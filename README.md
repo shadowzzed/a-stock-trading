@@ -148,4 +148,4 @@ pip install requests mootdx langgraph langchain-openai
 
 ## License
 
-Private use only.
+MIT License
