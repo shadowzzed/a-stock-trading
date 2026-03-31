@@ -1024,10 +1024,125 @@ def format_feishu(item, interpretation):
 # 主流程
 # ═══════════════════════════════════════════════════════════════
 
+# ═══════════════════════════════════════════════════════════════
+# 窗口化聚合机制
+# ═══════════════════════════════════════════════════════════════
+
+AGGREGATE_INTERVAL = 20 * 60  # 聚合窗口：20 分钟
+
+# 高优先级关键词（交易时间内命中则立即推送）
+_PRIORITY_KEYWORDS = {
+    "supply_demand": ["减产", "扩产", "限产", "停产", "产能", "供需", "供给", "涨价", "降价", "短缺", "库存"],
+    "earnings": ["业绩预增", "业绩预减", "净利润增长", "净利润下降", "营收增长", "营收下降", "业绩快报", "业绩暴雷", "扭亏", "首亏"],
+    "research": ["研报", "首次覆盖", "目标价", "评级上调", "评级下调", "买入评级", "增持评级"],
+    "geopolitics": ["制裁", "冲突", "战争", "军事", "袭击", "威胁", "封锁", "禁令", "关税"],
+}
+
+_news_buffer = []  # 聚合窗口内暂存的新闻
+_last_aggregate_time = [0.0]  # 上次聚合时间
+
+
+def is_trading_hours():
+    """判断当前是否 A 股交易时间（09:25-15:00）"""
+    now = datetime.now()
+    t = now.hour * 60 + now.minute
+    return 9 * 60 + 25 <= t <= 15 * 60
+
+
+def classify_priority(title, interpretation=""):
+    """判断新闻优先级，返回级别名或 None"""
+    text = title + " " + interpretation
+    for level, keywords in _PRIORITY_KEYWORDS.items():
+        for kw in keywords:
+            if kw in text:
+                return level
+    return None
+
+
+def load_aggregate_prompt():
+    """加载聚合 Agent prompt"""
+    prompt_path = os.path.join(os.path.dirname(__file__), "prompts", "news_aggregate.md")
+    with open(prompt_path, "r", encoding="utf-8") as f:
+        return f.read()
+
+
+def ai_aggregate(items_with_interp):
+    """调用 AI 聚合分析，输出 Top 10"""
+    if not items_with_interp:
+        return None
+
+    prompt = load_aggregate_prompt()
+    news_text = "\n".join(
+        "%d. [%s][%s] %s" % (i + 1, it["item"].get("source", ""), it["item"].get("time", ""), it["item"]["title"])
+        for i, it in enumerate(items_with_interp)
+    )
+
+    user_content = "时间窗口内共 %d 条原始新闻：\n\n%s" % (len(items_with_interp), news_text)
+
+    for attempt in range(3):
+        try:
+            resp = requests.post(
+                "%s/chat/completions" % AI_API_BASE,
+                headers={"Authorization": "Bearer %s" % AI_API_KEY, "Content-Type": "application/json"},
+                json={
+                    "model": AI_MODEL,
+                    "messages": [
+                        {"role": "system", "content": prompt},
+                        {"role": "user", "content": user_content},
+                    ],
+                    "temperature": 0.3,
+                    "max_tokens": 3000,
+                },
+                timeout=120,
+            )
+            data = resp.json()
+            track_tokens(data.get("usage"), len(items_with_interp))
+            return data["choices"][0]["message"]["content"].strip()
+        except Exception as e:
+            if attempt < 2:
+                print("  [聚合AI] 第%d次失败，重试: %s" % (attempt + 1, e), flush=True)
+                time.sleep(5 * (attempt + 1))
+            else:
+                log_error("聚合AI", "3次重试均失败: %s" % e)
+    return None
+
+
+def flush_aggregate_buffer(today, sent_keys):
+    """将缓冲区内的新闻聚合后发送"""
+    global _news_buffer
+    if not _news_buffer:
+        return 0
+
+    buf = _news_buffer[:]
+    _news_buffer = []
+
+    window_start = min(it["item"].get("time", "??:??") for it in buf)
+    window_end = datetime.now().strftime("%H:%M")
+
+    print("[%s] 聚合 %d 条新闻（%s - %s）..." % (window_end, len(buf), window_start, window_end), flush=True)
+
+    # 调用聚合 AI
+    aggregate_text = ai_aggregate(buf)
+
+    if aggregate_text:
+        # 发送聚合结果到飞书
+        send_feishu(aggregate_text)
+        print("  ✅ 聚合报告已发送", flush=True)
+
+    # 所有新闻保存到 daily 文件（不管聚合是否成功）
+    for it in buf:
+        save_to_trading(today, it["item"], it["interpretation"])
+        save_news_item(it["item"], it["interpretation"])
+        _title_window.add(it["item"]["title"])
+        sent_keys.add(it["item"]["key"])
+
+    _last_aggregate_time[0] = time.time()
+    return len(buf)
+
+
 def run_once():
     today = datetime.now().strftime("%Y-%m-%d")
     sent_keys = load_sent_keys(today)
-    initial_count = len(sent_keys)
 
     # 收集各数据源
     all_items = []
@@ -1067,48 +1182,64 @@ def run_once():
         all_items.extend(rpt)
 
     if not all_items:
+        # 即使没有新闻，也检查是否需要刷新聚合缓冲
+        if _news_buffer and time.time() - _last_aggregate_time[0] >= AGGREGATE_INTERVAL:
+            flush_aggregate_buffer(today, sent_keys)
         return 0
 
     # 标题去重（精确 + 模糊，含 1 小时滑动窗口）
-    window_titles = _title_window.get_titles()  # 窗口内已发送标题
+    window_titles = _title_window.get_titles()
     unique = []
     seen_exact = set()
-    seen_titles = list(window_titles)  # 初始化为窗口历史
+    seen_titles = list(window_titles)
     for item in all_items:
         title = item["title"].strip()
         short = title[:40]
-        # 1. 精确去重：前40字符完全相同
         if short in seen_exact:
             continue
-        # 2. 模糊去重：与窗口内标题的关键字重叠度 > 40%
         if _is_similar_to_any(title, seen_titles):
             continue
         seen_exact.add(short)
         seen_titles.append(title)
         unique.append(item)
 
+    if not unique:
+        if _news_buffer and time.time() - _last_aggregate_time[0] >= AGGREGATE_INTERVAL:
+            flush_aggregate_buffer(today, sent_keys)
+        return 0
+
     print("[%s] 处理 %d 条新闻" % (datetime.now().strftime("%H:%M:%S"), len(unique)), flush=True)
 
     # 批量 AI 解读
     interps = ai_batch_interpret(unique)
 
-    # 逐条发送 + 保存
+    trading = is_trading_hours()
     sent_count = 0
+
     for i, item in enumerate(unique):
         interpretation = interps.get(i, "（AI 解读暂不可用）")
-        msg = format_feishu(item, interpretation)
+        priority = classify_priority(item["title"], interpretation)
 
-        if send_feishu(msg):
-            save_to_trading(today, item, interpretation)
-            save_news_item(item, interpretation)
-            _title_window.add(item["title"])
-            sent_keys.add(item["key"])
-            sent_count += 1
-            print("  ✅ %s" % item["title"][:35], flush=True)
+        if trading and priority:
+            # 交易时间 + 高优先级 → 立即推送
+            tag = {"supply_demand": "供需", "earnings": "业绩", "research": "研报", "geopolitics": "地缘"}.get(priority, "")
+            msg = "🔔 **[%s]** %s" % (tag, format_feishu(item, interpretation))
+            if send_feishu(msg):
+                save_to_trading(today, item, interpretation)
+                save_news_item(item, interpretation)
+                _title_window.add(item["title"])
+                sent_keys.add(item["key"])
+                sent_count += 1
+                print("  🔔 [%s] %s" % (tag, item["title"][:30]), flush=True)
+            time.sleep(0.3)
         else:
-            print("  ❌ %s" % item["title"][:35], flush=True)
+            # 暂存到聚合缓冲区
+            _news_buffer.append({"item": item, "interpretation": interpretation})
+            print("  📦 缓存: %s" % item["title"][:35], flush=True)
 
-        time.sleep(0.5)
+    # 检查是否到了聚合时间
+    if _news_buffer and time.time() - _last_aggregate_time[0] >= AGGREGATE_INTERVAL:
+        flush_aggregate_buffer(today, sent_keys)
 
     return sent_count
 
@@ -1163,9 +1294,12 @@ def _sigusr1_handler(signum, frame):
 def main():
     print("📰 A 股新闻监控启动", flush=True)
     print("   数据源: TrendRadar + 财联社 + 华尔街见闻 + 金十数据 + BlockBeats + 东方财富研报", flush=True)
-    print("   轮询间隔: %ds" % POLL_INTERVAL, flush=True)
+    print("   轮询间隔: %ds | 聚合窗口: %d分钟" % (POLL_INTERVAL, AGGREGATE_INTERVAL // 60), flush=True)
+    print("   交易时间(09:25-15:00): 高优先级实时推送，其余聚合", flush=True)
+    print("   非交易时间: 全部聚合推送", flush=True)
     print("   看门狗超时: %ds" % WATCHDOG_TIMEOUT, flush=True)
     print(flush=True)
+    _last_aggregate_time[0] = time.time()  # 初始化聚合计时器
 
     if "--once" in sys.argv:
         count = run_once()
