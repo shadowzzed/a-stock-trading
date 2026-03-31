@@ -26,21 +26,21 @@ from typing import Dict, List, Optional, Set
 import requests
 
 # ═══════════════════════════════════════════════════════════════
-# 配置
+# 配置（从全局 config.yaml 读取，环境变量可覆盖）
 # ═══════════════════════════════════════════════════════════════
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from config import get_config as _get_global_config
+_cfg = _get_global_config()
 
 TRENDRADAR_OUTPUT = Path(os.environ.get(
     "TRENDRADAR_OUTPUT", os.path.expanduser("~/src/TrendRadar/output")
 ))
-TRADING_DIR = Path(os.environ.get(
-    "TRADING_DIR", os.path.join(os.path.dirname(__file__), "..", "daily")
-))
+TRADING_DIR = Path(os.environ.get("TRADING_DIR", _cfg["daily_dir"]))
 STATE_DIR = Path(os.environ.get(
     "STATE_DIR", os.path.expanduser("~/src/TrendRadar/output/.news_monitor")
 ))
-NEWS_DB_PATH = Path(os.environ.get(
-    "NEWS_DB_PATH", os.path.join(os.path.dirname(__file__), "news_monitor.db")
-))
+NEWS_DB_PATH = Path(os.environ.get("NEWS_DB_PATH", _cfg["news_db"]))
 
 # DeepSeek API（火山引擎）— 直连不走代理
 _no_proxy = os.environ.get("NO_PROXY", "")
@@ -49,9 +49,9 @@ if _volc_domain not in _no_proxy:
     os.environ["NO_PROXY"] = ("%s,%s" % (_no_proxy, _volc_domain)).strip(",")
     os.environ["no_proxy"] = os.environ["NO_PROXY"]
 
-AI_API_BASE = "https://ark.cn-beijing.volces.com/api/v3"
-AI_API_KEY = os.environ.get("ARK_API_KEY", "")
-AI_MODEL = os.environ.get("ARK_MODEL", "ep-20260211173256-z9vg4")
+AI_API_BASE = _cfg["ai_api_base"]
+AI_API_KEY = _cfg["ai_api_key"]
+AI_MODEL = _cfg["ai_model"]
 
 # 飞书 App Bot
 FEISHU_APP_ID = os.environ.get("FEISHU_APP_ID", "")
