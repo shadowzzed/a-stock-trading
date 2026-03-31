@@ -1028,7 +1028,8 @@ def format_feishu(item, interpretation):
 # 窗口化聚合机制
 # ═══════════════════════════════════════════════════════════════
 
-AGGREGATE_INTERVAL = 20 * 60  # 聚合窗口：20 分钟
+AGGREGATE_INTERVAL_TRADING = 20 * 60   # 交易时间聚合窗口：20 分钟
+AGGREGATE_INTERVAL_OFF_HOURS = 60 * 60  # 非交易时间聚合窗口：1 小时
 
 # 高优先级关键词（交易时间内命中则立即推送）
 _PRIORITY_KEYWORDS = {
@@ -1183,7 +1184,7 @@ def run_once():
 
     if not all_items:
         # 即使没有新闻，也检查是否需要刷新聚合缓冲
-        if _news_buffer and time.time() - _last_aggregate_time[0] >= AGGREGATE_INTERVAL:
+        if _news_buffer and time.time() - _last_aggregate_time[0] >= (AGGREGATE_INTERVAL_TRADING if is_trading_hours() else AGGREGATE_INTERVAL_OFF_HOURS):
             flush_aggregate_buffer(today, sent_keys)
         return 0
 
@@ -1204,7 +1205,7 @@ def run_once():
         unique.append(item)
 
     if not unique:
-        if _news_buffer and time.time() - _last_aggregate_time[0] >= AGGREGATE_INTERVAL:
+        if _news_buffer and time.time() - _last_aggregate_time[0] >= (AGGREGATE_INTERVAL_TRADING if is_trading_hours() else AGGREGATE_INTERVAL_OFF_HOURS):
             flush_aggregate_buffer(today, sent_keys)
         return 0
 
@@ -1238,7 +1239,7 @@ def run_once():
             print("  📦 缓存: %s" % item["title"][:35], flush=True)
 
     # 检查是否到了聚合时间
-    if _news_buffer and time.time() - _last_aggregate_time[0] >= AGGREGATE_INTERVAL:
+    if _news_buffer and time.time() - _last_aggregate_time[0] >= (AGGREGATE_INTERVAL_TRADING if is_trading_hours() else AGGREGATE_INTERVAL_OFF_HOURS):
         flush_aggregate_buffer(today, sent_keys)
 
     return sent_count
@@ -1294,9 +1295,9 @@ def _sigusr1_handler(signum, frame):
 def main():
     print("📰 A 股新闻监控启动", flush=True)
     print("   数据源: TrendRadar + 财联社 + 华尔街见闻 + 金十数据 + BlockBeats + 东方财富研报", flush=True)
-    print("   轮询间隔: %ds | 聚合窗口: %d分钟" % (POLL_INTERVAL, AGGREGATE_INTERVAL // 60), flush=True)
-    print("   交易时间(09:25-15:00): 高优先级实时推送，其余聚合", flush=True)
-    print("   非交易时间: 全部聚合推送", flush=True)
+    print("   轮询间隔: %ds" % POLL_INTERVAL, flush=True)
+    print("   交易时间(09:25-15:00): 高优实时推送 | 低优%d分钟聚合" % (AGGREGATE_INTERVAL_TRADING // 60), flush=True)
+    print("   非交易时间: %d分钟聚合推送" % (AGGREGATE_INTERVAL_OFF_HOURS // 60), flush=True)
     print("   看门狗超时: %ds" % WATCHDOG_TIMEOUT, flush=True)
     print(flush=True)
     _last_aggregate_time[0] = time.time()  # 初始化聚合计时器
