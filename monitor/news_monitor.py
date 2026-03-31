@@ -520,9 +520,11 @@ def ai_batch_interpret(items):
                         results[idx] = cleaned
 
                 print("  [AI] 解读 %d-%d/%d 完成" % (start + 1, min(start + batch_size, len(items)), len(items)), flush=True)
+                _write_heartbeat()  # 每批成功后刷新心跳，避免看门狗误杀
                 break  # 成功则跳出重试
 
             except Exception as e:
+                _write_heartbeat()  # 重试前也刷新心跳，表明进程仍在推进
                 if attempt < 2:
                     print("  [AI] 批次 %d-%d 第%d次失败，%ds后重试: %s" % (
                         start + 1, start + batch_size, attempt + 1, 5 * (attempt + 1), e), flush=True)
@@ -1098,8 +1100,10 @@ def ai_aggregate(items_with_interp):
             )
             data = resp.json()
             track_tokens(data.get("usage"), len(items_with_interp))
+            _write_heartbeat()  # 聚合AI成功后刷新心跳
             return data["choices"][0]["message"]["content"].strip()
         except Exception as e:
+            _write_heartbeat()  # 重试前也刷新心跳
             if attempt < 2:
                 print("  [聚合AI] 第%d次失败，重试: %s" % (attempt + 1, e), flush=True)
                 time.sleep(5 * (attempt + 1))
