@@ -1,44 +1,76 @@
-# 盘中分析 Agent Prompts
+# 盘中分析 Agent
 
-本目录包含 A 股盘中分析的 Agent 提示词，可被任何 AI Agent 框架驱动。
+可独立运行的盘中分析 Agent，支持任何 OpenAI-compatible API。
 
-## Agent 列表
+## 快速开始
 
-| Agent | 文件 | 触发时间 | 依赖数据 |
-|-------|------|---------|---------|
-| 开盘分析 | `opening_analysis.md` | 09:26（竞价数据就绪后） | 9:25 快照、股票池、7日K线、涨跌停CSV、新闻 |
-| 早盘机会分析 | `early_session_analysis.md` | 09:41（早盘数据就绪后） | 9:40 快照、开盘分析报告、股票池、昨日复盘 |
-| 收盘复盘准备 | `closing_review.md` | 18:00（收盘数据导出后） | 行情数据.md、涨跌停CSV |
+```bash
+# 设置环境变量
+export ARK_API_KEY="your_api_key"
+export ARK_MODEL="your_model_endpoint"
 
-## 路径变量
+# 运行开盘分析
+python -m agents.runner opening_analysis
 
-提示词中使用 `{变量名}` 格式的路径占位符，使用时需替换为实际路径：
+# 运行早盘机会分析
+python -m agents.runner early_session_analysis
 
-| 变量 | 含义 | 示例 |
+# 运行收盘复盘准备
+python -m agents.runner closing_review
+
+# 指定数据目录
+python -m agents.runner opening_analysis --data-dir /path/to/trading
+
+# 只看 prompt 不调 AI（调试用）
+python -m agents.runner opening_analysis --dry-run
+```
+
+## 文件结构
+
+| 文件 | 用途 |
+|------|------|
+| `runner.py` | Agent 执行器：数据采集 → 构建上下文 → 调用 AI → 保存报告 |
+| `config.py` | 配置管理：路径、API、prompt 加载 |
+| `opening_analysis.md` | 开盘分析 prompt（09:26） |
+| `early_session_analysis.md` | 早盘机会分析 prompt（09:41） |
+| `closing_review.md` | 收盘复盘准备 prompt（18:00） |
+
+## 环境变量
+
+| 变量 | 必须 | 说明 |
 |------|------|------|
-| `{DATA_DIR}` | 项目数据根目录（含 stocks.md、intraday/） | `/path/to/a-stock-trading` |
-| `{SCRIPTS_DIR}` | 脚本目录 | `/path/to/a-stock-trading/scripts` |
-| `{DAILY_DIR}` | 每日数据目录 | `/path/to/a-stock-trading/daily` |
+| `ARK_API_KEY` | 是 | AI API Key |
+| `ARK_MODEL` | 是 | 模型 endpoint |
+| `ARK_API_BASE` | 否 | API 地址（默认火山引擎） |
+| `TRADING_DATA_DIR` | 否 | 数据根目录（默认项目根） |
+| `TRADING_SCRIPTS_DIR` | 否 | 脚本目录（默认 scripts/） |
+| `TRADING_DAILY_DIR` | 否 | 每日数据目录（默认 daily/） |
 
 ## 执行流程
 
 ```
 09:25  脚本: intraday_data.py snapshot     → 拉取竞价快照
-09:26  Agent: opening_analysis.md          → 生成开盘分析报告
+09:26  Agent: opening_analysis             → 生成开盘分析报告
 09:40  脚本: intraday_data.py snapshot     → 拉取早盘快照
-09:41  Agent: early_session_analysis.md    → 生成早盘机会分析
+09:41  Agent: early_session_analysis       → 生成早盘机会分析
 10:00  脚本: intraday_data.py snapshot     → 拉取盘中快照
 11:30  脚本: intraday_data.py snapshot     → 拉取午盘快照
 14:40  脚本: intraday_data.py snapshot     → 拉取尾盘快照
 15:05  脚本: export_daily_summary.py       → 导出收盘数据
-18:00  Agent: closing_review.md            → 收盘复盘准备
+18:00  Agent: closing_review               → 收盘复盘准备
 ```
 
-## 在 HappyClaw 中使用
+## 在其他框架中集成
 
-这些 prompt 文件可通过 HappyClaw 定时任务驱动：
-- `schedule_type`: cron
-- `execution_type`: agent
-- `context_mode`: isolated
+`config.load_prompt()` 可加载并渲染 prompt 文件：
 
-将 prompt 文件内容作为任务的 `prompt` 字段，替换路径变量后即可调度。
+```python
+from agents.config import load_prompt
+
+prompt = load_prompt("opening_analysis",
+    data_dir="/path/to/data",
+    scripts_dir="/path/to/scripts",
+    daily_dir="/path/to/daily",
+)
+# prompt 已替换路径变量，可直接传给任何 LLM
+```
