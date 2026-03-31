@@ -116,35 +116,58 @@ python monitor/news_monitor.py
   30s    monitor/news_monitor.py           → daily/YYYY-MM-DD/新闻.md
 ```
 
-## 配置
-
-复制 `.env.example` 为 `.env`，填入实际值：
+## 快速开始
 
 ```bash
-cp .env.example .env
+# 1. 克隆仓库
+git clone https://github.com/shadowzzed/a-stock-trading.git
+cd a-stock-trading
+
+# 2. 配置数据目录
+cp config.yaml.example config.yaml
+# 编辑 config.yaml，修改 data_root 指向你的数据存储目录
+
+# 3. 设置 AI API 密钥
+export ARK_API_KEY="your_api_key"
+export ARK_MODEL="your_model_endpoint"
+
+# 4. 安装依赖
+pip install -e .
+
+# 5. 首次运行会自动创建数据目录结构
+python -m intraday opening_analysis --dry-run
 ```
+
+## 代码与数据分离
+
+代码在 Git 仓库中，运行时数据存储在 `config.yaml` 指定的 `data_root` 目录下：
+
+```
+~/trading-data/              ← data_root（不在仓库中）
+├── intraday/intraday.db     # 盘中快照 SQLite
+├── daily/YYYY-MM-DD/        # 每日数据（CSV、报告、新闻）
+├── news_monitor.db          # 新闻去重数据库
+├── stocks.md                # 股票池（首次运行从模板复制）
+└── logs/                    # 运行日志
+```
+
+配置优先级：环境变量 `TRADING_DATA_ROOT` > `config.yaml` > 默认值 `./runtime_data/`
+
+## 环境变量
 
 | 变量 | 必须 | 说明 |
 |------|------|------|
 | `ARK_API_KEY` | 是 | AI API Key（火山引擎 DeepSeek 等） |
 | `ARK_MODEL` | 是 | 模型 endpoint ID |
 | `ARK_API_BASE` | 否 | API 地址（默认火山引擎） |
+| `TRADING_DATA_ROOT` | 否 | 数据根目录（也可在 config.yaml 中配置） |
 | `FEISHU_APP_ID` | 否 | 飞书推送（新闻监控用） |
 | `FEISHU_APP_SECRET` | 否 | 飞书推送 |
 | `FEISHU_WEBHOOK_URL` | 否 | 飞书 Webhook |
 
-## 安装
-
-```bash
-pip install -e .
-
-# 或仅安装依赖
-pip install requests mootdx langgraph langchain-openai
-```
-
 ## 股票池
 
-`stocks.md` 维护 18 个板块约 174 只股票的跟踪池，⭐ 标记辨识度核心股。
+`knowledge/stocks_template.md` 是股票池模板（18 个板块约 174 只，⭐ 标记辨识度核心股）。首次运行时自动复制到 `{data_root}/stocks.md`，后续在数据目录中维护。
 
 ## License
 

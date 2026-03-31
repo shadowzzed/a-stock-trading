@@ -27,20 +27,12 @@ import os
 import sys
 from datetime import datetime
 
-# 项目根目录
-PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-
-# 配置
-AI_API_KEY = os.environ.get("ARK_API_KEY", "")
-AI_API_BASE = os.environ.get("ARK_API_BASE", "https://ark.cn-beijing.volces.com/api/v3")
-AI_MODEL = os.environ.get("ARK_MODEL", "")
-DATA_DIR = os.environ.get("TRADING_DATA_DIR", PROJECT_ROOT)
-DAILY_DIR = os.environ.get("TRADING_DAILY_DIR", os.path.join(DATA_DIR, "daily"))
-STOCKS_FILE = os.environ.get("TRADING_STOCKS_FILE", os.path.join(DATA_DIR, "stocks.md"))
+# 全局配置
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from config import get_config
 
 
 def load_prompt(name: str) -> str:
-    """加载 prompt 文件"""
     path = os.path.join(os.path.dirname(__file__), "prompts", "%s.md" % name)
     with open(path, "r", encoding="utf-8") as f:
         return f.read()
@@ -54,22 +46,21 @@ def load_file(path: str) -> str:
 
 
 def call_ai(system_prompt: str, user_prompt: str) -> str:
-    """调用 AI API"""
     import requests
-
-    if not AI_API_KEY:
+    cfg = get_config()
+    if not cfg["ai_api_key"]:
         raise ValueError("ARK_API_KEY 未设置")
-    if not AI_MODEL:
+    if not cfg["ai_model"]:
         raise ValueError("ARK_MODEL 未设置")
 
     resp = requests.post(
-        "%s/chat/completions" % AI_API_BASE,
+        "%s/chat/completions" % cfg["ai_api_base"],
         headers={
-            "Authorization": "Bearer %s" % AI_API_KEY,
+            "Authorization": "Bearer %s" % cfg["ai_api_key"],
             "Content-Type": "application/json",
         },
         json={
-            "model": AI_MODEL,
+            "model": cfg["ai_model"],
             "messages": [
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_prompt},
@@ -85,12 +76,13 @@ def call_ai(system_prompt: str, user_prompt: str) -> str:
 
 def run_catalyst(date: str, dry_run: bool = False):
     """从当日新闻提取事件催化"""
-    news = load_file(os.path.join(DAILY_DIR, date, "新闻.md"))
+    cfg = get_config()
+    news = load_file(os.path.join(cfg["daily_dir"], date, "新闻.md"))
     if not news:
         print("[WARN] 未找到 %s 的新闻文件" % date)
         return
 
-    stocks = load_file(STOCKS_FILE)
+    stocks = load_file(cfg["stocks_file"])
     prompt = load_prompt("catalyst_extract")
 
     user_content = "今天是 %s。\n\n## 今日新闻\n\n%s" % (date, news[:8000])
@@ -104,7 +96,7 @@ def run_catalyst(date: str, dry_run: bool = False):
     print("[%s] 提取事件催化..." % datetime.now().strftime("%H:%M:%S"))
     result = call_ai(prompt, user_content)
 
-    output_path = os.path.join(DAILY_DIR, date, "事件催化.md")
+    output_path = os.path.join(cfg["daily_dir"], date, "事件催化.md")
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
     with open(output_path, "w", encoding="utf-8") as f:
         f.write(result)
@@ -116,10 +108,10 @@ def run_catalyst(date: str, dry_run: bool = False):
 
 def run_briefing(date: str, dry_run: bool = False):
     """生成盘前新闻简报"""
-    # 读取今日和昨日新闻
-    news_today = load_file(os.path.join(DAILY_DIR, date, "新闻.md"))
-    catalyst = load_file(os.path.join(DAILY_DIR, date, "事件催化.md"))
-    stocks = load_file(STOCKS_FILE)
+    cfg = get_config()
+    news_today = load_file(os.path.join(cfg["daily_dir"], date, "新闻.md"))
+    catalyst = load_file(os.path.join(cfg["daily_dir"], date, "事件催化.md"))
+    stocks = load_file(cfg["stocks_file"])
 
     prompt = load_prompt("morning_briefing")
 
@@ -138,7 +130,7 @@ def run_briefing(date: str, dry_run: bool = False):
     print("[%s] 生成盘前简报..." % datetime.now().strftime("%H:%M:%S"))
     result = call_ai(prompt, user_content)
 
-    output_path = os.path.join(DAILY_DIR, date, "盘前简报.md")
+    output_path = os.path.join(cfg["daily_dir"], date, "盘前简报.md")
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
     with open(output_path, "w", encoding="utf-8") as f:
         f.write(result)

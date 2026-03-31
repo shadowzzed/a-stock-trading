@@ -15,3 +15,8 @@ logs/
 daily/
 intraday/
 backtest*/
+
+# 运行时数据目录
+runtime_data/
+config.yaml
+stocks.md

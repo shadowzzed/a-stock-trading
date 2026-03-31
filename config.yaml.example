@@ -1,0 +1,15 @@
+# A股短线交易分析 - 数据目录配置
+#
+# 复制此文件为 config.yaml，修改 data_root 指向你的数据存储目录。
+# 首次运行时会自动创建子目录结构。
+
+# 所有运行时数据的根目录（支持 ~ 展开）
+data_root: ~/trading-data
+
+# 子目录结构（自动创建，一般不需要改）：
+#   {data_root}/
+#   ├── intraday/intraday.db    # 盘中快照 SQLite
+#   ├── daily/YYYY-MM-DD/       # 每日数据（CSV、报告、新闻）
+#   ├── news_monitor.db         # 新闻去重数据库
+#   ├── stocks.md               # 股票池（首次运行从仓库复制模板）
+#   └── logs/                   # 运行日志
