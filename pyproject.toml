@@ -1,19 +1,18 @@
-[build-system]
-requires = ["setuptools>=61.0"]
-build-backend = "setuptools.build_meta"
-
 [project]
-name = "short-term-agents"
+name = "a-stock-trading"
 version = "0.1.0"
-description = "A股短线多Agent复盘系统"
-requires-python = ">=3.10"
+description = "A股短线交易分析工具集"
+requires-python = ">=3.9"
 dependencies = [
-    "langgraph>=0.4.8",
-    "langchain-core>=0.3.81",
-    "langchain-openai>=0.3.23",
-    "pandas>=2.3.0",
-    "rich>=14.0.0",
+    "requests",
+    "mootdx",
+    "langgraph",
+    "langchain-openai",
 ]
 
+[project.optional-dependencies]
+dev = ["rich"]
+
 [project.scripts]
-sta = "short_term_agents.main:cli"
+intraday-agent = "intraday.runner:main"
+review-agent = "review.main:cli"
