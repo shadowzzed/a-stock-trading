@@ -99,7 +99,7 @@ def save_result(status, message, **extra):
 # API 调用
 # ═══════════════════════════════════════════════════════════════
 
-def check_available(headers):
+def check_available(headers, tag=""):
     """检查是否可购买（preview 接口）"""
     try:
         resp = requests.post(
@@ -116,11 +116,11 @@ def check_available(headers):
             return not sold_out, pay_amount, biz_id, data["data"]
         return False, None, None, data
     except Exception as e:
-        log("[preview] 异常: %s" % e)
+        log("%s[preview] 异常: %s" % (tag, e))
         return False, None, None, None
 
 
-def create_sign(headers):
+def create_sign(headers, tag=""):
     """创建签约订阅"""
     try:
         resp = requests.post(
@@ -130,10 +130,10 @@ def create_sign(headers):
             timeout=10,
         )
         data = resp.json()
-        log("[create-sign] 响应: %s" % json.dumps(data, ensure_ascii=False))
+        log("%s[create-sign] code=%s msg=%s" % (tag, data.get("code"), data.get("msg", "")))
         return data
     except Exception as e:
-        log("[create-sign] 异常: %s" % e)
+        log("%s[create-sign] 异常: %s" % (tag, e))
         return None
 
 
@@ -180,24 +180,60 @@ def main():
 
     def worker(thread_id):
         """每个线程独立轮询检测 + 下单"""
+        tag = "[T%d] " % thread_id
         poll_count = 0
         # 每个线程错开一点启动时间，避免完全同步请求
         time.sleep(thread_id * 0.05)
+        log("%s启动，开始轮询检测..." % tag)
 
         while not success_event.is_set() and not timeout_event.is_set():
             elapsed = time.time() - start_time
             if elapsed > MAX_WAIT_MINUTES * 60:
                 timeout_event.set()
+                log("%s超时退出" % tag)
                 return
 
             # 检测是否可购买
-            available, pay_amount, biz_id, preview_data = check_available(headers)
+            available, pay_amount, biz_id, preview_data = check_available(headers, tag)
             poll_count += 1
 
-            if poll_count % 50 == 0:
-                log("[T%d] 轮询 #%d | 已等 %ds | 售罄" % (thread_id, poll_count, int(elapsed)))
+            if available:
+                # 检测到放开！
+                ts = datetime.now().strftime("%H:%M:%S.%f")[:-3]
+                log("%s🎉 检测到【可购买】！价格: ¥%s | 轮询 #%d | 耗时 %ds" % (tag, pay_amount, poll_count, int(elapsed)))
 
-            if not available:
+                for attempt in range(1, MAX_RETRY + 1):
+                    if success_event.is_set():
+                        log("%s其他线程已成功，停止下单" % tag)
+                        return
+
+                    log("%s下单第 %d/%d 次..." % (tag, attempt, MAX_RETRY))
+                    result = create_sign(headers, tag)
+
+                    if result and result.get("code") == 200:
+                        order_data = result.get("data", {})
+                        log("%s✅ 下单成功！订单: %s" % (tag, json.dumps(order_data, ensure_ascii=False)))
+                        success_result[0] = order_data
+                        success_meta[0] = (thread_id, pay_amount, ts)
+                        success_event.set()
+                        return
+
+                    elif result and result.get("code") == 500:
+                        log("%s❌ 下单失败(%d/%d): %s" % (tag, attempt, MAX_RETRY, result.get("msg")))
+                        if attempt < MAX_RETRY:
+                            time.sleep(0.1)
+                    else:
+                        log("%s⚠️ 下单异常(%d/%d): %s" % (tag, attempt, MAX_RETRY, result))
+                        if attempt < MAX_RETRY:
+                            time.sleep(0.1)
+
+                # 该线程重试完毕但没成功，继续轮询
+                log("%s下单 %d 次均失败，可能瞬间售罄，继续检测..." % (tag, MAX_RETRY))
+            else:
+                # 仍然售罄
+                if poll_count % 50 == 0:
+                    log("%s检测 #%d | 已等 %ds | 售罄" % (tag, poll_count, int(elapsed)))
+
                 now = datetime.now()
                 if now.hour == 9 and now.minute >= 59 and now.second >= 50:
                     interval = POLL_INTERVAL
@@ -206,39 +242,11 @@ def main():
                 else:
                     interval = PRE_POLL_INTERVAL
                 time.sleep(interval)
-                continue
 
-            # 检测到放开，立即下单！
-            ts = datetime.now().strftime("%H:%M:%S.%f")[:-3]
-            log("[T%d] 🎉 检测到放开！价格: ¥%s | 轮询 %d 次" % (thread_id, pay_amount, poll_count))
-
-            for attempt in range(1, MAX_RETRY + 1):
-                if success_event.is_set():
-                    log("[T%d] 其他线程已成功，停止" % thread_id)
-                    return
-
-                result = create_sign(headers)
-
-                if result and result.get("code") == 200:
-                    order_data = result.get("data", {})
-                    log("[T%d] ✅ 下单成功！" % thread_id)
-                    log("[T%d] 订单: %s" % (thread_id, json.dumps(order_data, ensure_ascii=False)))
-                    success_result[0] = order_data
-                    success_meta[0] = (thread_id, pay_amount, ts)
-                    success_event.set()
-                    return
-
-                elif result and result.get("code") == 500:
-                    log("[T%d] 下单第%d次失败: %s" % (thread_id, attempt, result.get("msg")))
-                    if attempt < MAX_RETRY:
-                        time.sleep(0.1)
-                else:
-                    log("[T%d] 下单第%d次未知响应: %s" % (thread_id, attempt, result))
-                    if attempt < MAX_RETRY:
-                        time.sleep(0.1)
-
-            # 该线程重试完毕但没成功，继续轮询（可能是瞬间售罄，等下次放开）
-            log("[T%d] 下单 %d 次未成功，继续轮询..." % (thread_id, MAX_RETRY))
+        if success_event.is_set():
+            log("%s收到成功信号，退出" % tag)
+        else:
+            log("%s退出" % tag)
 
     # 启动所有线程
     log("启动 %d 个检测+抢单线程..." % SNIPE_THREADS)
