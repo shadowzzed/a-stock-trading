@@ -45,33 +45,46 @@ def load_file(path: str) -> str:
     return ""
 
 
-def call_ai(system_prompt: str, user_prompt: str) -> str:
+def call_ai(system_prompt: str, user_prompt: str) -> tuple:
+    """调用 AI（Grok 优先，失败 fallback 到 DeepSeek），返回 (text, provider_name)"""
     import requests
-    cfg = get_config()
-    if not cfg["ai_api_key"]:
-        raise ValueError("ARK_API_KEY 未设置")
-    if not cfg["ai_model"]:
-        raise ValueError("ARK_MODEL 未设置")
+    from config import get_ai_providers
 
-    resp = requests.post(
-        "%s/chat/completions" % cfg["ai_api_base"],
-        headers={
-            "Authorization": "Bearer %s" % cfg["ai_api_key"],
-            "Content-Type": "application/json",
-        },
-        json={
-            "model": cfg["ai_model"],
-            "messages": [
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_prompt},
-            ],
-            "temperature": 0.3,
-            "max_tokens": 4096,
-        },
-        timeout=120,
-    )
-    resp.raise_for_status()
-    return resp.json()["choices"][0]["message"]["content"]
+    providers = get_ai_providers()
+    if not providers:
+        raise ValueError("未配置任何 AI 提供商（XAI_API_KEY 或 ARK_API_KEY）")
+
+    for provider in providers:
+        for attempt in range(3):
+            try:
+                resp = requests.post(
+                    "%s/chat/completions" % provider["base"],
+                    headers={
+                        "Authorization": "Bearer %s" % provider["key"],
+                        "Content-Type": "application/json",
+                    },
+                    json={
+                        "model": provider["model"],
+                        "messages": [
+                            {"role": "system", "content": system_prompt},
+                            {"role": "user", "content": user_prompt},
+                        ],
+                        "temperature": 0.3,
+                        "max_tokens": 4096,
+                    },
+                    timeout=120,
+                )
+                resp.raise_for_status()
+                text = resp.json()["choices"][0]["message"]["content"]
+                print("  [AI:%s] 调用成功" % provider["name"], flush=True)
+                return text, provider["name"]
+            except Exception as e:
+                if attempt < 2:
+                    print("  [AI:%s] 第%d次失败，重试: %s" % (provider["name"], attempt + 1, e), flush=True)
+                else:
+                    print("  [AI:%s] 3次失败，切换下一个提供商" % provider["name"], flush=True)
+
+    raise RuntimeError("所有 AI 提供商均调用失败")
 
 
 def run_catalyst(date: str, dry_run: bool = False):
@@ -94,14 +107,15 @@ def run_catalyst(date: str, dry_run: bool = False):
         return
 
     print("[%s] 提取事件催化..." % datetime.now().strftime("%H:%M:%S"))
-    result = call_ai(prompt, user_content)
+    result, ai_provider = call_ai(prompt, user_content)
 
     output_path = os.path.join(cfg["daily_dir"], date, "事件催化.md")
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
     with open(output_path, "w", encoding="utf-8") as f:
         f.write(result)
+        f.write("\n\n`AI: %s`\n" % ai_provider)
 
-    print("[%s] 已保存: %s" % (datetime.now().strftime("%H:%M:%S"), output_path))
+    print("[%s] 已保存: %s (AI: %s)" % (datetime.now().strftime("%H:%M:%S"), output_path, ai_provider))
     print(result)
     return result
 
@@ -128,14 +142,15 @@ def run_briefing(date: str, dry_run: bool = False):
         return
 
     print("[%s] 生成盘前简报..." % datetime.now().strftime("%H:%M:%S"))
-    result = call_ai(prompt, user_content)
+    result, ai_provider = call_ai(prompt, user_content)
 
     output_path = os.path.join(cfg["daily_dir"], date, "盘前简报.md")
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
     with open(output_path, "w", encoding="utf-8") as f:
         f.write(result)
+        f.write("\n\n`AI: %s`\n" % ai_provider)
 
-    print("[%s] 已保存: %s" % (datetime.now().strftime("%H:%M:%S"), output_path))
+    print("[%s] 已保存: %s (AI: %s)" % (datetime.now().strftime("%H:%M:%S"), output_path, ai_provider))
     print(result)
     return result
 

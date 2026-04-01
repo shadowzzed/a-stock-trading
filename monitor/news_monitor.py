@@ -49,9 +49,9 @@ if _volc_domain not in _no_proxy:
     os.environ["NO_PROXY"] = ("%s,%s" % (_no_proxy, _volc_domain)).strip(",")
     os.environ["no_proxy"] = os.environ["NO_PROXY"]
 
-AI_API_BASE = _cfg["ai_api_base"]
-AI_API_KEY = _cfg["ai_api_key"]
-AI_MODEL = _cfg["ai_model"]
+# AI 提供商列表（Grok 优先，DeepSeek fallback）
+from config import get_ai_providers as _get_ai_providers
+AI_PROVIDERS = _get_ai_providers()
 
 # 飞书 App Bot
 FEISHU_APP_ID = _cfg["feishu_app_id"]
@@ -464,8 +464,9 @@ def format_number(n):
 # ═══════════════════════════════════════════════════════════════
 
 def ai_batch_interpret(items):
-    """批量 AI 解读，每次最多 8 条，返回 {index: text}"""
+    """批量 AI 解读，每次最多 8 条，返回 ({index: text}, provider_name)"""
     results = {}
+    used_providers = set()
     batch_size = 8
     for start in range(0, len(items), batch_size):
         batch = items[start:start + batch_size]
@@ -483,64 +484,74 @@ def ai_batch_interpret(items):
 
 2. ...""" % news_text
 
-        for attempt in range(3):
-            try:
-                resp = requests.post(
-                    "%s/chat/completions" % AI_API_BASE,
-                    headers={"Authorization": "Bearer %s" % AI_API_KEY, "Content-Type": "application/json"},
-                    json={
-                        "model": AI_MODEL,
-                        "messages": [{"role": "user", "content": prompt}],
-                        "temperature": 0.3,
-                        "max_tokens": 1500,
-                    },
-                    timeout=90,
-                    proxies=_NO_PROXY,
-                )
-                data = resp.json()
-                track_tokens(data.get("usage"), len(batch))
-                text = data["choices"][0]["message"]["content"].strip()
+        batch_done = False
+        for provider in AI_PROVIDERS:
+            if batch_done:
+                break
+            for attempt in range(3):
+                try:
+                    resp = requests.post(
+                        "%s/chat/completions" % provider["base"],
+                        headers={"Authorization": "Bearer %s" % provider["key"], "Content-Type": "application/json"},
+                        json={
+                            "model": provider["model"],
+                            "messages": [{"role": "user", "content": prompt}],
+                            "temperature": 0.3,
+                            "max_tokens": 1500,
+                        },
+                        timeout=90,
+                    )
+                    data = resp.json()
+                    track_tokens(data.get("usage"), len(batch))
+                    text = data["choices"][0]["message"]["content"].strip()
 
-                # 按编号拆分
-                parts = []
-                current_lines = []
-                for line in text.split("\n"):
-                    s = line.strip()
-                    if s and s[0].isdigit() and "." in s[:4] and current_lines:
+                    # 按编号拆分
+                    parts = []
+                    current_lines = []
+                    for line in text.split("\n"):
+                        s = line.strip()
+                        if s and s[0].isdigit() and "." in s[:4] and current_lines:
+                            parts.append("\n".join(current_lines))
+                            current_lines = [s]
+                        elif s:
+                            current_lines.append(s)
+                    if current_lines:
                         parts.append("\n".join(current_lines))
-                        current_lines = [s]
-                    elif s:
-                        current_lines.append(s)
-                if current_lines:
-                    parts.append("\n".join(current_lines))
 
-                for i, part in enumerate(parts):
-                    idx = start + i
-                    if idx < len(items):
-                        # 去掉编号前缀 "1. "
-                        cleaned = part
-                        dot_pos = cleaned.find(".")
-                        if dot_pos > 0 and dot_pos <= 3 and cleaned[:dot_pos].isdigit():
-                            cleaned = cleaned[dot_pos + 1:].strip()
-                        results[idx] = cleaned
+                    for i, part in enumerate(parts):
+                        idx = start + i
+                        if idx < len(items):
+                            # 去掉编号前缀 "1. "
+                            cleaned = part
+                            dot_pos = cleaned.find(".")
+                            if dot_pos > 0 and dot_pos <= 3 and cleaned[:dot_pos].isdigit():
+                                cleaned = cleaned[dot_pos + 1:].strip()
+                            results[idx] = cleaned
 
-                print("  [AI] 解读 %d-%d/%d 完成" % (start + 1, min(start + batch_size, len(items)), len(items)), flush=True)
-                _write_heartbeat()  # 每批成功后刷新心跳，避免看门狗误杀
-                break  # 成功则跳出重试
+                    print("  [AI:%s] 解读 %d-%d/%d 完成" % (provider["name"], start + 1, min(start + batch_size, len(items)), len(items)), flush=True)
+                    _write_heartbeat()
+                    used_providers.add(provider["name"])
+                    batch_done = True
+                    break  # 成功则跳出重试
 
-            except Exception as e:
-                _write_heartbeat()  # 重试前也刷新心跳，表明进程仍在推进
-                if attempt < 2:
-                    print("  [AI] 批次 %d-%d 第%d次失败，%ds后重试: %s" % (
-                        start + 1, start + batch_size, attempt + 1, 5 * (attempt + 1), e), flush=True)
-                    time.sleep(5 * (attempt + 1))
-                else:
-                    log_error("AI解读", "批次 %d-%d 3次重试均失败: %s" % (start + 1, start + batch_size, e))
+                except Exception as e:
+                    _write_heartbeat()
+                    if attempt < 2:
+                        print("  [AI:%s] 批次 %d-%d 第%d次失败，%ds后重试: %s" % (
+                            provider["name"], start + 1, start + batch_size, attempt + 1, 5 * (attempt + 1), e), flush=True)
+                        time.sleep(5 * (attempt + 1))
+                    else:
+                        print("  [AI:%s] 批次 %d-%d 3次失败，切换下一个提供商" % (
+                            provider["name"], start + 1, start + batch_size), flush=True)
+
+            if not batch_done and provider == AI_PROVIDERS[-1]:
+                log_error("AI解读", "批次 %d-%d 所有提供商均失败" % (start + 1, start + batch_size))
 
         if start + batch_size < len(items):
             time.sleep(1)
 
-    return results
+    provider_label = "+".join(sorted(used_providers)) if used_providers else "无"
+    return results, provider_label
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -1004,7 +1015,7 @@ def save_to_trading(today, item, interpretation):
         f.write(entry)
 
 
-def format_feishu(item, interpretation):
+def format_feishu(item, interpretation, ai_provider=""):
     t = item.get("time", "")
     t_part = " · %s" % t if t else ""
 
@@ -1022,8 +1033,10 @@ def format_feishu(item, interpretation):
 
     url_line = "\n[原文链接](%s)" % item["url"] if item.get("url") else ""
 
-    return "**%s**\n`%s`%s%s%s\n\n%s%s" % (
-        item["title"], item["source"], t_part, extra_line, brief_line, interpretation, url_line
+    model_tag = "\n`AI: %s`" % ai_provider if ai_provider else ""
+
+    return "**%s**\n`%s`%s%s%s\n\n%s%s%s" % (
+        item["title"], item["source"], t_part, extra_line, brief_line, interpretation, url_line, model_tag
     )
 
 
@@ -1116,34 +1129,36 @@ def ai_rank_summaries(summaries_text):
 
 直接输出排序后的列表，不要加额外说明。"""
 
-    for attempt in range(3):
-        try:
-            resp = requests.post(
-                "%s/chat/completions" % AI_API_BASE,
-                headers={"Authorization": "Bearer %s" % AI_API_KEY, "Content-Type": "application/json"},
-                json={
-                    "model": AI_MODEL,
-                    "messages": [
-                        {"role": "system", "content": prompt},
-                        {"role": "user", "content": summaries_text},
-                    ],
-                    "temperature": 0.3,
-                    "max_tokens": 6000,
-                },
-                timeout=90,
-                proxies=_NO_PROXY,
-            )
-            data = resp.json()
-            track_tokens(data.get("usage"), 0)
-            _write_heartbeat()
-            return data["choices"][0]["message"]["content"].strip()
-        except Exception as e:
-            _write_heartbeat()
-            if attempt < 2:
-                print("  [排序AI] 第%d次失败，重试: %s" % (attempt + 1, e), flush=True)
-                time.sleep(5 * (attempt + 1))
-            else:
-                log_error("排序AI", "3次重试均失败: %s" % e)
+    for provider in AI_PROVIDERS:
+        for attempt in range(3):
+            try:
+                resp = requests.post(
+                    "%s/chat/completions" % provider["base"],
+                    headers={"Authorization": "Bearer %s" % provider["key"], "Content-Type": "application/json"},
+                    json={
+                        "model": provider["model"],
+                        "messages": [
+                            {"role": "system", "content": prompt},
+                            {"role": "user", "content": summaries_text},
+                        ],
+                        "temperature": 0.3,
+                        "max_tokens": 6000,
+                    },
+                    timeout=90,
+                )
+                data = resp.json()
+                track_tokens(data.get("usage"), 0)
+                _write_heartbeat()
+                print("  [排序AI:%s] 完成" % provider["name"], flush=True)
+                return data["choices"][0]["message"]["content"].strip()
+            except Exception as e:
+                _write_heartbeat()
+                if attempt < 2:
+                    print("  [排序AI:%s] 第%d次失败，重试: %s" % (provider["name"], attempt + 1, e), flush=True)
+                    time.sleep(5 * (attempt + 1))
+                else:
+                    print("  [排序AI:%s] 3次失败，切换下一个提供商" % provider["name"], flush=True)
+    log_error("排序AI", "所有提供商均失败")
     return None
 
 
@@ -1287,7 +1302,7 @@ def run_once():
     print("[%s] 处理 %d 条新闻" % (datetime.now().strftime("%H:%M:%S"), len(unique)), flush=True)
 
     # 批量 AI 解读
-    interps = ai_batch_interpret(unique)
+    interps, ai_provider = ai_batch_interpret(unique)
 
     trading = is_trading_hours()
     sent_count = 0
@@ -1299,7 +1314,7 @@ def run_once():
         if trading and priority:
             # 交易时间 + 高优先级 → 立即推送
             tag = {"supply_demand": "供需", "earnings": "业绩", "research": "研报", "geopolitics": "地缘"}.get(priority, "")
-            msg = "🔔 **[%s]** %s" % (tag, format_feishu(item, interpretation))
+            msg = "🔔 **[%s]** %s" % (tag, format_feishu(item, interpretation, ai_provider))
             if send_feishu(msg):
                 save_to_trading(today, item, interpretation)
                 save_news_item(item, interpretation)

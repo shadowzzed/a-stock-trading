@@ -67,10 +67,15 @@ def get_config():
         "stocks_file": os.path.join(data_root, "stocks.md"),
         "logs_dir": os.path.join(data_root, "logs"),
 
-        # AI 配置（环境变量 > config.yaml > 默认值）
+        # AI 配置 — DeepSeek（环境变量 > config.yaml > 默认值）
         "ai_api_key": os.environ.get("ARK_API_KEY", yaml_cfg.get("ai_api_key", "")),
         "ai_api_base": os.environ.get("ARK_API_BASE", yaml_cfg.get("ai_api_base", "https://ark.cn-beijing.volces.com/api/v3")),
         "ai_model": os.environ.get("ARK_MODEL", yaml_cfg.get("ai_model", "")),
+
+        # AI 配置 — Grok（xAI，主力 AI）
+        "grok_api_key": os.environ.get("XAI_API_KEY", yaml_cfg.get("grok_api_key", "")),
+        "grok_api_base": yaml_cfg.get("grok_api_base", "https://api.x.ai/v1"),
+        "grok_model": yaml_cfg.get("grok_model", "grok-3-fast"),
 
         # 飞书配置（环境变量 > config.yaml > 默认值）
         "feishu_app_id": os.environ.get("FEISHU_APP_ID", yaml_cfg.get("feishu_app_id", "")),
@@ -104,6 +109,27 @@ def init_data_dirs():
 
     print("[init] 数据目录: %s" % data_root)
     return cfg
+
+
+def get_ai_providers():
+    """返回 AI 提供商列表（按优先级：Grok > DeepSeek）"""
+    cfg = get_config()
+    providers = []
+    if cfg["grok_api_key"]:
+        providers.append({
+            "name": "Grok",
+            "base": cfg["grok_api_base"],
+            "key": cfg["grok_api_key"],
+            "model": cfg["grok_model"],
+        })
+    if cfg["ai_api_key"]:
+        providers.append({
+            "name": "DeepSeek",
+            "base": cfg["ai_api_base"],
+            "key": cfg["ai_api_key"],
+            "model": cfg["ai_model"],
+        })
+    return providers
 
 
 def reload_config():
