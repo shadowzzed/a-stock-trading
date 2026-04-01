@@ -34,15 +34,19 @@ MAX_RETRY = 5             # 下单重试次数
 MAX_WAIT_MINUTES = 30     # 最大等待时间（分钟）
 
 
+def log(msg):
+    """带时间戳的日志输出（立即刷新）"""
+    print("[%s][%s] %s" % (datetime.now().strftime("%H:%M:%S"), USER_LABEL, msg), flush=True)
+
+
 def load_token():
     """加载 JWT token（环境变量优先，其次从浏览器状态文件提取）"""
     if TOKEN_DIRECT:
-        print("[%s] ✅ 使用环境变量 Token（长度 %d）" % (USER_LABEL, len(TOKEN_DIRECT)))
+        log("✅ 使用环境变量 Token（长度 %d）" % len(TOKEN_DIRECT))
         return TOKEN_DIRECT
 
     if not os.path.exists(AUTH_FILE):
-        print("[%s] ❌ 未找到认证文件: %s" % (USER_LABEL, AUTH_FILE))
-        print("   请先运行浏览器登录并保存状态")
+        log("❌ 未找到认证文件: %s" % AUTH_FILE)
         sys.exit(1)
 
     with open(AUTH_FILE) as f:
@@ -52,10 +56,10 @@ def load_token():
     for c in cookies:
         if c.get("name") == "bigmodel_token_production":
             token = c["value"]
-            print("[%s] ✅ Token 加载成功（长度 %d）" % (USER_LABEL, len(token)))
+            log("✅ Token 加载成功（长度 %d）" % len(token))
             return token
 
-    print("[%s] ❌ 未在状态文件中找到 bigmodel_token_production cookie" % USER_LABEL)
+    log("❌ 未在状态文件中找到 bigmodel_token_production cookie")
     sys.exit(1)
 
 
@@ -86,7 +90,7 @@ def save_result(status, message, **extra):
     with open(tmp, "w") as f:
         json.dump(result, f, ensure_ascii=False, indent=2)
     os.rename(tmp, RESULT_FILE)
-    print("[%s] 结果已写入: %s" % (USER_LABEL, RESULT_FILE))
+    log("结果已写入: %s" % RESULT_FILE)
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -108,9 +112,10 @@ def check_available(headers):
             pay_amount = data["data"].get("payAmount")
             biz_id = data["data"].get("bizId")
             return not sold_out, pay_amount, biz_id, data["data"]
+        return False, None, None, data
     except Exception as e:
-        print("  [preview] 异常: %s" % e)
-    return False, None, None, None
+        log("[preview] 异常: %s" % e)
+        return False, None, None, None
 
 
 def create_sign(headers):
@@ -123,10 +128,10 @@ def create_sign(headers):
             timeout=10,
         )
         data = resp.json()
-        print("  [create-sign] 响应: %s" % json.dumps(data, ensure_ascii=False))
+        log("[create-sign] 响应: %s" % json.dumps(data, ensure_ascii=False))
         return data
     except Exception as e:
-        print("  [create-sign] 异常: %s" % e)
+        log("[create-sign] 异常: %s" % e)
         return None
 
 
@@ -142,7 +147,7 @@ def check_limit_buy(headers):
         if data.get("code") == 200:
             return data.get("data", {})
     except Exception as e:
-        print("  [isLimitBuy] 异常: %s" % e)
+        log("[isLimitBuy] 异常: %s" % e)
     return {}
 
 
@@ -151,31 +156,33 @@ def check_limit_buy(headers):
 # ═══════════════════════════════════════════════════════════════
 
 def main():
+    log("脚本启动 | 目标: %s (%s)" % (PRODUCT_NAME, PRODUCT_ID))
+
     token = load_token()
     headers = get_headers(token)
 
     # 验证 token 有效性
     limit_info = check_limit_buy(headers)
     if not limit_info:
-        print("[%s] ❌ Token 无效或已过期" % USER_LABEL)
+        log("❌ Token 无效或已过期")
         save_result("error", "Token 无效或已过期，请重新登录")
         sys.exit(1)
-    print("[%s] ✅ Token 验证通过，限购状态: %s" % (USER_LABEL, limit_info))
+    log("✅ Token 验证通过 | 限购: %s" % limit_info)
 
     # 初始检查
     available, pay_amount, biz_id, preview_data = check_available(headers)
     if available:
-        print("[%s] 🎉 当前已可购买！直接下单" % USER_LABEL)
+        log("🎉 当前已可购买！直接下单")
     else:
-        print("[%s] ⏳ 当前售罄，等待放开..." % USER_LABEL)
-        print("   目标: %s (%s)" % (PRODUCT_NAME, PRODUCT_ID))
+        log("⏳ 当前售罄，开始轮询等待...")
 
     # 轮询等待放开（带超时）
     poll_count = 0
     start_time = time.time()
     while not available:
-        if time.time() - start_time > MAX_WAIT_MINUTES * 60:
-            print("[%s] ⏰ 等待超时（%d 分钟），退出" % (USER_LABEL, MAX_WAIT_MINUTES))
+        elapsed = time.time() - start_time
+        if elapsed > MAX_WAIT_MINUTES * 60:
+            log("⏰ 等待超时（%d 分钟），退出" % MAX_WAIT_MINUTES)
             save_result("timeout", "等待 %d 分钟后仍未补货" % MAX_WAIT_MINUTES)
             sys.exit(0)
 
@@ -191,39 +198,40 @@ def main():
         available, pay_amount, biz_id, preview_data = check_available(headers)
         poll_count += 1
 
-        if poll_count % 30 == 0:
-            print("[%s][%s] 已轮询 %d 次，仍售罄" % (USER_LABEL, now.strftime("%H:%M:%S"), poll_count))
+        # 每10次输出一次状态（高频轮询时约3秒一次）
+        if poll_count % 10 == 0:
+            log("轮询 #%d | 已等 %ds | 售罄 | interval=%.1fs" % (poll_count, int(elapsed), interval))
 
     # 放开了！
     ts = datetime.now().strftime("%H:%M:%S.%f")[:-3]
-    print("[%s] 🎉 [%s] 检测到放开！价格: ¥%s" % (USER_LABEL, ts, pay_amount))
-    print("   preview 完整数据: %s" % json.dumps(preview_data, ensure_ascii=False))
+    log("🎉 检测到放开！价格: ¥%s | 轮询 %d 次" % (pay_amount, poll_count))
+    log("preview: %s" % json.dumps(preview_data, ensure_ascii=False))
 
     # 立即下单
     for attempt in range(1, MAX_RETRY + 1):
-        print("[%s] [下单] 第 %d 次尝试..." % (USER_LABEL, attempt))
+        log("[下单] 第 %d/%d 次尝试..." % (attempt, MAX_RETRY))
         result = create_sign(headers)
 
         if result and result.get("code") == 200:
             order_data = result.get("data", {})
-            print("[%s] ✅ 下单成功！" % USER_LABEL)
-            print("   订单数据: %s" % json.dumps(order_data, ensure_ascii=False))
+            log("✅ 下单成功！")
+            log("订单: %s" % json.dumps(order_data, ensure_ascii=False))
 
             pay_url = order_data.get("payUrl") or order_data.get("url") or order_data.get("signUrl")
             save_result("success", "下单成功", price=pay_amount, detect_time=ts, pay_url=pay_url, order_data=order_data)
             return
 
         elif result and result.get("code") == 500:
-            print("[%s] [下单] 失败: %s" % (USER_LABEL, result.get("msg")))
+            log("[下单] 失败: %s" % result.get("msg"))
             if attempt < MAX_RETRY:
                 time.sleep(0.2)
         else:
-            print("[%s] [下单] 未知响应: %s" % (USER_LABEL, result))
+            log("[下单] 未知响应: %s" % result)
             if attempt < MAX_RETRY:
                 time.sleep(0.3)
 
     # 全部重试失败
-    print("[%s] ❌ 下单失败，已重试 %d 次" % (USER_LABEL, MAX_RETRY))
+    log("❌ 下单失败，已重试 %d 次" % MAX_RETRY)
     save_result("failed", "重试 %d 次均未成功" % MAX_RETRY)
 
 
