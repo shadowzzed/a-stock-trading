@@ -358,6 +358,9 @@ def _is_similar_to_any(title, existing_titles, threshold=0.4):
 FEISHU_WEBHOOK_URL = _cfg["feishu_webhook_url"]
 
 
+_NO_PROXY = {"http": None, "https": None}  # 绕过系统代理直连
+
+
 def send_feishu(content):
     resp = requests.post(
         FEISHU_WEBHOOK_URL,
@@ -366,6 +369,7 @@ def send_feishu(content):
             "card": {"elements": [{"tag": "markdown", "content": content}]},
         },
         timeout=15,
+        proxies=_NO_PROXY,
     )
     data = resp.json()
     if data.get("code") == 0 or data.get("StatusCode") == 0:
@@ -491,6 +495,7 @@ def ai_batch_interpret(items):
                         "max_tokens": 1500,
                     },
                     timeout=90,
+                    proxies=_NO_PROXY,
                 )
                 data = resp.json()
                 track_tokens(data.get("usage"), len(batch))
@@ -1097,6 +1102,7 @@ def ai_aggregate(items_with_interp):
                     "max_tokens": 6000,
                 },
                 timeout=180,
+                proxies=_NO_PROXY,
             )
             data = resp.json()
             track_tokens(data.get("usage"), len(items_with_interp))
@@ -1119,17 +1125,23 @@ def flush_aggregate_buffer(today, sent_keys):
         return 0
 
     buf = _news_buffer[:]
-    _news_buffer = []
 
     # 过滤掉已单独推送的新闻，聚合时不再重复
     already_sent = [it for it in buf if it.get("sent_immediately")]
     buf_for_aggregate = [it for it in buf if not it.get("sent_immediately")]
 
-    window_start = min(it["item"].get("time", "??:??") for it in buf)
+    window_start = min((it["item"].get("time", "??:??") for it in buf), default="??:??")
     window_end = datetime.now().strftime("%H:%M")
 
     print("[%s] 聚合 %d 条新闻（%s - %s），其中 %d 条已单独推送跳过" % (
         window_end, len(buf), window_start, window_end, len(already_sent)), flush=True)
+
+    # 限制送入 AI 的条数（最多 60 条，避免 prompt 过长超时）
+    MAX_AGGREGATE_ITEMS = 60
+    if len(buf_for_aggregate) > MAX_AGGREGATE_ITEMS:
+        print("  ⚠️ 缓冲区 %d 条超过上限 %d，截取最新的 %d 条" % (
+            len(buf_for_aggregate), MAX_AGGREGATE_ITEMS, MAX_AGGREGATE_ITEMS), flush=True)
+        buf_for_aggregate = buf_for_aggregate[-MAX_AGGREGATE_ITEMS:]
 
     # 调用聚合 AI（仅未单独推送的）
     aggregate_text = ai_aggregate(buf_for_aggregate) if buf_for_aggregate else None
@@ -1138,8 +1150,14 @@ def flush_aggregate_buffer(today, sent_keys):
         # 发送聚合结果到飞书
         send_feishu(aggregate_text)
         print("  ✅ 聚合报告已发送", flush=True)
+    elif buf_for_aggregate:
+        # AI 聚合失败，不清空缓冲区，等下一轮重试
+        print("  ⚠️ 聚合AI失败，保留缓冲区 %d 条待下轮重试" % len(_news_buffer), flush=True)
+        _last_aggregate_time[0] = time.time()  # 重置计时器避免立即重试
+        return 0
 
-    # 所有新闻保存到 daily 文件（不管聚合是否成功）
+    # 聚合成功（或无需聚合），清空缓冲区并保存
+    _news_buffer = []
     for it in buf:
         save_to_trading(today, it["item"], it["interpretation"])
         save_news_item(it["item"], it["interpretation"])
