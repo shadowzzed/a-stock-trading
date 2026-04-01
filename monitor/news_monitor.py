@@ -54,9 +54,9 @@ AI_API_KEY = _cfg["ai_api_key"]
 AI_MODEL = _cfg["ai_model"]
 
 # 飞书 App Bot
-FEISHU_APP_ID = os.environ.get("FEISHU_APP_ID", "")
-FEISHU_APP_SECRET = os.environ.get("FEISHU_APP_SECRET", "")
-FEISHU_RECEIVE_ID = os.environ.get("FEISHU_RECEIVE_ID", "")  # union_id
+FEISHU_APP_ID = _cfg["feishu_app_id"]
+FEISHU_APP_SECRET = _cfg["feishu_app_secret"]
+FEISHU_RECEIVE_ID = _cfg["feishu_receive_id"]  # union_id
 
 # TrendRadar AI 筛选阈值
 MIN_RELEVANCE_SCORE = 0.7
@@ -355,7 +355,7 @@ def _is_similar_to_any(title, existing_titles, threshold=0.4):
 # 飞书
 # ═══════════════════════════════════════════════════════════════
 
-FEISHU_WEBHOOK_URL = os.environ.get("FEISHU_WEBHOOK_URL", "")
+FEISHU_WEBHOOK_URL = _cfg["feishu_webhook_url"]
 
 
 def send_feishu(content):

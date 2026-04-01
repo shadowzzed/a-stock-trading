@@ -71,6 +71,12 @@ def get_config():
         "ai_api_key": os.environ.get("ARK_API_KEY", yaml_cfg.get("ai_api_key", "")),
         "ai_api_base": os.environ.get("ARK_API_BASE", yaml_cfg.get("ai_api_base", "https://ark.cn-beijing.volces.com/api/v3")),
         "ai_model": os.environ.get("ARK_MODEL", yaml_cfg.get("ai_model", "")),
+
+        # 飞书配置（环境变量 > config.yaml > 默认值）
+        "feishu_app_id": os.environ.get("FEISHU_APP_ID", yaml_cfg.get("feishu_app_id", "")),
+        "feishu_app_secret": os.environ.get("FEISHU_APP_SECRET", yaml_cfg.get("feishu_app_secret", "")),
+        "feishu_receive_id": os.environ.get("FEISHU_RECEIVE_ID", yaml_cfg.get("feishu_receive_id", "")),
+        "feishu_webhook_url": os.environ.get("FEISHU_WEBHOOK_URL", yaml_cfg.get("feishu_webhook_url", "")),
     }
     return _config_cache
 
