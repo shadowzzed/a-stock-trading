@@ -13,10 +13,12 @@ from .agents.analysts import sentiment_analyst, sector_analyst, leader_analyst
 from .agents.debate import bull_researcher, bear_researcher, judge, final_review
 
 
+import sys
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from config import get_ai_providers
+
+
 DEFAULT_CONFIG = {
-    "llm_provider": "openai",          # openai-compatible API
-    "model": os.environ.get("ARK_MODEL", ""),  # 默认用火山引擎 DeepSeek
-    "base_url": os.environ.get("ARK_API_BASE", "https://ark.cn-beijing.volces.com/api/v3"),
     "max_debate_rounds": 1,            # 多空辩论轮数
 }
 
@@ -33,13 +35,39 @@ def should_continue_debate(state: AgentState, max_rounds: int) -> str:
 
 
 def _create_llm(cfg: dict):
-    """创建 LLM 实例"""
+    """创建 LLM 实例（Grok 优先，DeepSeek fallback）"""
     from langchain_openai import ChatOpenAI
-    return ChatOpenAI(
-        model=cfg["model"],
-        base_url=cfg["base_url"],
+
+    providers = get_ai_providers()
+    if not providers:
+        raise ValueError("未配置任何 AI 提供商（XAI_API_KEY 或 ARK_API_KEY）")
+
+    # 用第一个提供商作为主力
+    primary = providers[0]
+    llm = ChatOpenAI(
+        model=primary["model"],
+        base_url=primary["base"],
+        api_key=primary["key"],
         temperature=cfg.get("temperature", 0.3),
     )
+
+    # 如果有多个提供商，用 with_fallbacks 链接
+    if len(providers) > 1:
+        fallbacks = []
+        for p in providers[1:]:
+            fallbacks.append(ChatOpenAI(
+                model=p["model"],
+                base_url=p["base"],
+                api_key=p["key"],
+                temperature=cfg.get("temperature", 0.3),
+            ))
+        llm = llm.with_fallbacks(fallbacks)
+        print("  [LLM] %s (fallback: %s)" % (
+            primary["name"], ", ".join(p["name"] for p in providers[1:])), flush=True)
+    else:
+        print("  [LLM] %s" % primary["name"], flush=True)
+
+    return llm
 
 
 def build_graph(config: Optional[dict] = None) -> StateGraph:
