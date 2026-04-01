@@ -1074,18 +1074,47 @@ def load_aggregate_prompt():
         return f.read()
 
 
-def ai_aggregate(items_with_interp):
-    """调用 AI 聚合分析，输出 Top 30"""
-    if not items_with_interp:
-        return None
+def _rank_importance(interpretation):
+    """根据 AI 解读内容判断重要度分数（越高越重要）"""
+    text = interpretation or ""
+    score = 0
+    # 供需类（最高）
+    for kw in ["减产", "扩产", "限产", "停产", "产能", "供需", "涨价", "降价", "短缺"]:
+        if kw in text:
+            score = max(score, 50)
+    # 业绩类
+    for kw in ["业绩预增", "业绩预减", "净利润", "营收增长", "营收下降", "扭亏", "首亏", "暴雷"]:
+        if kw in text:
+            score = max(score, 40)
+    # 利好/利空明确标注
+    if "利好" in text:
+        score = max(score, 30)
+    if "利空" in text:
+        score = max(score, 30)
+    # 地缘
+    for kw in ["制裁", "冲突", "战争", "军事", "袭击", "关税", "封锁"]:
+        if kw in text:
+            score = max(score, 35)
+    # 有具体个股代码
+    import re
+    if re.search(r'\d{6}', text):
+        score += 10
+    # 有板块关联
+    for kw in ["板块", "概念", "涨停", "跌停"]:
+        if kw in text:
+            score += 5
+    return score
 
-    prompt = load_aggregate_prompt()
-    news_text = "\n".join(
-        "%d. [%s][%s] %s" % (i + 1, it["item"].get("source", ""), it["item"].get("time", ""), it["item"]["title"])
-        for i, it in enumerate(items_with_interp)
-    )
 
-    user_content = "时间窗口内共 %d 条未单独推送的新闻（已单独推送的高优新闻不在此列）：\n\n%s" % (len(items_with_interp), news_text)
+def ai_rank_summaries(summaries_text):
+    """用 AI 对已有摘要做排序去重，输入很短不会超时"""
+    prompt = """你是A股短线新闻编辑。以下是已经解读过的新闻摘要列表，请：
+1. 去重（同一事件合并）
+2. 按对A股短线交易的影响程度从高到低排序
+3. 输出前30条（不足则全部）
+4. 保持原有的格式（板块/个股/利好利空/解读）
+
+直接输出排序后的列表，不要加额外说明。"""
 
     for attempt in range(3):
         try:
@@ -1096,37 +1125,37 @@ def ai_aggregate(items_with_interp):
                     "model": AI_MODEL,
                     "messages": [
                         {"role": "system", "content": prompt},
-                        {"role": "user", "content": user_content},
+                        {"role": "user", "content": summaries_text},
                     ],
                     "temperature": 0.3,
                     "max_tokens": 6000,
                 },
-                timeout=180,
+                timeout=90,
                 proxies=_NO_PROXY,
             )
             data = resp.json()
-            track_tokens(data.get("usage"), len(items_with_interp))
-            _write_heartbeat()  # 聚合AI成功后刷新心跳
+            track_tokens(data.get("usage"), 0)
+            _write_heartbeat()
             return data["choices"][0]["message"]["content"].strip()
         except Exception as e:
-            _write_heartbeat()  # 重试前也刷新心跳
+            _write_heartbeat()
             if attempt < 2:
-                print("  [聚合AI] 第%d次失败，重试: %s" % (attempt + 1, e), flush=True)
+                print("  [排序AI] 第%d次失败，重试: %s" % (attempt + 1, e), flush=True)
                 time.sleep(5 * (attempt + 1))
             else:
-                log_error("聚合AI", "3次重试均失败: %s" % e)
+                log_error("排序AI", "3次重试均失败: %s" % e)
     return None
 
 
 def flush_aggregate_buffer(today, sent_keys):
-    """将缓冲区内的新闻聚合后发送"""
+    """将缓冲区内的新闻摘要排序后发送"""
     global _news_buffer
     if not _news_buffer:
         return 0
 
     buf = _news_buffer[:]
 
-    # 过滤掉已单独推送的新闻，聚合时不再重复
+    # 过滤掉已单独推送的新闻
     already_sent = [it for it in buf if it.get("sent_immediately")]
     buf_for_aggregate = [it for it in buf if not it.get("sent_immediately")]
 
@@ -1136,27 +1165,46 @@ def flush_aggregate_buffer(today, sent_keys):
     print("[%s] 聚合 %d 条新闻（%s - %s），其中 %d 条已单独推送跳过" % (
         window_end, len(buf), window_start, window_end, len(already_sent)), flush=True)
 
-    # 限制送入 AI 的条数（最多 60 条，避免 prompt 过长超时）
-    MAX_AGGREGATE_ITEMS = 60
-    if len(buf_for_aggregate) > MAX_AGGREGATE_ITEMS:
-        print("  ⚠️ 缓冲区 %d 条超过上限 %d，截取最新的 %d 条" % (
-            len(buf_for_aggregate), MAX_AGGREGATE_ITEMS, MAX_AGGREGATE_ITEMS), flush=True)
-        buf_for_aggregate = buf_for_aggregate[-MAX_AGGREGATE_ITEMS:]
-
-    # 调用聚合 AI（仅未单独推送的）
-    aggregate_text = ai_aggregate(buf_for_aggregate) if buf_for_aggregate else None
-
-    if aggregate_text:
-        # 发送聚合结果到飞书
-        send_feishu(aggregate_text)
-        print("  ✅ 聚合报告已发送", flush=True)
-    elif buf_for_aggregate:
-        # AI 聚合失败，不清空缓冲区，等下一轮重试
-        print("  ⚠️ 聚合AI失败，保留缓冲区 %d 条待下轮重试" % len(_news_buffer), flush=True)
-        _last_aggregate_time[0] = time.time()  # 重置计时器避免立即重试
+    if not buf_for_aggregate:
+        _news_buffer = []
+        _last_aggregate_time[0] = time.time()
         return 0
 
-    # 聚合成功（或无需聚合），清空缓冲区并保存
+    # 用已有的 AI 摘要（interpretation）构建排序输入
+    # 每条只有标题+一行摘要，非常短，不会超时
+    summaries = []
+    for it in buf_for_aggregate:
+        title = it["item"]["title"]
+        source = it["item"].get("source", "")
+        t = it["item"].get("time", "")
+        interp = it.get("interpretation", "")
+        summaries.append("[%s][%s] %s\n%s" % (source, t, title, interp))
+
+    # 先按规则粗排（importance score）
+    scored = list(zip(buf_for_aggregate, summaries))
+    scored.sort(key=lambda x: _rank_importance(x[1]), reverse=True)
+
+    # 取前60条摘要送 AI 做精排+去重（摘要很短，60条约3000字，不会超时）
+    top_summaries = [s for _, s in scored[:60]]
+    summaries_text = "共 %d 条新闻摘要（已按重要度粗排）：\n\n" % len(top_summaries)
+    summaries_text += "\n\n".join("%d. %s" % (i + 1, s) for i, s in enumerate(top_summaries))
+
+    # AI 精排去重
+    aggregate_text = ai_rank_summaries(summaries_text)
+
+    if aggregate_text:
+        header = "### 新闻聚合（%s - %s，%d 条）\n\n" % (window_start, window_end, len(buf_for_aggregate))
+        send_feishu(header + aggregate_text)
+        print("  ✅ 聚合报告已发送（%d 条摘要排序）" % len(top_summaries), flush=True)
+    else:
+        # AI 排序也失败，用规则排序的结果直接发送前30条
+        print("  ⚠️ AI排序失败，使用规则排序直接发送", flush=True)
+        fallback = "### 新闻聚合（%s - %s，%d 条）\n\n" % (window_start, window_end, len(buf_for_aggregate))
+        for i, (_, s) in enumerate(scored[:30]):
+            fallback += "**%d.** %s\n\n" % (i + 1, s)
+        send_feishu(fallback)
+
+    # 清空缓冲区并保存
     _news_buffer = []
     for it in buf:
         save_to_trading(today, it["item"], it["interpretation"])
