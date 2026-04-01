@@ -1070,7 +1070,7 @@ def load_aggregate_prompt():
 
 
 def ai_aggregate(items_with_interp):
-    """调用 AI 聚合分析，输出 Top 10"""
+    """调用 AI 聚合分析，输出 Top 30"""
     if not items_with_interp:
         return None
 
@@ -1080,7 +1080,7 @@ def ai_aggregate(items_with_interp):
         for i, it in enumerate(items_with_interp)
     )
 
-    user_content = "时间窗口内共 %d 条原始新闻：\n\n%s" % (len(items_with_interp), news_text)
+    user_content = "时间窗口内共 %d 条未单独推送的新闻（已单独推送的高优新闻不在此列）：\n\n%s" % (len(items_with_interp), news_text)
 
     for attempt in range(3):
         try:
@@ -1094,9 +1094,9 @@ def ai_aggregate(items_with_interp):
                         {"role": "user", "content": user_content},
                     ],
                     "temperature": 0.3,
-                    "max_tokens": 3000,
+                    "max_tokens": 6000,
                 },
-                timeout=120,
+                timeout=180,
             )
             data = resp.json()
             track_tokens(data.get("usage"), len(items_with_interp))
@@ -1121,13 +1121,18 @@ def flush_aggregate_buffer(today, sent_keys):
     buf = _news_buffer[:]
     _news_buffer = []
 
+    # 过滤掉已单独推送的新闻，聚合时不再重复
+    already_sent = [it for it in buf if it.get("sent_immediately")]
+    buf_for_aggregate = [it for it in buf if not it.get("sent_immediately")]
+
     window_start = min(it["item"].get("time", "??:??") for it in buf)
     window_end = datetime.now().strftime("%H:%M")
 
-    print("[%s] 聚合 %d 条新闻（%s - %s）..." % (window_end, len(buf), window_start, window_end), flush=True)
+    print("[%s] 聚合 %d 条新闻（%s - %s），其中 %d 条已单独推送跳过" % (
+        window_end, len(buf), window_start, window_end, len(already_sent)), flush=True)
 
-    # 调用聚合 AI
-    aggregate_text = ai_aggregate(buf)
+    # 调用聚合 AI（仅未单独推送的）
+    aggregate_text = ai_aggregate(buf_for_aggregate) if buf_for_aggregate else None
 
     if aggregate_text:
         # 发送聚合结果到飞书
@@ -1237,9 +1242,11 @@ def run_once():
                 sent_count += 1
                 print("  🔔 [%s] %s" % (tag, item["title"][:30]), flush=True)
             time.sleep(0.3)
+            # 标记为已单独推送，聚合时跳过
+            _news_buffer.append({"item": item, "interpretation": interpretation, "sent_immediately": True})
         else:
             # 暂存到聚合缓冲区
-            _news_buffer.append({"item": item, "interpretation": interpretation})
+            _news_buffer.append({"item": item, "interpretation": interpretation, "sent_immediately": False})
             print("  📦 缓存: %s" % item["title"][:35], flush=True)
 
     # 检查是否到了聚合时间
