@@ -67,10 +67,10 @@ def get_config():
         "stocks_file": os.path.join(data_root, "stocks.md"),
         "logs_dir": os.path.join(data_root, "logs"),
 
-        # AI 配置
-        "ai_api_key": os.environ.get("ARK_API_KEY", ""),
-        "ai_api_base": os.environ.get("ARK_API_BASE", "https://ark.cn-beijing.volces.com/api/v3"),
-        "ai_model": os.environ.get("ARK_MODEL", ""),
+        # AI 配置（环境变量 > config.yaml > 默认值）
+        "ai_api_key": os.environ.get("ARK_API_KEY", yaml_cfg.get("ai_api_key", "")),
+        "ai_api_base": os.environ.get("ARK_API_BASE", yaml_cfg.get("ai_api_base", "https://ark.cn-beijing.volces.com/api/v3")),
+        "ai_model": os.environ.get("ARK_MODEL", yaml_cfg.get("ai_model", "")),
     }
     return _config_cache
 
