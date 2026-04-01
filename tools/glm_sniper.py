@@ -16,7 +16,7 @@ from datetime import datetime
 # ═══════════════════════════════════════════════════════════════
 
 API_BASE = "https://bigmodel.cn/api"
-PRODUCT_ID = os.environ.get("GLM_PRODUCT_ID", "product-a6ef45")  # 默认 Pro 套餐
+PRODUCT_ID = os.environ.get("GLM_PRODUCT_ID", "product-1df3e1")  # GLM Coding Pro ¥149/月
 PRODUCT_NAME = os.environ.get("GLM_PRODUCT_NAME", "GLM Coding Pro")
 USER_LABEL = os.environ.get("GLM_USER_LABEL", "User")
 
