@@ -8,6 +8,7 @@ import json
 import os
 import sys
 import time
+import threading
 import requests
 from datetime import datetime
 
@@ -30,8 +31,9 @@ RESULT_FILE = os.environ.get("GLM_RESULT_FILE", os.path.join(os.path.dirname(__f
 # 轮询配置
 POLL_INTERVAL = 0.3       # 放开后的轮询间隔（秒）
 PRE_POLL_INTERVAL = 1.0   # 放开前的轮询间隔（秒）
-MAX_RETRY = 5             # 下单重试次数
+MAX_RETRY = 5             # 每个线程的下单重试次数
 MAX_WAIT_MINUTES = 30     # 最大等待时间（分钟）
+SNIPE_THREADS = int(os.environ.get("GLM_THREADS", "5"))  # 并发抢单线程数
 
 
 def log(msg):
@@ -207,32 +209,52 @@ def main():
     log("🎉 检测到放开！价格: ¥%s | 轮询 %d 次" % (pay_amount, poll_count))
     log("preview: %s" % json.dumps(preview_data, ensure_ascii=False))
 
-    # 立即下单
-    for attempt in range(1, MAX_RETRY + 1):
-        log("[下单] 第 %d/%d 次尝试..." % (attempt, MAX_RETRY))
-        result = create_sign(headers)
+    # 多线程并发抢单
+    success_event = threading.Event()
+    success_result = [None]  # 用列表存储结果，线程安全写入
 
-        if result and result.get("code") == 200:
-            order_data = result.get("data", {})
-            log("✅ 下单成功！")
-            log("订单: %s" % json.dumps(order_data, ensure_ascii=False))
+    def snipe_worker(thread_id):
+        for attempt in range(1, MAX_RETRY + 1):
+            if success_event.is_set():
+                return
+            log("[T%d] 第 %d/%d 次尝试..." % (thread_id, attempt, MAX_RETRY))
+            result = create_sign(headers)
 
-            pay_url = order_data.get("payUrl") or order_data.get("url") or order_data.get("signUrl")
-            save_result("success", "下单成功", price=pay_amount, detect_time=ts, pay_url=pay_url, order_data=order_data)
-            return
+            if result and result.get("code") == 200:
+                order_data = result.get("data", {})
+                log("[T%d] ✅ 下单成功！" % thread_id)
+                log("[T%d] 订单: %s" % (thread_id, json.dumps(order_data, ensure_ascii=False)))
+                success_result[0] = order_data
+                success_event.set()
+                return
 
-        elif result and result.get("code") == 500:
-            log("[下单] 失败: %s" % result.get("msg"))
-            if attempt < MAX_RETRY:
-                time.sleep(0.2)
-        else:
-            log("[下单] 未知响应: %s" % result)
-            if attempt < MAX_RETRY:
-                time.sleep(0.3)
+            elif result and result.get("code") == 500:
+                log("[T%d] 失败: %s" % (thread_id, result.get("msg")))
+                if attempt < MAX_RETRY and not success_event.is_set():
+                    time.sleep(0.1)
+            else:
+                log("[T%d] 未知响应: %s" % (thread_id, result))
+                if attempt < MAX_RETRY and not success_event.is_set():
+                    time.sleep(0.15)
 
-    # 全部重试失败
-    log("❌ 下单失败，已重试 %d 次" % MAX_RETRY)
-    save_result("failed", "重试 %d 次均未成功" % MAX_RETRY)
+    log("启动 %d 个抢单线程..." % SNIPE_THREADS)
+    threads = []
+    for i in range(SNIPE_THREADS):
+        t = threading.Thread(target=snipe_worker, args=(i + 1,), daemon=True)
+        threads.append(t)
+        t.start()
+
+    # 等待所有线程完成或有一个成功
+    for t in threads:
+        t.join(timeout=30)
+
+    if success_event.is_set() and success_result[0]:
+        order_data = success_result[0]
+        pay_url = order_data.get("payUrl") or order_data.get("url") or order_data.get("signUrl")
+        save_result("success", "下单成功（%d线程并发）" % SNIPE_THREADS, price=pay_amount, detect_time=ts, pay_url=pay_url, order_data=order_data)
+    else:
+        log("❌ 所有线程均未成功（%d线程 x %d次重试）" % (SNIPE_THREADS, MAX_RETRY))
+        save_result("failed", "%d线程 x %d次重试均未成功" % (SNIPE_THREADS, MAX_RETRY))
 
 
 if __name__ == "__main__":
