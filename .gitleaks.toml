@@ -1,0 +1,6 @@
+[allowlist]
+  description = "Global allow list"
+  paths = [
+    '''node_modules/''',
+    '''\.news_monitor_heartbeat''',
+  ]
