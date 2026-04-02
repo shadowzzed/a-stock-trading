@@ -11,12 +11,13 @@ sys.stderr = os.fdopen(sys.stderr.fileno(), 'w', buffering=1)
 # 设置 API Key
 # OPENAI_API_KEY must be set in environment
 
-# 添加 short-term-agents 到 path
-sys.path.insert(0, os.path.expanduser("~/src/short-term-agents"))
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from config import get_config
+
+_cfg = get_config()
+data_dir = _cfg["data_root"]
 
 from short_term_agents.backtest import run_backtest
-
-data_dir = os.path.expanduser("~/src/happyclaw/data/groups/main/trading")
 
 dates = [
     "2026-03-04", "2026-03-05", "2026-03-06",

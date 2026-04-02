@@ -1,6 +1,9 @@
 __pycache__/
 *.pyc
 *.pyo
+*.egg-info/
+dist/
+build/
 .env
 *.db
 *.db-journal
@@ -10,19 +13,16 @@ venv/
 .venv/
 node_modules/
 *.tmp
-bigmodel_auth*.json
-logs/
-# 运行时数据（目录名和包名冲突，用具体文件模式）
-daily/*.csv
-daily/*.md
-!daily/.gitkeep
-intraday/*.db
-intraday/*.db-journal
-intraday/*.db-wal
-intraday/intraday.db*
-backtest*/
 
-# 运行时数据目录
-runtime_data/
+# 敏感文件
+bigmodel_auth*.json
 config.yaml
-stocks.md
+
+# 运行时数据（由 config.yaml 的 data_root 控制）
+runtime_data/
+
+# 日志
+logs/
+
+# backtest 输出
+backtest*/

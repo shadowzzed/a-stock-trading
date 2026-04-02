@@ -1,15 +1,50 @@
-# A股短线交易分析 - 数据目录配置
+# a-stock-trading 配置文件模板
 #
-# 复制此文件为 config.yaml，修改 data_root 指向你的数据存储目录。
-# 首次运行时会自动创建子目录结构。
+# 复制为 config.yaml 并填写实际值。
+# 优先级：环境变量 > config.yaml > 默认值
 
+# ── 数据目录 ──────────────────────────────────────
 # 所有运行时数据的根目录（支持 ~ 展开）
+# 默认: ./runtime_data（项目内，开箱即用）
 data_root: ~/trading-data
 
-# 子目录结构（自动创建，一般不需要改）：
+# 目录结构（init_data_dirs 自动创建）：
 #   {data_root}/
-#   ├── intraday/intraday.db    # 盘中快照 SQLite
 #   ├── daily/YYYY-MM-DD/       # 每日数据（CSV、报告、新闻）
+#   ├── intraday/intraday.db    # 盘中快照 SQLite
 #   ├── news_monitor.db         # 新闻去重数据库
-#   ├── stocks.md               # 股票池（首次运行从仓库复制模板）
-#   └── logs/                   # 运行日志
+#   ├── stocks.md               # 股票池（首次运行从模板复制）
+#   ├── logs/                   # 运行日志
+#   ├── backtest/               # 回测结果
+#   ├── integrations/trendradar/ # TrendRadar 集成
+#   └── state/news_monitor/     # 监控状态文件
+
+# ── 外部集成（可选）──────────────────────────────
+# TrendRadar 输出目录（留空则使用 data_root 下的默认路径）
+# trendradar_output: ~/src/TrendRadar/output
+
+# ── AI 配置 ────────────────────────────────────────
+# 推荐用环境变量（更安全）：
+#   export XAI_API_KEY=...       # Grok（主力）
+#   export ARK_API_KEY=...       # DeepSeek（fallback）
+#   export ARK_MODEL=...         # DeepSeek endpoint
+
+# 也可写在这里（不推荐提交到 git）：
+# ai_api_base: https://ark.cn-beijing.volces.com/api/v3
+# ai_api_key: <your-key>
+# ai_model: <your-endpoint>
+
+# grok_api_key: <your-key>
+# grok_model: grok-3-fast
+
+# ── 飞书配置（可选）────────────────────────────────
+# 推荐用环境变量：
+#   export FEISHU_APP_ID=...
+#   export FEISHU_APP_SECRET=...
+#   export FEISHU_RECEIVE_ID=...
+#   export FEISHU_WEBHOOK_URL=...
+
+# feishu_app_id: <your-app-id>
+# feishu_app_secret: <your-app-secret>
+# feishu_receive_id: <your-union-id>
+# feishu_webhook_url: <your-webhook-url>

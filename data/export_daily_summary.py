@@ -10,15 +10,20 @@
 """
 
 import json
+import os
 import sqlite3
 import sys
 from collections import defaultdict
 from datetime import datetime
 from pathlib import Path
 
-DB_PATH = Path(__file__).parent / "intraday" / "intraday.db"
-DAILY_DIR = Path(__file__).parent / "daily"
-STOCKS_MD = Path(__file__).parent / "stocks.md"
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from config import get_config
+
+_cfg = get_config()
+DB_PATH = Path(_cfg["intraday_db"])
+DAILY_DIR = Path(_cfg["daily_dir"])
+STOCKS_MD = Path(_cfg["stocks_file"])
 
 
 def parse_stocks_md():

@@ -20,7 +20,7 @@ def main():
     )
     parser.add_argument(
         "agent",
-        choices=["opening_analysis", "early_session_analysis"],
+        choices=["opening_analysis", "early_session_analysis", "closing_review"],
         help="要运行的 Agent",
     )
     parser.add_argument(
@@ -36,9 +36,9 @@ def main():
 
     args = parser.parse_args()
 
-    from intraday.graph import run
+    from intraday.runner import run_agent
 
-    report = run(
+    report = run_agent(
         agent_name=args.agent,
         date=args.date,
         dry_run=args.dry_run,

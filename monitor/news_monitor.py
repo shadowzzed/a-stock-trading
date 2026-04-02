@@ -34,11 +34,11 @@ from config import get_config as _get_global_config
 _cfg = _get_global_config()
 
 TRENDRADAR_OUTPUT = Path(os.environ.get(
-    "TRENDRADAR_OUTPUT", os.path.expanduser("~/src/TrendRadar/output")
+    "TRENDRADAR_OUTPUT", _cfg["trendradar_output"]
 ))
 TRADING_DIR = Path(os.environ.get("TRADING_DIR", _cfg["daily_dir"]))
 STATE_DIR = Path(os.environ.get(
-    "STATE_DIR", os.path.expanduser("~/src/TrendRadar/output/.news_monitor")
+    "NEWS_STATE_DIR", _cfg["news_state_dir"]
 ))
 NEWS_DB_PATH = Path(os.environ.get("NEWS_DB_PATH", _cfg["news_db"]))
 
@@ -1341,7 +1341,7 @@ def run_once():
 # 自检与自愈
 # ═══════════════════════════════════════════════════════════════
 
-HEARTBEAT_PATH = Path(__file__).parent / ".news_monitor_heartbeat"
+HEARTBEAT_PATH = Path(os.path.join(_cfg["logs_dir"], ".news_monitor_heartbeat"))
 WATCHDOG_TIMEOUT = 300  # run_once 超过 5 分钟视为卡死
 
 

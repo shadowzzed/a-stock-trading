@@ -27,8 +27,12 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import pandas as pd
 from mootdx.quotes import Quotes
 
-STOCKS_MD = os.path.join(os.path.dirname(__file__), "stocks.md")
-INTRADAY_DIR = os.path.join(os.path.dirname(__file__), "intraday")
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from config import get_config
+
+_cfg = get_config()
+STOCKS_MD = _cfg["stocks_file"]
+INTRADAY_DIR = _cfg["intraday_dir"]
 
 # A 股代码前缀
 A_SHARE_PREFIXES = ("000", "001", "002", "003", "300", "301", "600", "601", "603", "605", "688")
@@ -177,9 +181,6 @@ def fetch_full_market(max_workers=8):
 # SQLite 存储
 # ═══════════════════════════════════════════════════════════════
 
-DB_PATH = os.path.join(INTRADAY_DIR, "intraday.db")
-
-
 def calc_limit_price(last_close, pct):
     """计算涨停/跌停价（四舍五入到分）"""
     return round(last_close * (1 + pct / 100), 2)
@@ -206,8 +207,9 @@ def check_limit(code, price, last_close):
 
 
 def get_db_path():
-    os.makedirs(INTRADAY_DIR, exist_ok=True)
-    return DB_PATH
+    cfg = get_config()
+    os.makedirs(cfg["intraday_dir"], exist_ok=True)
+    return cfg["intraday_db"]
 
 
 def init_db(conn):

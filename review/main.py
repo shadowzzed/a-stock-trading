@@ -27,7 +27,7 @@ def cli():
     parser.add_argument("date", help="分析日期，如 2026-03-24")
     parser.add_argument(
         "--data-dir",
-        default=os.path.expanduser("~/src/happyclaw/data/groups/main/trading"),
+        default=None,
         help="trading 数据目录",
     )
     parser.add_argument("--debug", action="store_true", help="打印中间过程")
@@ -60,6 +60,11 @@ def cli():
     )
 
     args = parser.parse_args()
+
+    if args.data_dir is None:
+        sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+        from config import get_config
+        args.data_dir = get_config()["data_root"]
 
     # 加载 prompt 覆盖
     prompt_overrides = {}

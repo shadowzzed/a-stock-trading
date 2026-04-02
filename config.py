@@ -1,15 +1,19 @@
 """
-全局配置加载器
+全局配置加载器 — 唯一配置入口
 
 优先级：环境变量 > config.yaml > 默认值
 
+所有业务模块必须通过 get_config() 获取路径，禁止自行拼接或 hard code。
+
 数据目录结构：
     {data_root}/
-    ├── intraday/intraday.db
     ├── daily/YYYY-MM-DD/
+    ├── intraday/intraday.db
     ├── news_monitor.db
     ├── stocks.md
-    └── logs/
+    ├── logs/
+    ├── integrations/trendradar/
+    └── state/news_monitor/
 """
 
 import os
@@ -50,12 +54,26 @@ def get_config():
 
     yaml_cfg = _load_yaml_config()
 
-    # data_root: 环境变量 > config.yaml > 默认值
+    # data_root: 环境变量 > config.yaml > 默认值（项目内 runtime_data/）
     data_root = os.environ.get(
         "TRADING_DATA_ROOT",
         yaml_cfg.get("data_root", os.path.join(_PROJECT_ROOT, "runtime_data"))
     )
     data_root = os.path.expanduser(data_root)
+
+    # trendradar_output: 环境变量 > config.yaml > 默认值
+    trendradar_output = os.environ.get(
+        "TRENDRADAR_OUTPUT",
+        yaml_cfg.get("trendradar_output", os.path.join(data_root, "integrations", "trendradar"))
+    )
+    trendradar_output = os.path.expanduser(trendradar_output)
+
+    # news_state_dir: 环境变量 > config.yaml > 默认值
+    news_state_dir = os.environ.get(
+        "NEWS_STATE_DIR",
+        yaml_cfg.get("news_state_dir", os.path.join(data_root, "state", "news_monitor"))
+    )
+    news_state_dir = os.path.expanduser(news_state_dir)
 
     _config_cache = {
         "project_root": _PROJECT_ROOT,
@@ -66,6 +84,9 @@ def get_config():
         "news_db": os.path.join(data_root, "news_monitor.db"),
         "stocks_file": os.path.join(data_root, "stocks.md"),
         "logs_dir": os.path.join(data_root, "logs"),
+        "backtest_dir": os.path.join(data_root, "backtest"),
+        "trendradar_output": trendradar_output,
+        "news_state_dir": news_state_dir,
 
         # AI 配置 — DeepSeek（环境变量 > config.yaml > 默认值）
         "ai_api_key": os.environ.get("ARK_API_KEY", yaml_cfg.get("ai_api_key", "")),
@@ -96,6 +117,9 @@ def init_data_dirs():
         cfg["daily_dir"],
         cfg["intraday_dir"],
         cfg["logs_dir"],
+        cfg["backtest_dir"],
+        cfg["trendradar_output"],
+        cfg["news_state_dir"],
     ]
     for d in dirs:
         os.makedirs(d, exist_ok=True)
