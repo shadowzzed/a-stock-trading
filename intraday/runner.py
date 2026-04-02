@@ -142,10 +142,16 @@ def build_context(agent_name: str, today: str) -> str:
         if stocks:
             sections.append("## 股票池\n\n" + stocks)
 
-        for date, content in find_recent_files(daily_dir, "阿意复盘.md", 1):
-            sections.append("## 阿意复盘 %s\n\n%s" % (date, content[:2000]))
-        for date, content in find_recent_files(daily_dir, "刺客复盘.md", 1):
-            sections.append("## 刺客复盘 %s\n\n%s" % (date, content[:2000]))
+        # 加载 review_docs/ 目录下所有 .md 文件
+        for date in get_trading_days(4)[:2]:
+            review_dir = os.path.join(daily_dir, date, "review_docs")
+            if os.path.isdir(review_dir):
+                for f in sorted(os.listdir(review_dir)):
+                    if f.endswith(".md"):
+                        name = f[:-3]
+                        content = load_file(os.path.join(review_dir, f))
+                        if content:
+                            sections.append("## %s %s\n\n%s" % (name, date, content[:2000]))
 
         news = load_file(os.path.join(daily_dir, today, "新闻.md"))
         if news:

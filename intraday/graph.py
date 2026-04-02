@@ -156,12 +156,16 @@ def _fetch_early_session(cfg: dict, today: str) -> dict:
     if stocks_text:
         context_parts.append("## 股票池\n\n" + stocks_text[:3000])
 
-    # 最近复盘
+    # 最近复盘（从 review_docs/ 目录加载所有 .md 文件）
     for date in _recent_trading_days(today, 2):
-        for reviewer in ["阿意复盘", "刺客复盘", "三哥复盘"]:
-            content = _load_file(os.path.join(daily_dir, date, "%s.md" % reviewer))
-            if content:
-                context_parts.append("## %s %s\n\n%s" % (reviewer, date, content[:2000]))
+        review_dir = os.path.join(daily_dir, date, "review_docs")
+        if os.path.isdir(review_dir):
+            for f in sorted(os.listdir(review_dir)):
+                if f.endswith(".md"):
+                    name = f[:-3]  # 去掉 .md 后缀
+                    content = _load_file(os.path.join(review_dir, f))
+                    if content:
+                        context_parts.append("## %s %s\n\n%s" % (name, date, content[:2000]))
 
     # 今日新闻
     news = _load_file(os.path.join(daily_dir, today, "新闻.md"))

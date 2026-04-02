@@ -42,12 +42,20 @@ def load_daily_data(data_dir: str, date: str, history_days: int = 7) -> DailyDat
     # 个股行情
     stock_data = _load_csv(daily_dir, f"行情_{date.replace('-', '')}.csv")
 
-    # 复盘文档（所有 *复盘.md）
+    # 复盘文档（从 review_docs/ 子目录加载所有 .md 文件）
     reviews = {}
-    for md_path in glob.glob(os.path.join(daily_dir, "*复盘*.md")):
-        name = os.path.basename(md_path)
-        with open(md_path, "r", encoding="utf-8") as f:
-            reviews[name] = f.read()
+    review_dir = os.path.join(daily_dir, "review_docs")
+    if os.path.isdir(review_dir):
+        for md_path in sorted(glob.glob(os.path.join(review_dir, "*.md"))):
+            name = os.path.basename(md_path)
+            with open(md_path, "r", encoding="utf-8") as f:
+                reviews[name] = f.read()
+    else:
+        # 兼容旧目录结构（复盘文件直接在日期目录下）
+        for md_path in glob.glob(os.path.join(daily_dir, "*复盘*.md")):
+            name = os.path.basename(md_path)
+            with open(md_path, "r", encoding="utf-8") as f:
+                reviews[name] = f.read()
 
     # 事件催化
     events = ""
