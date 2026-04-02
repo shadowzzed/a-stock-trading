@@ -103,6 +103,10 @@ def get_config():
         "feishu_app_secret": os.environ.get("FEISHU_APP_SECRET", yaml_cfg.get("feishu_app_secret", "")),
         "feishu_receive_id": os.environ.get("FEISHU_RECEIVE_ID", yaml_cfg.get("feishu_receive_id", "")),
         "feishu_webhook_url": os.environ.get("FEISHU_WEBHOOK_URL", yaml_cfg.get("feishu_webhook_url", "")),
+
+        # 交易对话 Bot（独立飞书应用）
+        "chat_feishu_app_id": os.environ.get("CHAT_FEISHU_APP_ID", yaml_cfg.get("chat_feishu_app_id", "")),
+        "chat_feishu_app_secret": os.environ.get("CHAT_FEISHU_APP_SECRET", yaml_cfg.get("chat_feishu_app_secret", "")),
     }
     return _config_cache
 

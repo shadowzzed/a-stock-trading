@@ -10,6 +10,7 @@ dependencies = [
     "langgraph",
     "langchain-openai",
     "langchain-core",
+    "lark-oapi",
 ]
 
 [project.optional-dependencies]
@@ -20,3 +21,4 @@ intraday-agent = "intraday.cli:main"
 review-agent = "review.main:cli"
 monitor-agent = "monitor.agent:main"
 trading-doctor = "tools.doctor:main"
+chat-agent = "chat.__main__:main"
