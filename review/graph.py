@@ -178,10 +178,9 @@ def _load_initial_state(
     # 加载跨周期记忆（严格截止到分析日期，不读未来数据）
     memory_dir = cfg.get("memory_dir", "")
     if not memory_dir:
-        # data_dir = .../happyclaw/data/groups/main/trading
-        # memory  = .../happyclaw/data/memory/main/
-        happyclaw_data = os.path.dirname(os.path.dirname(os.path.dirname(data_dir)))
-        memory_dir = os.path.join(happyclaw_data, "memory", "main")
+        # 从 data_dir 向上推导到项目 data/ 目录，再拼接 memory/main/
+        data_top = os.path.dirname(os.path.dirname(os.path.dirname(data_dir)))
+        memory_dir = os.path.join(data_top, "memory", "main")
     memory_text = load_memory(memory_dir, date)
 
     return {

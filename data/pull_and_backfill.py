@@ -5,7 +5,7 @@ import sys
 import baostock as bs
 import pandas as pd
 
-# baostock-batch package should be installed (e.g. pip install -e ~/src/happyclaw/container/skills/baostock-batch)
+# baostock-batch package should be installed (e.g. pip install baostock-batch)
 from baostock_batch import parse_stock_input
 
 DAILY_DIR = os.path.join(os.path.dirname(__file__), "daily")
