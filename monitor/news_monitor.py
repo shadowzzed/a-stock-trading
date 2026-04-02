@@ -1015,9 +1015,23 @@ def save_to_trading(today, item, interpretation):
         f.write(entry)
 
 
-def format_feishu(item, interpretation, ai_provider=""):
+def format_feishu(item, interpretation, ai_provider="", priority=None):
     t = item.get("time", "")
     t_part = " · %s" % t if t else ""
+
+    # 标签：优先级 + 关联板块 + 关联个股
+    tags = []
+    if priority:
+        tag_map = {"supply_demand": "供需", "earnings": "财报", "research": "研报", "geopolitics": "地缘"}
+        tags.append(tag_map.get(priority, priority))
+    if item.get("plates"):
+        for p in item["plates"][:2]:
+            tags.append(p)
+    if item.get("stocks"):
+        for s in item["stocks"][:3]:
+            # 去掉可能的代码后缀，只留名称
+            tags.append(s.split("(")[0].strip() if "(" in s else s)
+    tag_line = " ".join("[%s]" % tg for tg in tags) + "\n" if tags else ""
 
     # 已有的关联信息
     extra_parts = []
@@ -1035,8 +1049,8 @@ def format_feishu(item, interpretation, ai_provider=""):
 
     model_tag = "\n`AI: %s`" % ai_provider if ai_provider else ""
 
-    return "**%s**\n`%s`%s%s%s\n\n%s%s%s" % (
-        item["title"], item["source"], t_part, extra_line, brief_line, interpretation, url_line, model_tag
+    return "%s**%s**\n`%s`%s%s%s\n\n%s%s%s" % (
+        tag_line, item["title"], item["source"], t_part, extra_line, brief_line, interpretation, url_line, model_tag
     )
 
 
@@ -1193,7 +1207,18 @@ def flush_aggregate_buffer(today, sent_keys):
         source = it["item"].get("source", "")
         t = it["item"].get("time", "")
         interp = it.get("interpretation", "")
-        summaries.append("[%s][%s] %s\n%s" % (source, t, title, interp))
+        # 构建标签：优先级 + 关联板块 + 关联个股
+        tags = []
+        if it.get("priority"):
+            tag_map = {"supply_demand": "供需", "earnings": "财报", "research": "研报", "geopolitics": "地缘"}
+            tags.append(tag_map.get(it["priority"], it["priority"]))
+        if it["item"].get("plates"):
+            tags.extend(it["item"]["plates"][:2])
+        if it["item"].get("stocks"):
+            for s in it["item"]["stocks"][:3]:
+                tags.append(s.split("(")[0].strip() if "(" in s else s)
+        tag_str = " ".join("[%s]" % tg for tg in tags) + " " if tags else ""
+        summaries.append("%s[%s][%s] %s\n%s" % (tag_str, source, t, title, interp))
 
     # 先按规则粗排（importance score）
     scored = list(zip(buf_for_aggregate, summaries))
@@ -1314,7 +1339,7 @@ def run_once():
         if trading and priority:
             # 交易时间 + 高优先级 → 立即推送
             tag = {"supply_demand": "供需", "earnings": "业绩", "research": "研报", "geopolitics": "地缘"}.get(priority, "")
-            msg = "🔔 **[%s]** %s" % (tag, format_feishu(item, interpretation, ai_provider))
+            msg = "🔔 **[%s]** %s" % (tag, format_feishu(item, interpretation, ai_provider, priority=priority))
             if send_feishu(msg):
                 save_to_trading(today, item, interpretation)
                 save_news_item(item, interpretation)
