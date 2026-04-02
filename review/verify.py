@@ -184,12 +184,9 @@ def verify_prediction(
     if stock_pnl:
         d1_summary += f"\n\n{stock_pnl}"
 
-    # 调用 LLM 验证
-    llm = ChatOpenAI(
-        model=cfg["model"],
-        base_url=cfg["base_url"],
-        temperature=0.1,
-    )
+    # 调用 LLM 验证（Grok 优先，DeepSeek fallback）
+    from .graph import _create_llm
+    llm = _create_llm({**cfg, "temperature": 0.1})
 
     verify_msg = f"""## Day D ({day_d}) 的 Agent 预测报告
 

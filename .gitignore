@@ -12,8 +12,14 @@ node_modules/
 *.tmp
 bigmodel_auth*.json
 logs/
-daily/
-intraday/
+# 运行时数据（目录名和包名冲突，用具体文件模式）
+daily/*.csv
+daily/*.md
+!daily/.gitkeep
+intraday/*.db
+intraday/*.db-journal
+intraday/*.db-wal
+intraday/intraday.db*
 backtest*/
 
 # 运行时数据目录
