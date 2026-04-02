@@ -201,6 +201,9 @@ def _load_initial_state(
         "sentiment_report": "",
         "sector_report": "",
         "leader_report": "",
+        "sentiment_data": {},
+        "sector_data": {},
+        "leader_data": {},
         "debate_state": {
             "bull_history": [],
             "bear_history": [],
@@ -209,7 +212,10 @@ def _load_initial_state(
             "judge_decision": "",
             "count": 0,
         },
+        "bull_claims": [],
+        "bear_claims": [],
         "final_report": "",
+        "final_decision": {},
         "human_feedback": "",
         "reviewed_report": "",
         "prompt_overrides": (config or {}).get("prompt_overrides", {}),
@@ -219,10 +225,12 @@ def _load_initial_state(
 def _save_intermediate_outputs(data_dir: str, date: str, state: dict):
     """保存各 agent 中间输出到 daily 目录"""
     import os
+    import json as _json
+
     daily_dir = os.path.join(data_dir, "daily", date)
     os.makedirs(daily_dir, exist_ok=True)
 
-    # 三位分析师
+    # 三位分析师 markdown 报告
     for key, filename in [
         ("sentiment_report", "agent_01_情绪分析.md"),
         ("sector_report", "agent_02_板块分析.md"),
@@ -232,6 +240,17 @@ def _save_intermediate_outputs(data_dir: str, date: str, state: dict):
         if content:
             with open(os.path.join(daily_dir, filename), "w", encoding="utf-8") as f:
                 f.write(content)
+
+    # 三位分析师结构化 JSON
+    for key, filename in [
+        ("sentiment_data", "agent_state_01_sentiment.json"),
+        ("sector_data", "agent_state_02_sector.json"),
+        ("leader_data", "agent_state_03_leader.json"),
+    ]:
+        data = state.get(key)
+        if data:
+            with open(os.path.join(daily_dir, filename), "w", encoding="utf-8") as f:
+                _json.dump(data, f, ensure_ascii=False, indent=2)
 
     # 多空辩论
     debate = state.get("debate_state") or {}
@@ -248,11 +267,26 @@ def _save_intermediate_outputs(data_dir: str, date: str, state: dict):
         with open(os.path.join(daily_dir, "agent_04_多空辩论.md"), "w", encoding="utf-8") as f:
             f.write("\n\n---\n\n".join(parts))
 
+    # 辩论结构化 JSON
+    debate_data = {
+        "bull_claims": state.get("bull_claims") or [],
+        "bear_claims": state.get("bear_claims") or [],
+        "rounds": len(state.get("bull_claims") or []),
+    }
+    with open(os.path.join(daily_dir, "agent_state_04_debate.json"), "w", encoding="utf-8") as f:
+        _json.dump(debate_data, f, ensure_ascii=False, indent=2)
+
     # 最终报告
     final = state.get("final_report", "")
     if final:
         with open(os.path.join(daily_dir, "agent_05_裁决报告.md"), "w", encoding="utf-8") as f:
             f.write(final)
+
+    # 最终决策结构化 JSON
+    final_decision = state.get("final_decision")
+    if final_decision:
+        with open(os.path.join(daily_dir, "agent_state_05_decision.json"), "w", encoding="utf-8") as f:
+            _json.dump(final_decision, f, ensure_ascii=False, indent=2)
 
 
 def run(

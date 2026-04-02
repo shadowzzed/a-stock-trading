@@ -4,6 +4,41 @@ from langchain_core.messages import SystemMessage, HumanMessage
 
 from ..state import AgentState, DebateState
 from ..prompts import BULL_RESEARCHER, BEAR_RESEARCHER, JUDGE, FINAL_REVIEW
+from .analysts import _parse_structured_output
+
+
+# 附加到辩论 user message 末尾的 JSON 输出指令
+_DEBATE_JSON_INSTRUCTION = """
+
+在你的辩论输出的最开头，必须先输出一个 JSON 代码块：
+```json
+{
+  "claim": "本轮核心观点",
+  "core_evidence": ["证据1", "证据2"],
+  "attack_previous_point": "针对对方观点的反驳",
+  "uncertainty": "本观点的不确定性",
+  "trading_implication": "对交易动作的含义"
+}
+```
+然后再输出你的完整论述。"""
+
+# 附加到裁决官 user message 末尾的 JSON 输出指令
+_JUDGE_JSON_INSTRUCTION = """
+
+在你的报告最开头，必须先输出一个 JSON 代码块：
+```json
+{
+  "market_bias": "偏多/偏空/震荡",
+  "position_advice": "轻仓/半仓/重仓/空仓",
+  "main_sectors": ["板块1", "板块2"],
+  "focus_stocks": ["个股1", "个股2"],
+  "do_actions": ["可做动作1"],
+  "avoid_actions": ["避免动作1"],
+  "risk_conditions": ["风险触发条件1"],
+  "confidence": 0.68
+}
+```
+然后再输出完整的复盘报告。"""
 
 
 def _get_prompt(state, agent_name, default_prompt):
@@ -56,11 +91,19 @@ def bull_researcher(state: AgentState, llm) -> dict:
 
 请基于以上分析师报告，给出你的看多观点和做多机会。"""
 
+    user_msg += _DEBATE_JSON_INSTRUCTION
+
     prompt = _get_prompt(state, "bull", BULL_RESEARCHER)
     response = llm.invoke([
         SystemMessage(content=prompt),
         HumanMessage(content=user_msg),
     ])
+
+    # 解析结构化论点
+    claim_data, _ = _parse_structured_output(response.content)
+    bull_claims = list(state.get("bull_claims") or [])
+    if claim_data:
+        bull_claims.append(claim_data)
 
     bull_history = list(debate.get("bull_history", []))
     bull_history.append(response.content)
@@ -74,7 +117,7 @@ def bull_researcher(state: AgentState, llm) -> dict:
         "judge_decision": "",
         "count": count,
     }
-    return {"debate_state": new_debate}
+    return {"debate_state": new_debate, "bull_claims": bull_claims}
 
 
 def bear_researcher(state: AgentState, llm) -> dict:
@@ -90,11 +133,19 @@ def bear_researcher(state: AgentState, llm) -> dict:
 
 请反驳看多派的观点，指出做多的风险和隐患。"""
 
+    user_msg += _DEBATE_JSON_INSTRUCTION
+
     prompt = _get_prompt(state, "bear", BEAR_RESEARCHER)
     response = llm.invoke([
         SystemMessage(content=prompt),
         HumanMessage(content=user_msg),
     ])
+
+    # 解析结构化论点
+    claim_data, _ = _parse_structured_output(response.content)
+    bear_claims = list(state.get("bear_claims") or [])
+    if claim_data:
+        bear_claims.append(claim_data)
 
     bear_history = list(debate.get("bear_history", []))
     bear_history.append(response.content)
@@ -108,7 +159,7 @@ def bear_researcher(state: AgentState, llm) -> dict:
         "judge_decision": "",
         "count": count,
     }
-    return {"debate_state": new_debate}
+    return {"debate_state": new_debate, "bear_claims": bear_claims}
 
 
 def judge(state: AgentState, llm) -> dict:
@@ -147,13 +198,24 @@ def judge(state: AgentState, llm) -> dict:
 
 请综合以上所有信息，输出最终的每日复盘报告。"""
 
+    user_msg += _JUDGE_JSON_INSTRUCTION
+
     prompt = _get_prompt(state, "judge", JUDGE)
     response = llm.invoke([
         SystemMessage(content=prompt),
         HumanMessage(content=user_msg),
     ])
 
-    return {"final_report": response.content}
+    final_decision, _ = _parse_structured_output(response.content)
+
+    # 累积传递辩论结构化数据
+    result = {
+        "final_report": response.content,
+        "final_decision": final_decision,
+        "bull_claims": state.get("bull_claims") or [],
+        "bear_claims": state.get("bear_claims") or [],
+    }
+    return result
 
 
 def final_review(state: AgentState, llm) -> dict:

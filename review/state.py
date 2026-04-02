@@ -37,11 +37,23 @@ class AgentState(TypedDict):
     sector_report: str          # 板块轮动分析
     leader_report: str          # 龙头辨识分析
 
+    # 阶段1：结构化分析数据（新增）
+    sentiment_data: dict        # 情绪分析结构化结论
+    sector_data: dict           # 板块分析结构化结论
+    leader_data: dict           # 龙头分析结构化结论
+
     # 阶段2：多空辩论
     debate_state: DebateState
 
+    # 阶段2：辩论结构化数据（新增）
+    bull_claims: list           # 看多派结构化论点列表
+    bear_claims: list           # 看空派结构化论点列表
+
     # 阶段3：最终输出
     final_report: str           # 最终复盘报告（AI 初步版）
+
+    # 阶段3：最终决策（新增）
+    final_decision: dict        # 结构化决策对象
 
     # 阶段4：人类终审
     human_feedback: str         # 人类终审反馈
