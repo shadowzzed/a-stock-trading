@@ -1,0 +1,14 @@
+{
+  "name": "trade-expert-agent",
+  "version": "1.0.0",
+  "type": "module",
+  "scripts": {
+    "start": "node index.mjs"
+  },
+  "dependencies": {
+    "@larksuiteoapi/node-sdk": "^1.58.0",
+    "openai": "^4.103.0",
+    "better-sqlite3": "^11.9.1",
+    "yaml": "^2.7.1"
+  }
+}
