@@ -21,16 +21,8 @@ class AgentState(TypedDict):
     limit_up_summary: str       # 涨停板摘要
     limit_down_summary: str     # 跌停板摘要
     stock_summary: str          # 个股行情摘要
-    reviews_text: str           # 复盘文档合并文本
     events_text: str            # 事件催化文本
-    history_text: str           # 近几日历史情绪数据
     stock_pool_text: str        # 股票池辨识度核心标的
-    prev_report: str            # 前一交易日的 Agent 报告（用于自我校准）
-    lessons_text: str           # 历史经验教训（持久化累积）
-    index_text: str             # 指数行情数据
-    capital_flow_text: str      # 资金流数据（板块资金流+北向资金）
-    memory_text: str            # 跨周期记忆（近期复盘总结）
-    quant_rules_text: str       # 量化规律参考
 
     # 阶段1：分析师报告
     sentiment_report: str       # 情绪周期分析

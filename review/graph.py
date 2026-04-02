@@ -11,6 +11,7 @@ from langgraph.graph import StateGraph, END
 from .state import AgentState
 from .agents.analysts import sentiment_analyst, sector_analyst, leader_analyst
 from .agents.debate import bull_researcher, bear_researcher, judge, final_review
+from .tools import RetrievalToolFactory
 
 
 import sys
@@ -21,6 +22,53 @@ from config import get_ai_providers
 DEFAULT_CONFIG = {
     "max_debate_rounds": 1,            # 多空辩论轮数
 }
+
+
+def _run_with_tools(llm, tools, system_prompt: str, user_message: str, max_rounds: int = 3) -> str:
+    """Run LLM with tool-calling loop until no more tool calls.
+
+    Returns the final LLM response content (string).
+    """
+    from langchain_core.messages import SystemMessage, HumanMessage, ToolMessage
+
+    llm_with_tools = llm.bind_tools(tools)
+    messages = [
+        SystemMessage(content=system_prompt),
+        HumanMessage(content=user_message),
+    ]
+
+    for _ in range(max_rounds):
+        response = llm_with_tools.invoke(messages)
+
+        if not response.tool_calls:
+            return response.content
+
+        messages.append(response)
+        tool_map = {t.name: t for t in tools}
+
+        for tc in response.tool_calls:
+            tool_fn = tool_map.get(tc["name"])
+            if tool_fn:
+                try:
+                    result = tool_fn.invoke(tc["args"])
+                    messages.append(ToolMessage(
+                        content=str(result),
+                        tool_call_id=tc["id"],
+                    ))
+                except Exception as e:
+                    messages.append(ToolMessage(
+                        content=f"Error: {e}",
+                        tool_call_id=tc["id"],
+                    ))
+            else:
+                messages.append(ToolMessage(
+                    content=f"Unknown tool: {tc['name']}",
+                    tool_call_id=tc["id"],
+                ))
+
+    # If we exhausted rounds, get final response without tools
+    final = llm.invoke(messages)
+    return final.content
 
 
 def should_continue_debate(state: AgentState, max_rounds: int) -> str:
@@ -76,12 +124,21 @@ def build_graph(config: Optional[dict] = None) -> StateGraph:
     llm = _create_llm(cfg)
     max_rounds = cfg["max_debate_rounds"]
 
-    _sentiment = partial(sentiment_analyst, llm=llm)
-    _sector = partial(sector_analyst, llm=llm)
-    _leader = partial(leader_analyst, llm=llm)
-    _bull = partial(bull_researcher, llm=llm)
-    _bear = partial(bear_researcher, llm=llm)
-    _judge = partial(judge, llm=llm)
+    # 创建检索工具（data_dir 和 date 存在时才创建）
+    data_dir = cfg.get("data_dir", "")
+    date = cfg.get("date", "")
+    memory_dir = cfg.get("memory_dir", "")
+    tools = []
+    if data_dir and date:
+        factory = RetrievalToolFactory(data_dir, date, memory_dir)
+        tools = factory.create_tools()
+
+    _sentiment = partial(sentiment_analyst, llm=llm, tools=tools)
+    _sector = partial(sector_analyst, llm=llm, tools=tools)
+    _leader = partial(leader_analyst, llm=llm, tools=tools)
+    _bull = partial(bull_researcher, llm=llm, tools=tools)
+    _bear = partial(bear_researcher, llm=llm, tools=tools)
+    _judge = partial(judge, llm=llm, tools=tools)
 
     from langgraph.graph import START
 
@@ -148,62 +205,35 @@ def _load_initial_state(
         data_dir: trading 数据根目录
         date: 当日日期
         config: Agent 配置
-        prev_report: 前一交易日的 Agent 报告（用于自我校准）
+        prev_report: 前一交易日的 Agent 报告（用于自我校准，保留参数兼容）
     """
     from .data.loader import (
         load_daily_data,
         summarize_limit_up,
         summarize_limit_down,
         summarize_stock_data,
-        summarize_history,
         load_stock_pool,
-        load_lessons,
-        load_index_data,
-        load_capital_flow,
-        load_memory,
-        load_quantitative_rules,
     )
 
     cfg = config or {}
     history_days = cfg.get("history_days", 7)
     data = load_daily_data(data_dir, date, history_days=history_days)
 
-    reviews_text = ""
-    if data.reviews:
-        parts = []
-        for name, content in data.reviews.items():
-            parts.append("### {}\n{}".format(name, content))
-        reviews_text = "\n\n".join(parts)
-
-    # 加载跨周期记忆（严格截止到分析日期，不读未来数据）
-    memory_dir = cfg.get("memory_dir", "")
-    if not memory_dir:
-        # 从 data_dir 向上推导到项目 data/ 目录，再拼接 memory/main/
-        data_top = os.path.dirname(os.path.dirname(os.path.dirname(data_dir)))
-        memory_dir = os.path.join(data_top, "memory", "main")
-    memory_text = load_memory(memory_dir, date)
-
     return {
         "date": date,
         "limit_up_summary": summarize_limit_up(data.limit_up),
         "limit_down_summary": summarize_limit_down(data.limit_down),
         "stock_summary": summarize_stock_data(data.stock_data),
-        "reviews_text": reviews_text,
-        "events_text": data.events,
-        "history_text": summarize_history(data.history),
+        "events_text": data.events or "",
         "stock_pool_text": load_stock_pool(data_dir),
-        "prev_report": prev_report,
-        "lessons_text": load_lessons(data_dir),
-        "index_text": load_index_data(data_dir, date),
-        "capital_flow_text": load_capital_flow(data_dir, date),
-        "memory_text": memory_text,
-        "quant_rules_text": load_quantitative_rules(data_dir),
+        # 阶段1：分析师报告
         "sentiment_report": "",
         "sector_report": "",
         "leader_report": "",
         "sentiment_data": {},
         "sector_data": {},
         "leader_data": {},
+        # 阶段2：多空辩论
         "debate_state": {
             "bull_history": [],
             "bear_history": [],
@@ -214,10 +244,13 @@ def _load_initial_state(
         },
         "bull_claims": [],
         "bear_claims": [],
+        # 阶段3：最终输出
         "final_report": "",
         "final_decision": {},
+        # 阶段4：人类终审
         "human_feedback": "",
         "reviewed_report": "",
+        # Agent 自定义 prompt 覆盖
         "prompt_overrides": (config or {}).get("prompt_overrides", {}),
     }
 
@@ -316,7 +349,8 @@ def run(
         print(f"[自动验证] 跳过: {e}")
 
     init_state = _load_initial_state(data_dir, date, config, prev_report=prev_report)
-    graph = build_graph(config)
+    cfg = {**(config or {}), "data_dir": data_dir, "date": date}
+    graph = build_graph(cfg)
 
     if debug:
         from rich.console import Console
@@ -361,7 +395,8 @@ def run_with_review(
         print(f"[自动验证] 跳过: {e}")
 
     init_state = _load_initial_state(data_dir, date, config, prev_report=prev_report)
-    graph = build_graph(config)
+    cfg = {**(config or {}), "data_dir": data_dir, "date": date}
+    graph = build_graph(cfg)
 
     if debug:
         from rich.console import Console

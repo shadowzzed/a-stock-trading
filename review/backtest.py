@@ -134,7 +134,8 @@ def run_backtest(
                     config=run_config,
                     prev_report=prev_report,
                 )
-                graph = build_graph(run_config)
+                run_cfg = {**run_config, "data_dir": data_dir, "date": day_d}
+                graph = build_graph(run_cfg)
                 final = graph.invoke(init_state)
                 report = final.get("final_report", "（未生成报告）")
                 with open(report_path, "w", encoding="utf-8") as f:
