@@ -226,7 +226,17 @@ def judge(state: AgentState, llm, tools=None) -> dict:
     debate = state.get("debate_state") or {}
     debate_history = "\n\n---\n\n".join(debate.get("history", []))
 
+    # 数据质量警告注入
+    warnings = state.get("data_quality_warnings") or []
+    warnings_block = ""
+    if warnings:
+        warnings_block = "\n# ⚠️ 数据质量警告\n以下数据存在缺失或质量问题，请在分析时注意：\n"
+        for w in warnings:
+            warnings_block += f"- {w}\n"
+        warnings_block += "\n"
+
     user_msg = f"""日期：{state['date']}
+{warnings_block}
 
 {context}
 
