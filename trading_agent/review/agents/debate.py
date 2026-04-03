@@ -73,11 +73,23 @@ def bull_researcher(state: AgentState, llm, tools=None) -> dict:
     bear_history = debate.get("bear_history", [])
 
     if bear_history:
-        prev = "\n\n".join(bear_history)
+        # 引用看空派最近一轮的论述
+        last_bear = bear_history[-1]
+        # 如果历史超过1轮，简要列出之前的论点摘要
+        if len(bear_history) > 1:
+            prev_summaries = []
+            for i, h in enumerate(bear_history[:-1], 1):
+                # 取前100字作为摘要
+                summary = h[:100].replace("\n", " ") + "..."
+                prev_summaries.append(f"第{i}轮摘要: {summary}")
+            prev_text = "之前看空观点:\n" + "\n".join(prev_summaries) + f"\n\n最新一轮看空观点:\n{last_bear}"
+        else:
+            prev_text = last_bear
+
         user_msg = f"""{context}
 
-看空派刚才说：
-{prev[-1] if bear_history else ''}
+看空派观点：
+{prev_text}
 
 请反驳看空派的观点，给出你的看多论据。"""
     else:
@@ -117,10 +129,14 @@ def bull_researcher(state: AgentState, llm, tools=None) -> dict:
     bull_history.append(content)
     count = debate.get("count", 0) + 1
 
+    # 累积辩论历史，不丢弃之前的记录
+    prev_history = list(debate.get("history", []))
+    prev_history.append(f"【看多派第{len(bull_history)}轮】\n{content}")
+
     new_debate: DebateState = {
         "bull_history": bull_history,
         "bear_history": list(debate.get("bear_history", [])),
-        "history": [f"【看多派第{len(bull_history)}轮】\n{content}"],
+        "history": prev_history,
         "current_response": content,
         "judge_decision": "",
         "count": count,
@@ -134,12 +150,28 @@ def bear_researcher(state: AgentState, llm, tools=None) -> dict:
     debate = state.get("debate_state") or {}
     bull_history = debate.get("bull_history", [])
 
-    user_msg = f"""{context}
+    if bull_history:
+        # 引用看多派最近一轮的论述
+        last_bull = bull_history[-1]
+        if len(bull_history) > 1:
+            prev_summaries = []
+            for i, h in enumerate(bull_history[:-1], 1):
+                summary = h[:100].replace("\n", " ") + "..."
+                prev_summaries.append(f"第{i}轮摘要: {summary}")
+            prev_text = "之前看多观点:\n" + "\n".join(prev_summaries) + f"\n\n最新一轮看多观点:\n{last_bull}"
+        else:
+            prev_text = last_bull
 
-看多派刚才说：
-{bull_history[-1] if bull_history else '（无）'}
+        user_msg = f"""{context}
+
+看多派观点：
+{prev_text}
 
 请反驳看多派的观点，指出做多的风险和隐患。"""
+    else:
+        user_msg = f"""{context}
+
+请基于以上分析师报告，指出当前市场的风险和隐患。"""
 
     user_msg += """
 
@@ -173,10 +205,14 @@ def bear_researcher(state: AgentState, llm, tools=None) -> dict:
     bear_history.append(content)
     count = debate.get("count", 0) + 1
 
+    # 累积辩论历史，不丢弃之前的记录
+    prev_history = list(debate.get("history", []))
+    prev_history.append(f"【看空派第{len(bear_history)}轮】\n{content}")
+
     new_debate: DebateState = {
         "bull_history": list(debate.get("bull_history", [])),
         "bear_history": bear_history,
-        "history": [f"【看空派第{len(bear_history)}轮】\n{content}"],
+        "history": prev_history,
         "current_response": content,
         "judge_decision": "",
         "count": count,

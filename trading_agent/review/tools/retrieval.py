@@ -15,6 +15,14 @@ from typing import Optional
 from langchain_core.tools import tool
 
 
+def _str_result(result) -> str:
+    """将 DataResult 或 str 统一转为 str（供 LLM 工具返回值）。"""
+    from trading_agent.review.data.loader import DataResult
+    if isinstance(result, DataResult):
+        return str(result)
+    return result if result else "无数据"
+
+
 class RetrievalToolFactory:
     """创建绑定到特定 data_dir 和 date 的检索工具。
 
@@ -103,7 +111,7 @@ class RetrievalToolFactory:
                 return summarize_history(history)
 
             result = factory._cached(cache_key, _load)
-            return result if result else "无数据"
+            return _str_result(result)
 
         return get_history_data
 
@@ -163,7 +171,7 @@ class RetrievalToolFactory:
                 return "\n\n---\n\n".join(parts)
 
             result = factory._cached(cache_key, _load)
-            return result if result else "无数据"
+            return _str_result(result)
 
         return get_review_docs
 
@@ -208,7 +216,7 @@ class RetrievalToolFactory:
                 return load_memory(factory.memory_dir, factory.date, max_days=days_back)
 
             result = factory._cached(cache_key, _load)
-            return result if result else "无数据"
+            return _str_result(result)
 
         return get_memory
 
@@ -247,7 +255,7 @@ class RetrievalToolFactory:
                 return text
 
             result = factory._cached(cache_key, _load)
-            return result if result else "无数据"
+            return _str_result(result)
 
         return get_lessons
 
@@ -292,7 +300,7 @@ class RetrievalToolFactory:
                     return "无数据（读取失败）"
 
             result = factory._cached(cache_key, _load)
-            return result if result else "无数据"
+            return _str_result(result)
 
         return get_prev_report
 
@@ -318,7 +326,7 @@ class RetrievalToolFactory:
                 return load_index_data(factory.data_dir, target_date)
 
             result = factory._cached(cache_key, _load)
-            return result if result else "无数据"
+            return _str_result(result)
 
         return get_index_data
 
@@ -344,7 +352,7 @@ class RetrievalToolFactory:
                 return load_capital_flow(factory.data_dir, target_date)
 
             result = factory._cached(cache_key, _load)
-            return result if result else "无数据"
+            return _str_result(result)
 
         return get_capital_flow
 
@@ -383,7 +391,7 @@ class RetrievalToolFactory:
                 return text
 
             result = factory._cached(cache_key, _load)
-            return result if result else "无数据"
+            return _str_result(result)
 
         return get_quant_rules
 
@@ -492,7 +500,7 @@ class RetrievalToolFactory:
                 return "\n".join(lines)
 
             result = factory._cached(cache_key, _load)
-            return result if result else "无数据"
+            return _str_result(result)
 
         return get_stock_detail
 
@@ -530,7 +538,7 @@ class RetrievalToolFactory:
                     return "无数据（读取失败）"
 
             result = factory._cached(cache_key, _load)
-            return result if result else "无数据"
+            return _str_result(result)
 
         return get_past_report
 

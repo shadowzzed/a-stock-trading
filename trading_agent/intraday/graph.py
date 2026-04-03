@@ -139,7 +139,11 @@ def _fetch_early_session(cfg: dict, today: str) -> dict:
             rows = conn.execute("""
                 SELECT code, name, price, pctChg, open, high, low, last_close,
                        sector, star, in_pool, is_limit_up
-                FROM snapshots WHERE date = ? AND ts IN ('09:26:35','09:41:34') AND in_pool = 1
+                FROM snapshots WHERE date = ? AND in_pool = 1
+                    AND (
+                        (ts >= '09:25:00' AND ts <= '09:30:00')
+                        OR (ts >= '09:38:00' AND ts <= '09:45:00')
+                    )
                 ORDER BY ts, pctChg DESC
             """, (today,)).fetchall()
             conn.close()
