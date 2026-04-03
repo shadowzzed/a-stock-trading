@@ -1055,6 +1055,17 @@ def format_feishu(item, interpretation, ai_provider="", priority=None):
 
 
 # ═══════════════════════════════════════════════════════════════
+# 新闻影响分析集成（可选模块，不影响主流程）
+# ═══════════════════════════════════════════════════════════════
+
+try:
+    from news_monitor.impact.hooks import on_high_priority_news
+    _impact_available = True
+except ImportError:
+    _impact_available = False
+
+
+# ═══════════════════════════════════════════════════════════════
 # 主流程
 # ═══════════════════════════════════════════════════════════════
 
@@ -1373,7 +1384,15 @@ def run_once():
         if trading and priority:
             # 交易时间 + 高优先级 → 立即推送
             tag = {"supply_demand": "供需", "earnings": "财报", "research": "研报", "geopolitics": "地缘"}.get(priority, "")
-            msg = "🔔 **[%s]** %s" % (tag, format_feishu(item, interpretation, ai_provider, priority=priority))
+            # 影响分析（可选，超时跳过）
+            impact_report = ""
+            if _impact_available:
+                try:
+                    impact_report = on_high_priority_news(
+                        item["title"], item.get("brief", ""), timeout_sec=3.0)
+                except Exception:
+                    pass
+            msg = "🔔 **[%s]** %s%s" % (tag, format_feishu(item, interpretation, ai_provider, priority=priority), impact_report)
             if send_feishu(msg):
                 save_to_trading(today, item, interpretation)
                 save_news_item(item, interpretation)
