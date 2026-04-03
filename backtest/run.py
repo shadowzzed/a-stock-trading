@@ -18,6 +18,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
 
 from .engine.core import BacktestEngine
@@ -38,6 +39,8 @@ def main():
                         help="仅运行交易模拟（复用已有报告，零 LLM 消耗）")
     parser.add_argument("--capital", type=float, default=1_000_000.0,
                         help="模拟初始资金（默认100万）")
+    parser.add_argument("--simple-pnl", action="store_true",
+                        help="简化盈亏模式：提到即买入（D+1开盘买，D+2开盘卖），纯测选股")
     args = parser.parse_args()
 
     data_provider = ReviewDataProvider()
@@ -52,6 +55,11 @@ def main():
 
     output_dir = args.output or os.path.join(args.data_dir, "backtest_v6")
     os.makedirs(output_dir, exist_ok=True)
+
+    # ── 简化盈亏模式 ──
+    if args.simple_pnl:
+        _run_simple_pnl(dates, args.data_dir, output_dir, args.capital)
+        return
 
     # ── 交易模拟（仅模拟模式） ──
     if args.trade_sim_only:
@@ -151,6 +159,247 @@ def _load_report(data_dir: str, output_dir: str, date: str) -> str:
                     return f.read()
 
     return ""
+
+
+def _run_simple_pnl(
+    dates: list[str],
+    data_dir: str,
+    output_dir: str,
+    capital: float,
+):
+    """简化盈亏模式：提取 focus_stocks → D+1 开盘买 → D+2 开盘卖，纯测选股能力"""
+    import json
+    import re
+    from .adapter import CSVStockDataProvider
+
+    print("\n" + "=" * 60)
+    print("简化盈亏模式（提到即买，纯测选股）")
+    print("=" * 60)
+
+    loader = CSVStockDataProvider()
+    pairs = [(dates[i], dates[i + 1]) for i in range(len(dates) - 1)]
+
+    all_trades = []
+    equity = capital
+    equity_curve = []
+
+    for idx, (day_d, day_d1) in enumerate(pairs):
+        day_d2 = pairs[idx + 1][1] if idx + 1 < len(pairs) else None
+        report = _load_report(data_dir, output_dir, day_d)
+
+        if not report:
+            print("  [跳过] {} 无报告".format(day_d))
+            continue
+
+        # 提取 focus_stocks
+        stocks = _extract_focus_stocks(report)
+        if not stocks:
+            print("  [跳过] {} 无 focus_stocks".format(day_d))
+            continue
+
+        print("\n模拟 {}/{}: {} → {} | 标的: {}".format(
+            idx + 1, len(pairs), day_d, day_d1, ", ".join(stocks)))
+
+        # 等权买入
+        per_stock_capital = equity / len(stocks) if stocks else 0
+        day_pnl = 0.0
+        day_trades = 0
+
+        for stock_name in stocks:
+            # D+1 开盘价买入
+            buy_data = loader.load_stock_daily(data_dir, day_d1, stock_name)
+            if not buy_data or buy_data.get("open", 0) <= 0:
+                print("    {} : 无{}行情数据".format(stock_name, day_d1))
+                continue
+
+            buy_price = buy_data["open"]
+            shares = int(per_stock_capital / (buy_price * 100)) * 100
+            if shares <= 0:
+                print("    {} : 资金不足（需{:.0f}，分配{:.0f}）".format(
+                    stock_name, buy_price * 100, per_stock_capital))
+                continue
+
+            # D+2 开盘价卖出
+            if day_d2:
+                sell_data = loader.load_stock_daily(data_dir, day_d2, stock_name)
+                if sell_data and sell_data.get("open", 0) > 0:
+                    sell_price = sell_data["open"]
+                    pnl_pct = (sell_price - buy_price) / buy_price * 100
+                    pnl_amount = shares * (sell_price - buy_price)
+                else:
+                    # 无 D+2 数据，用 D+1 收盘价
+                    sell_price = buy_data.get("close", buy_price)
+                    pnl_pct = (sell_price - buy_price) / buy_price * 100
+                    pnl_amount = shares * (sell_price - buy_price)
+                    print("    {} : 无{}卖出数据，用收盘价{:.2f}".format(
+                        stock_name, day_d2, sell_price))
+            else:
+                # 最后一天无法卖出
+                sell_price = buy_data.get("close", buy_price)
+                pnl_pct = (sell_price - buy_price) / buy_price * 100
+                pnl_amount = shares * (sell_price - buy_price)
+
+            day_pnl += pnl_amount
+            day_trades += 1
+
+            trade_record = {
+                "signal_date": day_d,
+                "buy_date": day_d1,
+                "sell_date": day_d2 or "未卖出",
+                "stock_name": stock_name,
+                "buy_price": round(buy_price, 2),
+                "sell_price": round(sell_price, 2),
+                "shares": shares,
+                "pnl_pct": round(pnl_pct, 2),
+                "pnl_amount": round(pnl_amount, 2),
+            }
+            all_trades.append(trade_record)
+            print("    {} : 买{:.2f} → 卖{:.2f} | {:+.2f}% ({:+.0f}元)".format(
+                stock_name, buy_price, sell_price, pnl_pct, pnl_amount))
+
+        equity += day_pnl
+        daily_return = day_pnl / capital * 100
+        equity_curve.append({
+            "date": day_d1,
+            "equity": round(equity, 2),
+            "daily_return": round(daily_return, 2),
+            "trades": day_trades,
+        })
+        print("  日收益: {:+.2f}% | 净值: {:.0f}".format(daily_return, equity))
+
+    # 汇总报告
+    _save_simple_pnl_report(all_trades, equity_curve, capital, output_dir)
+
+
+def _extract_focus_stocks(report: str) -> list[str]:
+    """从报告 JSON 前置块中提取 focus_stocks"""
+    import json
+    import re
+
+    # 匹配 ```json ... ``` 块
+    json_match = re.search(r'```json\s*\n(.*?)\n```', report, re.DOTALL)
+    if json_match:
+        try:
+            data = json.loads(json_match.group(1))
+            stocks = data.get("focus_stocks", [])
+            if stocks:
+                return [s for s in stocks if s and len(s) >= 2]
+        except json.JSONDecodeError:
+            pass
+
+    # Fallback: 匹配裸 JSON
+    json_match = re.search(r'"focus_stocks"\s*:\s*\[(.*?)\]', report)
+    if json_match:
+        try:
+            stocks = json.loads("[" + json_match.group(1) + "]")
+            return [s for s in stocks if s and len(s) >= 2]
+        except json.JSONDecodeError:
+            pass
+
+    return []
+
+
+def _save_simple_pnl_report(
+    trades: list[dict],
+    equity_curve: list[dict],
+    initial_capital: float,
+    output_dir: str,
+):
+    """保存简化盈亏报告"""
+    import json
+
+    # 统计
+    total = len(trades)
+    wins = [t for t in trades if t["pnl_pct"] > 0]
+    losses = [t for t in trades if t["pnl_pct"] <= 0]
+    win_rate = len(wins) / total * 100 if total > 0 else 0
+    avg_pnl = sum(t["pnl_pct"] for t in trades) / total if total > 0 else 0
+    final_equity = equity_curve[-1]["equity"] if equity_curve else initial_capital
+    total_return = (final_equity - initial_capital) / initial_capital * 100
+
+    # 最大回撤
+    peak = initial_capital
+    max_dd = 0.0
+    for s in equity_curve:
+        if s["equity"] > peak:
+            peak = s["equity"]
+        dd = (peak - s["equity"]) / peak * 100
+        if dd > max_dd:
+            max_dd = dd
+
+    summary = {
+        "initial_capital": initial_capital,
+        "final_equity": round(final_equity, 2),
+        "total_return_pct": round(total_return, 2),
+        "total_trades": total,
+        "win_count": len(wins),
+        "loss_count": len(losses),
+        "win_rate": round(win_rate, 1),
+        "avg_pnl_pct": round(avg_pnl, 2),
+        "max_drawdown_pct": round(max_dd, 2),
+        "avg_win_pct": round(sum(t["pnl_pct"] for t in wins) / len(wins), 2) if wins else 0,
+        "avg_loss_pct": round(sum(t["pnl_pct"] for t in losses) / len(losses), 2) if losses else 0,
+    }
+
+    # 保存 JSON
+    result = {"summary": summary, "trades": trades, "equity_curve": equity_curve}
+    json_path = os.path.join(output_dir, "simple_pnl.json")
+    with open(json_path, "w", encoding="utf-8") as f:
+        json.dump(result, f, ensure_ascii=False, indent=2)
+
+    # 保存 Markdown
+    md_lines = [
+        "# 简化盈亏报告（提到即买模式）",
+        "",
+        "## 总体表现",
+        "",
+        "- 初始资金：{:.0f}".format(initial_capital),
+        "- 期末净值：{:.2f}".format(final_equity),
+        "- 累计收益率：{:+.2f}%".format(total_return),
+        "- 最大回撤：{:.2f}%".format(max_dd),
+        "",
+        "## 交易统计",
+        "",
+        "| 指标 | 值 |",
+        "|------|-----|",
+        "| 总交易次数 | {} |".format(total),
+        "| 胜率 | {:.1f}%（{}胜{}负）|".format(win_rate, len(wins), len(losses)),
+        "| 平均盈亏 | {:+.2f}% |".format(avg_pnl),
+        "| 平均盈利 | {:+.2f}% |".format(summary["avg_win_pct"]),
+        "| 平均亏损 | {:+.2f}% |".format(summary["avg_loss_pct"]),
+        "",
+        "## 逐笔明细",
+        "",
+        "| 信号日 | 买入日 | 卖出日 | 标的 | 买价 | 卖价 | 盈亏% | 盈亏额 |",
+        "|--------|--------|--------|------|------|------|-------|--------|",
+    ]
+    for t in trades:
+        md_lines.append("| {} | {} | {} | {} | {:.2f} | {:.2f} | {:+.2f}% | {:+.0f} |".format(
+            t["signal_date"], t["buy_date"], t["sell_date"],
+            t["stock_name"], t["buy_price"], t["sell_price"],
+            t["pnl_pct"], t["pnl_amount"]))
+
+    md_lines.extend([
+        "",
+        "## 净值曲线",
+        "",
+        "| 日期 | 净值 | 当日收益 | 交易数 |",
+        "|------|------|---------|--------|",
+    ])
+    for s in equity_curve:
+        md_lines.append("| {} | {:.2f} | {:+.2f}% | {} |".format(
+            s["date"], s["equity"], s["daily_return"], s["trades"]))
+
+    md_path = os.path.join(output_dir, "simple_pnl_报告.md")
+    with open(md_path, "w", encoding="utf-8") as f:
+        f.write("\n".join(md_lines))
+
+    print("\n" + "=" * 60)
+    print("简化盈亏结果:")
+    print("  总交易: {}笔 | 胜率: {:.1f}% | 平均盈亏: {:+.2f}%".format(
+        total, win_rate, avg_pnl))
+    print("  累计收益: {:+.2f}% | 最大回撤: {:.2f}%".format(total_return, max_dd))
+    print("  报告已保存到: {} 和 {}".format(json_path, md_path))
 
 
 if __name__ == "__main__":

@@ -82,33 +82,39 @@ def should_continue_debate(state: AgentState, max_rounds: int) -> str:
     return "bull"
 
 
-def _create_llm(cfg: dict):
-    """创建 LLM 实例（Grok 优先，DeepSeek fallback）"""
-    from langchain_openai import ChatOpenAI
+def _create_llm_from_provider(provider: dict, temperature: float = 0.3):
+    """根据 provider 配置创建 LLM 实例（支持 OpenAI 和 Anthropic 协议）"""
+    if provider.get("protocol") == "anthropic":
+        from langchain_anthropic import ChatAnthropic
+        return ChatAnthropic(
+            model=provider["model"],
+            anthropic_api_url=provider["base"],
+            anthropic_api_key=provider["key"],
+            temperature=temperature,
+        )
+    else:
+        from langchain_openai import ChatOpenAI
+        return ChatOpenAI(
+            model=provider["model"],
+            base_url=provider["base"],
+            api_key=provider["key"],
+            temperature=temperature,
+        )
 
+
+def _create_llm(cfg: dict):
+    """创建 LLM 实例（Grok > GLM > DeepSeek，自动 fallback）"""
     providers = get_ai_providers()
     if not providers:
-        raise ValueError("未配置任何 AI 提供商（XAI_API_KEY 或 ARK_API_KEY）")
+        raise ValueError("未配置任何 AI 提供商（XAI_API_KEY、GLM_API_KEY 或 ARK_API_KEY）")
 
-    # 用第一个提供商作为主力
+    temperature = cfg.get("temperature", 0.3)
     primary = providers[0]
-    llm = ChatOpenAI(
-        model=primary["model"],
-        base_url=primary["base"],
-        api_key=primary["key"],
-        temperature=cfg.get("temperature", 0.3),
-    )
+    llm = _create_llm_from_provider(primary, temperature)
 
     # 如果有多个提供商，用 with_fallbacks 链接
     if len(providers) > 1:
-        fallbacks = []
-        for p in providers[1:]:
-            fallbacks.append(ChatOpenAI(
-                model=p["model"],
-                base_url=p["base"],
-                api_key=p["key"],
-                temperature=cfg.get("temperature", 0.3),
-            ))
+        fallbacks = [_create_llm_from_provider(p, temperature) for p in providers[1:]]
         llm = llm.with_fallbacks(fallbacks)
         print("  [LLM] %s (fallback: %s)" % (
             primary["name"], ", ".join(p["name"] for p in providers[1:])), flush=True)
@@ -218,7 +224,8 @@ def _load_initial_state(
 
     cfg = config or {}
     history_days = cfg.get("history_days", 7)
-    data = load_daily_data(data_dir, date, history_days=history_days)
+    backtest_mode = cfg.get("backtest_mode", False)
+    data = load_daily_data(data_dir, date, history_days=history_days, backtest_mode=backtest_mode)
 
     # 生成各摘要，同时收集 DataResult 的质量警告
     lu_summary = summarize_limit_up(data.limit_up)

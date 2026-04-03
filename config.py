@@ -106,6 +106,11 @@ def get_config():
         "grok_api_base": yaml_cfg.get("grok_api_base", "https://api.x.ai/v1"),
         "grok_model": yaml_cfg.get("grok_model", "grok-3-fast"),
 
+        # AI 配置 — GLM（智谱，Anthropic 协议）
+        "glm_api_key": os.environ.get("GLM_API_KEY", yaml_cfg.get("glm_api_key", "")),
+        "glm_api_base": yaml_cfg.get("glm_api_base", "https://open.bigmodel.cn/api/anthropic"),
+        "glm_model": yaml_cfg.get("glm_model", "glm-5"),
+
         # 飞书配置（环境变量 > config.yaml > 默认值）
         "feishu_app_id": os.environ.get("FEISHU_APP_ID", yaml_cfg.get("feishu_app_id", "")),
         "feishu_app_secret": os.environ.get("FEISHU_APP_SECRET", yaml_cfg.get("feishu_app_secret", "")),
@@ -150,12 +155,21 @@ def init_data_dirs():
 
 
 def get_ai_providers():
-    """返回 AI 提供商列表（按优先级：Grok > DeepSeek）"""
+    """返回 AI 提供商列表（按优先级：GLM > Grok > DeepSeek）"""
     cfg = get_config()
     providers = []
+    if cfg["glm_api_key"]:
+        providers.append({
+            "name": "GLM",
+            "protocol": "anthropic",
+            "base": cfg["glm_api_base"],
+            "key": cfg["glm_api_key"],
+            "model": cfg["glm_model"],
+        })
     if cfg["grok_api_key"]:
         providers.append({
             "name": "Grok",
+            "protocol": "openai",
             "base": cfg["grok_api_base"],
             "key": cfg["grok_api_key"],
             "model": cfg["grok_model"],
@@ -163,6 +177,7 @@ def get_ai_providers():
     if cfg["ai_api_key"]:
         providers.append({
             "name": "DeepSeek",
+            "protocol": "openai",
             "base": cfg["ai_api_base"],
             "key": cfg["ai_api_key"],
             "model": cfg["ai_model"],

@@ -18,7 +18,7 @@ class ReviewDataProvider:
     def load_market_data(self, data_dir: str, date: str) -> MarketData:
         from trading_agent.review.data.loader import load_daily_data
 
-        daily_data = load_daily_data(data_dir, date)
+        daily_data = load_daily_data(data_dir, date, backtest_mode=True)
         limit_up = daily_data.limit_up
         limit_down = daily_data.limit_down
 
@@ -53,10 +53,20 @@ class ReviewDataProvider:
         self, data_dir: str, date: str, report: str = ""
     ) -> tuple[str, str]:
         from trading_agent.review.data.loader import load_daily_data, summarize_limit_up, summarize_limit_down
-        from trading_agent.review.verify import _load_stock_pnl
+        from trading_agent.review.verify import _load_stock_pnl, _enrich_from_db, _query_intraday_db
 
-        data_d1 = load_daily_data(data_dir, date)
+        data_d1 = load_daily_data(data_dir, date, backtest_mode=True)
+
+        # 先生成 DB 补充数据（前置到 CSV 之前，避免 LLM 忽略）
+        db_supplement = _enrich_from_db(data_dir, date, data_d1)
+
         summary = "## {} 实际行情\n\n".format(date)
+
+        # DB 补充数据前置 + 醒目警告（CSV 数据不完整时）
+        if db_supplement:
+            summary += "> ⚠️ **以下为 intraday DB 验证的完整数据（比 CSV 更准确），请优先以此为准：**\n\n"
+            summary += db_supplement + "\n\n---\n\n"
+
         summary += summarize_limit_up(data_d1.limit_up) + "\n\n"
         summary += summarize_limit_down(data_d1.limit_down)
 
@@ -69,6 +79,7 @@ class ReviewDataProvider:
     def discover_dates(
         self, data_dir: str, start: Optional[str] = None, end: Optional[str] = None
     ) -> list[str]:
+        import glob as glob_mod
         daily_root = os.path.join(data_dir, "daily")
         all_dates = sorted([
             d for d in os.listdir(daily_root)
@@ -78,7 +89,13 @@ class ReviewDataProvider:
             all_dates = [d for d in all_dates if d >= start]
         if end:
             all_dates = [d for d in all_dates if d <= end]
-        return all_dates
+        # 只返回有行情数据的交易日（过滤周末/非交易日）
+        trading_dates = []
+        for d in all_dates:
+            csv_pattern = os.path.join(daily_root, d, "行情_*.csv")
+            if glob_mod.glob(csv_pattern):
+                trading_dates.append(d)
+        return trading_dates
 
 
 class ReviewAgentRunner:
@@ -133,36 +150,31 @@ class CSVStockDataProvider:
     def __init__(self):
         self._name_code_cache: dict[str, str] = {}  # {name: code}
 
+    def _read_csv_safe(self, csv_path: str) -> list[dict]:
+        """安全读取 CSV（处理 NUL 字节等异常）"""
+        import csv as csv_mod
+        import io as io_mod
+
+        with open(csv_path, "r", encoding="utf-8-sig") as f:
+            raw = f.read().replace("\x00", "")  # 清除 NUL 字节
+        return list(csv_mod.DictReader(io_mod.StringIO(raw)))
+
     def load_stock_daily(
         self, data_dir: str, date: str, stock_name: str,
     ) -> Optional[dict]:
-        """从行情 CSV 加载指定股票的日线数据"""
-        import csv as csv_mod
-        import glob as glob_mod
+        """从行情 CSV 加载指定股票的日线数据（委托给 trading_agent 数据层，含 mootdx fallback）"""
+        from trading_agent.review.data.loader import load_stock_daily_ohlcv
 
-        d_dir = os.path.join(data_dir, "daily", date)
-        csv_files = glob_mod.glob(os.path.join(d_dir, "行情_*.csv"))
-        if not csv_files:
-            return None
-
-        for csv_file in csv_files:
-            try:
-                with open(csv_file, "r", encoding="utf-8-sig") as f:
-                    reader = csv_mod.DictReader(f)
-                    for row in reader:
-                        name = row.get("名称", "").strip()
-                        if name == stock_name:
-                            return self._row_to_dict(row, date)
-            except Exception:
-                continue
-
-        return None
+        result = load_stock_daily_ohlcv(data_dir, date, stock_name)
+        if result:
+            # 去掉内部字段
+            result.pop("_source", None)
+        return result
 
     def load_stock_daily_by_code(
         self, data_dir: str, date: str, stock_code: str,
     ) -> Optional[dict]:
         """按股票代码加载日线数据"""
-        import csv as csv_mod
         import glob as glob_mod
 
         d_dir = os.path.join(data_dir, "daily", date)
@@ -172,12 +184,10 @@ class CSVStockDataProvider:
 
         for csv_file in csv_files:
             try:
-                with open(csv_file, "r", encoding="utf-8-sig") as f:
-                    reader = csv_mod.DictReader(f)
-                    for row in reader:
-                        code = row.get("代码", "").strip()
-                        if code == stock_code:
-                            return self._row_to_dict(row, date)
+                for row in self._read_csv_safe(csv_file):
+                    code = row.get("代码", "").strip()
+                    if code == stock_code:
+                        return self._row_to_dict(row, date)
             except Exception:
                 continue
 

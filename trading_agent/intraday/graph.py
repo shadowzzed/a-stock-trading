@@ -194,32 +194,52 @@ def _fetch_early_session(cfg: dict, today: str) -> dict:
 # ── Node 2: analyze ────────────────────────────────────────────
 
 def _create_llm(temperature: float = 0.3):
-    """创建 LLM（Grok 优先，DeepSeek fallback）"""
-    from langchain_openai import ChatOpenAI
-
+    """创建 LLM（Grok > GLM > DeepSeek，自动 fallback）"""
     providers = get_ai_providers()
     if not providers:
-        raise ValueError("未配置任何 AI 提供商（XAI_API_KEY 或 ARK_API_KEY）")
+        raise ValueError("未配置任何 AI 提供商（XAI_API_KEY、GLM_API_KEY 或 ARK_API_KEY）")
 
     primary = providers[0]
-    llm = ChatOpenAI(
-        model=primary["model"],
-        base_url=primary["base"],
-        api_key=primary["key"],
-        temperature=temperature,
-        max_tokens=4096,
-    )
+    if primary.get("protocol") == "anthropic":
+        from langchain_anthropic import ChatAnthropic
+        llm = ChatAnthropic(
+            model=primary["model"],
+            anthropic_api_url=primary["base"],
+            anthropic_api_key=primary["key"],
+            temperature=temperature,
+            max_tokens=4096,
+        )
+    else:
+        from langchain_openai import ChatOpenAI
+        llm = ChatOpenAI(
+            model=primary["model"],
+            base_url=primary["base"],
+            api_key=primary["key"],
+            temperature=temperature,
+            max_tokens=4096,
+        )
 
     if len(providers) > 1:
         fallbacks = []
         for p in providers[1:]:
-            fallbacks.append(ChatOpenAI(
-                model=p["model"],
-                base_url=p["base"],
-                api_key=p["key"],
-                temperature=temperature,
-                max_tokens=4096,
-            ))
+            if p.get("protocol") == "anthropic":
+                from langchain_anthropic import ChatAnthropic
+                fallbacks.append(ChatAnthropic(
+                    model=p["model"],
+                    anthropic_api_url=p["base"],
+                    anthropic_api_key=p["key"],
+                    temperature=temperature,
+                    max_tokens=4096,
+                ))
+            else:
+                from langchain_openai import ChatOpenAI
+                fallbacks.append(ChatOpenAI(
+                    model=p["model"],
+                    base_url=p["base"],
+                    api_key=p["key"],
+                    temperature=temperature,
+                    max_tokens=4096,
+                ))
         llm = llm.with_fallbacks(fallbacks)
         print("[LLM] %s (fallback: %s)" % (
             primary["name"], ", ".join(p["name"] for p in providers[1:])), flush=True)

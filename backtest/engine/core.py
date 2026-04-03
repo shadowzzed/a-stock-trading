@@ -139,7 +139,7 @@ class BacktestEngine:
             )
             injected_ids = []
 
-            run_config: dict = {}
+            run_config: dict = {"backtest_mode": True}
             if injection:
                 overrides = {}
                 for agent, inject_text in injection.items():
@@ -246,6 +246,53 @@ class BacktestEngine:
             result.what_was_right = verify_result.get("what_was_right", [])
             result.what_was_wrong = verify_result.get("what_was_wrong", [])
 
+            # ── Step 4.5: 后置校验 — 磁核事实声明与 DB 对比 ──
+            corrections = self._post_verify_check(
+                data_dir, day_d1, verify_result, report,
+            )
+            if corrections:
+                # 按涉及维度去重（同一股票多次出现只扣一次）
+                affected_dims = set()
+                print("  [校验] 发现 {} 处事实修正:".format(len(corrections)))
+                for c in corrections:
+                    print("    - {}: {} → {}".format(c["stock"], c["claimed"], c["actual"]))
+                    # 修正分数中涉及该股票的错误判断
+                    for dim in ["sentiment", "sector", "leader", "strategy"]:
+                        dim_score = result.scores.get(dim, {})
+                        reason = dim_score.get("reason", "")
+                        if c["stock"] in reason:
+                            dim_score["reason"] = reason.replace(
+                                c["claimed"], c["actual"]
+                            )
+                            affected_dims.add(dim)
+
+                # 事实错误扣分：每个受影响维度扣 1 分
+                for dim in affected_dims:
+                    dim_info = result.scores.get(dim, {})
+                    old_score = dim_info.get("score", 0)
+                    new_score = max(1, old_score - 1)
+                    dim_info["score"] = new_score
+                    dim_info["reason"] = (
+                        "[事实修正: {}→{}] ".format(
+                            c["claimed"], c["actual"]
+                        ) + dim_info.get("reason", "")
+                    )
+                    print("    - 扣分: {} 维度 {} → {}".format(
+                        dim, old_score, new_score))
+
+                # 重新计算总分
+                total_score = sum(
+                    result.scores.get(d, {}).get("score", 0)
+                    for d in ["sentiment", "sector", "leader", "strategy"]
+                )
+                result.total_score = total_score
+                verify_result["total_score"] = total_score
+                # 更新保存的验证结果
+                verify_path = os.path.join(output_dir, "{}_verify.json".format(day_d))
+                with open(verify_path, "w", encoding="utf-8") as f:
+                    json.dump(verify_result, f, ensure_ascii=False, indent=2)
+                print("  [校验] 修正后总分: {}/20".format(total_score))
+
             # ── Step 5: 提取结构化经验 ──
             if on_progress:
                 on_progress(idx + 1, len(pairs), day_d, "extracting_experience")
@@ -289,6 +336,72 @@ class BacktestEngine:
             results, output_dir, exp_store, lesson_tracker,
         )
         return summary
+
+    def _post_verify_check(
+        self,
+        data_dir: str,
+        day_d1: str,
+        verify_result: dict,
+        report: str,
+    ) -> list[dict]:
+        """后置校验：对比验证 LLM 的事实声明与 intraday DB 实际数据
+
+        扫描 verify_result 中的 reason 文本，检测对具体股票的涨跌判断，
+        与 DB 中的实际行情对比，发现矛盾则返回修正列表。
+        """
+        import re as re_mod
+        import sqlite3 as sqlite3_mod
+
+        db_path = os.path.join(data_dir, "intraday", "intraday.db")
+        if not os.path.exists(db_path):
+            return []
+
+        # 收集所有 reason 中提到的股票名 + 判断
+        all_reasons = ""
+        scores = verify_result.get("scores", {})
+        for dim_scores in scores.values():
+            if isinstance(dim_scores, dict):
+                all_reasons += dim_scores.get("reason", "") + " "
+
+        # 提取 "XXX跌停" 或 "XXX涨停" 的声明
+        corrections = []
+        for m in re_mod.finditer(r"([\u4e00-\u9fa5]{2,4})(涨停|跌停)", all_reasons):
+            stock_name = m.group(1)
+            claim = m.group(2)  # "涨停" or "跌停"
+
+            # 查询 DB
+            try:
+                conn = sqlite3_mod.connect(f"file:{db_path}?mode=ro")
+                cursor = conn.cursor()
+                cursor.execute("""
+                    SELECT is_limit_up, is_limit_down, pctChg
+                    FROM snapshots
+                    WHERE date = ? AND name = ?
+                    AND ts = (SELECT MAX(ts) FROM snapshots WHERE date = ?)
+                    LIMIT 1
+                """, (day_d1, stock_name, day_d1))
+                row = cursor.fetchone()
+                conn.close()
+
+                if row:
+                    is_up, is_down, pct = row[0], row[1], row[2]
+                    # 检查矛盾
+                    if claim == "跌停" and is_up:
+                        corrections.append({
+                            "stock": stock_name,
+                            "claimed": "跌停",
+                            "actual": "涨停（{:+.2f}%）".format(pct),
+                        })
+                    elif claim == "涨停" and is_down:
+                        corrections.append({
+                            "stock": stock_name,
+                            "claimed": "涨停",
+                            "actual": "跌停（{:+.2f}%）".format(pct),
+                        })
+            except Exception:
+                continue
+
+        return corrections
 
     def _extract_experience(
         self,

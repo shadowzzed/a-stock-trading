@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import io
 import json
 import logging
 import os
@@ -51,12 +52,15 @@ class DailyData:
     history: list = field(default_factory=list)  # 近几日历史摘要 [{date, limit_up_count, limit_down_count, max_board, blown_rate}]
 
 
-def load_daily_data(data_dir: str, date: str, history_days: int = 7) -> DailyData:
+def load_daily_data(data_dir: str, date: str, history_days: int = 7,
+                    backtest_mode: bool = False) -> DailyData:
     """从 trading/daily/YYYY-MM-DD/ 目录加载当日数据
 
     Args:
         data_dir: trading 根目录（如 /path/to/trading）
         date: 日期字符串，如 "2026-03-24"
+        history_days: 历史回溯天数
+        backtest_mode: 回测模式下，review_docs 只加载 D-1 及之前（避免前瞻偏差）
     """
     daily_dir = os.path.join(data_dir, "daily", date)
     if not os.path.isdir(daily_dir):
@@ -71,20 +75,13 @@ def load_daily_data(data_dir: str, date: str, history_days: int = 7) -> DailyDat
     # 个股行情
     stock_data = _load_csv(daily_dir, f"行情_{date.replace('-', '')}.csv")
 
-    # 复盘文档（从 review_docs/ 子目录加载所有 .md 文件）
+    # 复盘文档
+    # 回测模式下禁止加载当天的 review_docs（前瞻偏差），只加载 D-1 及之前
     reviews = {}
-    review_dir = os.path.join(daily_dir, "review_docs")
-    if os.path.isdir(review_dir):
-        for md_path in sorted(glob.glob(os.path.join(review_dir, "*.md"))):
-            name = os.path.basename(md_path)
-            with open(md_path, "r", encoding="utf-8") as f:
-                reviews[name] = f.read()
+    if backtest_mode:
+        reviews = _load_prev_reviews(data_dir, date)
     else:
-        # 兼容旧目录结构（复盘文件直接在日期目录下）
-        for md_path in glob.glob(os.path.join(daily_dir, "*复盘*.md")):
-            name = os.path.basename(md_path)
-            with open(md_path, "r", encoding="utf-8") as f:
-                reviews[name] = f.read()
+        reviews = _load_current_reviews(daily_dir)
 
     # 事件催化
     events = ""
@@ -234,7 +231,10 @@ def _load_csv(directory: str, filename: str) -> pd.DataFrame:
     if not os.path.exists(path):
         return pd.DataFrame()
     try:
-        df = pd.read_csv(path, encoding="utf-8-sig")
+        # 先读取文件内容并清除 NUL 字节，避免 pd.read_csv 崩溃
+        with open(path, "r", encoding="utf-8-sig") as f:
+            raw = f.read().replace("\x00", "")
+        df = pd.read_csv(io.StringIO(raw))
         # 兼容英文列名的行情 CSV（baostock 格式）
         col_map = {
             "code": "代码",
@@ -254,6 +254,52 @@ def _load_csv(directory: str, filename: str) -> pd.DataFrame:
         return df
     except pd.errors.EmptyDataError:
         return pd.DataFrame()
+
+
+def _load_current_reviews(daily_dir: str) -> dict:
+    """加载当天的复盘文档（实盘模式）"""
+    reviews = {}
+    review_dir = os.path.join(daily_dir, "review_docs")
+    if os.path.isdir(review_dir):
+        for md_path in sorted(glob.glob(os.path.join(review_dir, "*.md"))):
+            name = os.path.basename(md_path)
+            with open(md_path, "r", encoding="utf-8") as f:
+                reviews[name] = f.read()
+    else:
+        # 兼容旧目录结构（复盘文件直接在日期目录下）
+        for md_path in glob.glob(os.path.join(daily_dir, "*复盘*.md")):
+            name = os.path.basename(md_path)
+            with open(md_path, "r", encoding="utf-8") as f:
+                reviews[name] = f.read()
+    return reviews
+
+
+def _load_prev_reviews(data_dir: str, current_date: str) -> dict:
+    """回测模式：只加载 D-1 及之前的复盘文档（避免前瞻偏差）"""
+    reviews = {}
+    daily_root = os.path.join(data_dir, "daily")
+    if not os.path.isdir(daily_root):
+        return reviews
+
+    prev_dates = sorted([
+        d for d in os.listdir(daily_root)
+        if os.path.isdir(os.path.join(daily_root, d)) and d < current_date
+    ])
+    # 只加载最近 3 天的复盘（避免上下文过长）
+    for prev_date in prev_dates[-3:]:
+        prev_dir = os.path.join(daily_root, prev_date)
+        review_dir = os.path.join(prev_dir, "review_docs")
+        if os.path.isdir(review_dir):
+            for md_path in sorted(glob.glob(os.path.join(review_dir, "*.md"))):
+                name = f"[{prev_date}] {os.path.basename(md_path)}"
+                with open(md_path, "r", encoding="utf-8") as f:
+                    reviews[name] = f.read()
+        else:
+            for md_path in glob.glob(os.path.join(prev_dir, "*复盘*.md")):
+                name = f"[{prev_date}] {os.path.basename(md_path)}"
+                with open(md_path, "r", encoding="utf-8") as f:
+                    reviews[name] = f.read()
+    return reviews
 
 
 def summarize_limit_up(df: pd.DataFrame) -> str:
@@ -1167,3 +1213,154 @@ def scan_trend_stocks(
         )
     finally:
         conn.close()
+
+
+# ── 个股日线数据（CSV 优先，mootdx fallback）──────────────────────
+
+def load_stock_daily_ohlcv(
+    data_dir: str,
+    date: str,
+    stock_name: str,
+) -> Optional[dict]:
+    """加载个股日线 OHLCV 数据。
+
+    优先从本地 CSV 读取，缺失时通过 mootdx 在线拉取。
+    回测和实盘共用此接口。
+
+    Args:
+        data_dir: trading 数据根目录
+        date: 日期 (YYYY-MM-DD)
+        stock_name: 股票名称
+
+    Returns:
+        {"date", "code", "name", "open", "high", "low", "close",
+         "pct_chg", "volume", "amount", "last_close"} 或 None
+    """
+    # Step 1: 尝试从本地 CSV 读取
+    result = _load_stock_from_csv(data_dir, date, stock_name)
+    if result:
+        return result
+
+    # Step 2: mootdx fallback
+    return _load_stock_from_mootdx(data_dir, date, stock_name)
+
+
+def _load_stock_from_csv(
+    data_dir: str, date: str, stock_name: str,
+) -> Optional[dict]:
+    """从本地行情 CSV 加载个股数据（处理 NUL 字节）"""
+    import csv as csv_mod
+    import io as io_mod
+
+    d_dir = os.path.join(data_dir, "daily", date)
+    csv_files = glob.glob(os.path.join(d_dir, "行情_*.csv"))
+    if not csv_files:
+        return None
+
+    for csv_file in csv_files:
+        try:
+            with open(csv_file, "r", encoding="utf-8-sig") as f:
+                raw = f.read().replace("\x00", "")  # 清除 NUL 字节
+            for row in csv_mod.DictReader(io_mod.StringIO(raw)):
+                name = row.get("名称", "").strip()
+                if name == stock_name:
+                    return _csv_row_to_dict(row, date)
+        except Exception:
+            continue
+
+    return None
+
+
+def _load_stock_from_mootdx(
+    data_dir: str, date: str, stock_name: str,
+) -> Optional[dict]:
+    """通过 mootdx 拉取个股日线数据"""
+    try:
+        from mootdx.quotes import Quotes
+
+        # 名称→代码映射
+        code = _resolve_stock_code(data_dir, stock_name)
+        if not code:
+            logger.debug("[mootdx] 无法解析 %s 的代码", stock_name)
+            return None
+
+        client = Quotes.factory(market="std")
+        df = client.bars(symbol=code, frequency=9, offset=10)
+        if df is None or df.empty:
+            return None
+
+        # 找到目标日期的行
+        target = date.replace("-", "")
+        df["date_str"] = df["datetime"].astype(str).str[:10].str.replace("-", "")
+        match = df[df["date_str"] == target]
+        if match.empty:
+            # 也尝试 YYYY-MM-DD 格式
+            df["date_str2"] = df["datetime"].astype(str).str[:10]
+            match = df[df["date_str2"] == date]
+        if match.empty:
+            return None
+
+        row = match.iloc[-1]
+        return {
+            "date": date,
+            "code": code,
+            "name": stock_name,
+            "open": float(row["open"]),
+            "high": float(row["high"]),
+            "low": float(row["low"]),
+            "close": float(row["close"]),
+            "pct_chg": float(row.get("pctChg", 0)),
+            "volume": float(row.get("vol", row.get("volume", 0))),
+            "amount": float(row.get("amount", 0)),
+            "last_close": float(row.get("last_close", 0)),
+            "_source": "mootdx",
+        }
+    except Exception as e:
+        logger.debug("[mootdx] fallback 失败 %s %s: %s", date, stock_name, e)
+        return None
+
+
+def _resolve_stock_code(data_dir: str, stock_name: str) -> Optional[str]:
+    """从行情 CSV 或 stocks.md 解析股票名称→代码"""
+    # 从最近的行情 CSV 查找
+    daily_root = os.path.join(data_dir, "daily")
+    if os.path.isdir(daily_root):
+        dirs = sorted(os.listdir(daily_root), reverse=True)
+        for d in dirs[:10]:
+            csv_files = glob.glob(os.path.join(daily_root, d, "行情_*.csv"))
+            for csv_file in csv_files:
+                try:
+                    import csv as csv_mod
+                    import io as io_mod
+                    with open(csv_file, "r", encoding="utf-8-sig") as f:
+                        raw = f.read().replace("\x00", "")
+                    for row in csv_mod.DictReader(io_mod.StringIO(raw)):
+                        if row.get("名称", "").strip() == stock_name:
+                            return row.get("代码", "").strip()
+                except Exception:
+                    continue
+    return None
+
+
+def _csv_row_to_dict(row: dict, date: str) -> dict:
+    """CSV 行 → 标准化字典"""
+    def _float(val, default=0.0):
+        try:
+            return float(str(val).replace(",", ""))
+        except (ValueError, TypeError):
+            return default
+
+    return {
+        "date": date,
+        "code": row.get("代码", "").strip() or row.get("code", "").strip(),
+        "name": row.get("名称", "").strip(),
+        "open": _float(row.get("开盘价") or row.get("open")),
+        "high": _float(row.get("最高价") or row.get("high")),
+        "low": _float(row.get("最低价") or row.get("low")),
+        "close": _float(row.get("收盘价") or row.get("close")),
+        "pct_chg": _float(row.get("涨跌幅") or row.get("pctChg")),
+        "volume": _float(row.get("成交量") or row.get("volume")),
+        "amount": _float(row.get("成交额") or row.get("amount")),
+        "last_close": _float(row.get("昨收", row.get("前收盘"))),
+        "_source": "csv",
+    }
