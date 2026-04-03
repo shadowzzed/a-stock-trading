@@ -56,6 +56,7 @@ class RetrievalToolFactory:
             self._make_get_quant_rules(),
             self._make_get_stock_detail(),
             self._make_get_past_report(),
+            self._make_scan_trend_stocks(),
         ]
 
     # ------------------------------------------------------------------
@@ -722,3 +723,278 @@ class RetrievalToolFactory:
             return "\n".join(lines)
 
         return get_market_data
+
+    # ------------------------------------------------------------------
+    # Tool 12: scan_trend_stocks (全市场趋势股扫描)
+    # ------------------------------------------------------------------
+    def _make_scan_trend_stocks(self):
+        factory = self
+
+        @tool
+        def scan_trend_stocks(
+            min_pct: Optional[float] = 3.0,
+            max_pct: Optional[float] = None,
+            sector: Optional[str] = None,
+            ma_type: Optional[str] = "both",
+            top_n: Optional[int] = 30,
+            hot_only: Optional[bool] = False,
+        ) -> str:
+            """全市场趋势股扫描 — 寻找沿5日线或10日线上方运行的趋势股。
+
+            遍历全市场所有股票的历史日线，计算5日/10日均线，筛选出
+            始终在均线上方运行且涨幅符合条件的趋势股。热门板块重点关注。
+
+            Args:
+                min_pct: 最低涨幅百分比，默认 3%
+                max_pct: 最高涨幅百分比（可选，过滤短期爆炒）
+                sector: 按板块名称筛选（模糊匹配，可选）
+                ma_type: "5"=仅5日线, "10"=仅10日线, "both"=两者都看（默认）
+                top_n: 返回数量，默认 30
+                hot_only: 是否只看热门板块（涨幅>1%的板块），默认 False
+            """
+            from datetime import datetime as _dt
+
+            ds = factory.date or _dt.now().strftime("%Y-%m-%d")
+            db_path = os.path.join(factory.data_dir, "intraday", "intraday.db")
+            if not os.path.exists(db_path):
+                return "无数据（intraday.db 不存在）"
+
+            try:
+                conn = sqlite3.connect(db_path)
+                conn.row_factory = sqlite3.Row
+            except Exception:
+                return "无数据（数据库连接失败）"
+
+            try:
+                # 1. 获取最近交易日列表（需要至少11个交易日来算10日均线）
+                trading_days = [
+                    r[0] for r in conn.execute(
+                        "SELECT DISTINCT date FROM snapshots "
+                        "WHERE ts = '15:00:00' ORDER BY date DESC LIMIT 12"
+                    ).fetchall()
+                ]
+                if len(trading_days) < 6:
+                    return f"数据不足：仅 {len(trading_days)} 个交易日，至少需要6个"
+
+                today = trading_days[0]
+                # 用最近11个交易日（含今天）计算均线
+                calc_days = trading_days[:11]
+
+                # 2. 获取这些日期的所有收盘数据
+                placeholders = ",".join(["?"] * len(calc_days))
+                rows = conn.execute(f"""
+                    SELECT date, code, name, price, pctChg, open, high, low,
+                           amount_yi, volume, sector, star, in_pool
+                    FROM snapshots
+                    WHERE date IN ({placeholders}) AND ts = '15:00:00'
+                    ORDER BY code, date DESC
+                """, calc_days).fetchall()
+
+                if not rows:
+                    return "无收盘数据"
+
+                # 3. 按股票聚合，计算均线
+                stock_data = {}  # code -> {dates: {date: price, ...}, info: {...}}
+                for r in rows:
+                    code = r["code"]
+                    if code not in stock_data:
+                        stock_data[code] = {
+                            "prices": {},  # date -> price (收盘价)
+                            "name": r["name"],
+                            "sector": r["sector"] or "",
+                            "star": r["star"],
+                            "in_pool": r["in_pool"],
+                        }
+                    stock_data[code]["prices"][r["date"]] = r["price"]
+
+                # 4. 计算均线并筛选趋势股
+                results = []
+                need_ma5 = ma_type in ("5", "both")
+                need_ma10 = ma_type in ("10", "both")
+
+                for code, sd in stock_data.items():
+                    prices = sd["prices"]
+                    if today not in prices:
+                        continue
+
+                    today_price = prices[today]
+                    if not today_price or today_price <= 0:
+                        continue
+
+                    # 按日期降序排列（最近的在前）
+                    sorted_dates = sorted(prices.keys(), reverse=True)
+
+                    # 今天涨跌幅
+                    # 从数据库中拿今天的 pctChg
+                    today_row = next(
+                        (r for r in rows if r["code"] == code and r["date"] == today),
+                        None
+                    )
+                    if not today_row:
+                        continue
+                    today_pct = today_row["pctChg"] or 0
+                    today_amount = today_row["amount_yi"] or 0
+
+                    # 涨幅过滤
+                    if today_pct < min_pct:
+                        continue
+                    if max_pct is not None and today_pct > max_pct:
+                        continue
+
+                    # 计算5日均线
+                    ma5 = None
+                    if need_ma5 and len(sorted_dates) >= 5:
+                        ma5_dates = sorted_dates[:5]
+                        ma5_prices = [prices[d] for d in ma5_dates if prices.get(d)]
+                        if len(ma5_prices) >= 5:
+                            ma5 = sum(ma5_prices) / len(ma5_prices)
+
+                    # 计算10日均线
+                    ma10 = None
+                    if need_ma10 and len(sorted_dates) >= 10:
+                        ma10_dates = sorted_dates[:10]
+                        ma10_prices = [prices[d] for d in ma10_dates if prices.get(d)]
+                        if len(ma10_prices) >= 10:
+                            ma10 = sum(ma10_prices) / len(ma10_prices)
+
+                    # 判断是否沿均线运行：价格在均线上方 + 近5日大部分时间在均线上方
+                    above_ma5 = False
+                    above_ma10 = False
+
+                    if need_ma5 and ma5:
+                        # 今天在5日线上方
+                        if today_price >= ma5:
+                            # 检查近5日中至少3日在5日线上方
+                            days_above = sum(
+                                1 for d in ma5_dates
+                                if prices.get(d, 0) >= ma5 * 0.99  # 允许1%误差
+                            )
+                            if days_above >= 3:
+                                above_ma5 = True
+
+                    if need_ma10 and ma10:
+                        if today_price >= ma10:
+                            ma10_check_dates = sorted_dates[:min(5, len(sorted_dates))]
+                            days_above = sum(
+                                1 for d in ma10_check_dates
+                                if prices.get(d, 0) >= ma10 * 0.99
+                            )
+                            if days_above >= 3:
+                                above_ma10 = True
+
+                    # 至少满足一个均线条件
+                    if not above_ma5 and not above_ma10:
+                        continue
+
+                    results.append({
+                        "code": code,
+                        "name": sd["name"],
+                        "price": today_price,
+                        "pctChg": today_pct,
+                        "amount_yi": today_amount,
+                        "sector": sd["sector"],
+                        "star": sd["star"],
+                        "in_pool": sd["in_pool"],
+                        "ma5": round(ma5, 2) if ma5 else None,
+                        "ma10": round(ma10, 2) if ma10 else None,
+                        "above_ma5": above_ma5,
+                        "above_ma10": above_ma10,
+                        "dist_ma5": round((today_price / ma5 - 1) * 100, 2) if ma5 else None,
+                        "dist_ma10": round((today_price / ma10 - 1) * 100, 2) if ma10 else None,
+                    })
+
+                # 5. 热门板块筛选
+                if hot_only:
+                    sector_avg = {}
+                    sector_counts = {}
+                    for r in results:
+                        s = r["sector"]
+                        if not s:
+                            continue
+                        sector_avg.setdefault(s, []).append(r["pctChg"])
+                        sector_counts[s] = sector_counts.get(s, 0) + 1
+                    hot_sectors = {
+                        s for s, pcts in sector_avg.items()
+                        if sum(pcts) / len(pcts) > 1.0 and sector_counts.get(s, 0) >= 2
+                    }
+                    results = [r for r in results if r["sector"] in hot_sectors]
+
+                # 6. 板块过滤
+                if sector:
+                    results = [
+                        r for r in results
+                        if sector in r["sector"]
+                    ]
+
+                # 7. 排序：池内优先 > 星标 > 涨幅
+                results.sort(
+                    key=lambda x: (
+                        -int(x["in_pool"] or 0),
+                        -int(x["star"] or 0),
+                        -(x["pctChg"] or 0),
+                    )
+                )
+
+                # 8. 截取 top_n
+                results = results[:top_n]
+
+                if not results:
+                    return "未找到符合条件的趋势股"
+
+                # 9. 格式化输出
+                lines = [
+                    f"## 趋势股扫描结果（{ds}）",
+                    f"筛选条件：涨幅≥{min_pct}%"
+                    + (f"≤{max_pct}%" if max_pct else "")
+                    + f" | 均线类型={ma_type}"
+                    + (f" | 板块含「{sector}」" if sector else "")
+                    + (f" | 仅热门板块" if hot_only else ""),
+                    f"共找到 {len(results)} 只趋势股\n",
+                    "| 代码 | 名称 | 现价 | 涨幅 | 5日线 | 10日线 | 距5日线 | 距10日线 | 成交额(亿) | 板块 |",
+                    "|------|------|------|------|-------|--------|---------|----------|-----------|------|",
+                ]
+
+                for r in results:
+                    star_mark = "⭐" if r["star"] else ""
+                    pool_mark = "🏊" if r["in_pool"] else ""
+                    name_display = f"{star_mark}{pool_mark}{r['name']}"
+
+                    ma5_str = f"{r['ma5']:.2f}" if r["ma5"] else "-"
+                    ma10_str = f"{r['ma10']:.2f}" if r["ma10"] else "-"
+                    dist5 = f"{r['dist_ma5']:+.1f}%" if r["dist_ma5"] is not None else "-"
+                    dist10 = f"{r['dist_ma10']:+.1f}%" if r["dist_ma10"] is not None else "-"
+
+                    lines.append(
+                        f"| {r['code']} | {name_display} | {r['price']:.2f} "
+                        f"| {r['pctChg']:+.2f}% | {ma5_str} | {ma10_str} "
+                        f"| {dist5} | {dist10} | {r['amount_yi']:.1f} | {r['sector']} |"
+                    )
+
+                # 板块汇总
+                sector_summary = {}
+                for r in results:
+                    s = r["sector"] or "未知"
+                    sector_summary.setdefault(s, {"count": 0, "pcts": []})
+                    sector_summary[s]["count"] += 1
+                    sector_summary[s]["pcts"].append(r["pctChg"])
+
+                lines.append("\n### 板块分布")
+                for s, info in sorted(
+                    sector_summary.items(),
+                    key=lambda x: -x[1]["count"]
+                ):
+                    avg_pct = sum(info["pcts"]) / len(info["pcts"])
+                    lines.append(
+                        f"- **{s}**：{info['count']}只，平均涨幅 {avg_pct:+.2f}%"
+                    )
+
+                return "\n".join(lines)
+
+            except Exception as e:
+                import logging
+                logging.getLogger(__name__).error("[scan_trend_stocks] error: %s", e)
+                return f"扫描失败: {e}"
+            finally:
+                conn.close()
+
+        return scan_trend_stocks
