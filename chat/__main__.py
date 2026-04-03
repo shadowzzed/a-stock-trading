@@ -1,7 +1,8 @@
 """盘中对话 Agent -- 飞书 Bot 模式入口
 
 启动方式:
-    python -m chat
+    python -m chat              # 飞书 Bot 模式
+    python -m chat --cli        # 本地 CLI 测试模式
     # 或
     chat-agent (安装后)
 """
@@ -10,6 +11,7 @@ from __future__ import annotations
 
 import logging
 import os
+import socket
 import sys
 import threading
 from collections import defaultdict
@@ -31,6 +33,26 @@ logging.basicConfig(
     datefmt="%H:%M:%S",
 )
 logger = logging.getLogger(__name__)
+
+# 端口锁，防止重复启动
+LOCK_PORT = 19876
+_lock_socket = None
+
+
+def _acquire_lock() -> bool:
+    """尝试绑定端口作为进程锁，返回是否成功。"""
+    global _lock_socket
+    try:
+        _lock_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        _lock_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        _lock_socket.bind(("127.0.0.1", LOCK_PORT))
+        _lock_socket.listen(1)
+        logger.info("端口锁已获取 (:%d)", LOCK_PORT)
+        return True
+    except OSError:
+        logger.error("端口锁获取失败 (:%d)，可能已有实例在运行。请先 kill 旧进程。", LOCK_PORT)
+        return False
+
 
 # 每个群聊维护独立的对话历史（简单内存实现）
 MAX_HISTORY_PER_CHAT = 20
@@ -57,7 +79,43 @@ def _append_history(chat_id: str, role: str, text: str) -> None:
             _chat_histories[chat_id] = history[-MAX_HISTORY_PER_CHAT:]
 
 
-def main() -> None:
+def run_cli() -> None:
+    """本地 CLI 测试模式，直接与 Agent 对话。"""
+    print("=== Trade Agent CLI 模式 ===")
+    print("输入消息直接对话，输入 /quit 退出\n")
+
+    agent = TradingChatAgent()
+    history = []
+
+    from langchain_core.messages import AIMessage, HumanMessage
+
+    while True:
+        try:
+            user_input = input("你> ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print("\n退出")
+            break
+
+        if not user_input:
+            continue
+        if user_input == "/quit":
+            break
+
+        history.append(HumanMessage(content=user_input))
+        try:
+            reply = agent.chat(user_input, history=history[:-1])
+            history.append(AIMessage(content=reply))
+            print(f"\nAgent> {reply}\n")
+        except Exception as e:
+            print(f"\n[错误] {e}\n")
+            logger.error("CLI 对话异常: %s", e, exc_info=True)
+
+
+def run_bot() -> None:
+    """飞书 Bot 模式。"""
+    if not _acquire_lock():
+        sys.exit(1)
+
     cfg = get_config()
     app_id = cfg.get("chat_feishu_app_id", "")
     app_secret = cfg.get("chat_feishu_app_secret", "")
@@ -100,6 +158,13 @@ def main() -> None:
 
     logger.info("正在连接飞书 WebSocket...")
     bot.start()
+
+
+def main() -> None:
+    if "--cli" in sys.argv:
+        run_cli()
+    else:
+        run_bot()
 
 
 if __name__ == "__main__":

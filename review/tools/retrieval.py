@@ -45,6 +45,7 @@ class RetrievalToolFactory:
     def create_tools(self) -> list:
         """创建所有检索工具。"""
         return [
+            self._make_get_market_data(),
             self._make_get_history_data(),
             self._make_get_review_docs(),
             self._make_get_memory(),
@@ -531,3 +532,193 @@ class RetrievalToolFactory:
             return result if result else "无数据"
 
         return get_past_report
+
+    # ------------------------------------------------------------------
+    # Tool 11: get_market_data (NEW - flexible market snapshot)
+    # ------------------------------------------------------------------
+    def _make_get_market_data(self):
+        factory = self
+
+        @tool
+        def get_market_data(
+            date: Optional[str] = None,
+            time: Optional[str] = None,
+            name: Optional[str] = None,
+            code: Optional[str] = None,
+            mode: Optional[str] = "overview",
+            sort_by: Optional[str] = "pctChg",
+            top_n: Optional[int] = None,
+        ) -> str:
+            """获取行情快照数据（支持按日期+时间查询）。可查市场概览、股票池行情、个股详情。
+            数据源优先从本地 SQLite，不存在时自动从通达信接口实时拉取。
+
+            Args:
+                date: 日期 YYYY-MM-DD，默认今天
+                time: 时间点，如 "09:25"、"10:00"、"11:30"、"close"。默认返回该日最新可用快照
+                name: 股票名称（模糊匹配，可选）
+                code: 股票代码（精确匹配，可选）
+                mode: "overview"=市场概览（涨幅TOP+跌幅TOP+涨停统计），"stock"=个股详情，"pool"=股票池行情。默认 overview
+                sort_by: "pctChg"、"amount"、"volume"，默认 pctChg
+                top_n: 返回数量（个股模式默认5，概览模式默认10）
+            """
+            from datetime import datetime as _dt
+
+            ds = date or _dt.now().strftime("%Y-%m-%d")
+            db_path = os.path.join(factory.data_dir, "intraday", "intraday.db")
+
+            rows = []
+            actual_ts = None
+
+            if os.path.exists(db_path):
+                conn = None
+                try:
+                    conn = sqlite3.connect(db_path)
+                    conn.row_factory = sqlite3.Row
+
+                    # Check if data exists for this date
+                    has_data = conn.execute(
+                        "SELECT 1 FROM snapshots WHERE date = ? LIMIT 1", (ds,)
+                    ).fetchone()
+
+                    if has_data:
+                        # Resolve target timestamp
+                        if time and time not in ("close", "latest"):
+                            ts_row = conn.execute(
+                                "SELECT ts FROM snapshots WHERE date = ? AND ts <= ? ORDER BY ts DESC LIMIT 1",
+                                (ds, time + ":59"),
+                            ).fetchone()
+                        else:
+                            ts_row = conn.execute(
+                                "SELECT ts FROM snapshots WHERE date = ? ORDER BY ts DESC LIMIT 1",
+                                (ds,),
+                            ).fetchone()
+
+                        if ts_row:
+                            actual_ts = ts_row[0]
+                            conditions = ["date = ?", "ts = ?"]
+                            params: list = [ds, actual_ts]
+
+                            if code:
+                                conditions.append("code LIKE ?")
+                                params.append(f"%{code}%")
+                            if name:
+                                conditions.append("name LIKE ?")
+                                params.append(f"%{name}%")
+                            if mode == "pool":
+                                conditions.append("in_pool = 1")
+
+                            where = " AND ".join(conditions)
+                            sort_col = (
+                                "amount_yi" if sort_by == "amount"
+                                else "volume" if sort_by == "volume"
+                                else "pctChg"
+                            )
+                            query = f"SELECT * FROM snapshots WHERE {where} ORDER BY {sort_col} DESC"
+                            rows = [dict(r) for r in conn.execute(query, params).fetchall()]
+                except Exception as e:
+                    import logging
+                    logging.getLogger(__name__).error("[get_market_data] DB error: %s", e)
+                finally:
+                    if conn:
+                        conn.close()
+
+            # Fallback: mootdx real-time (only for today)
+            today_str = _dt.now().strftime("%Y-%m-%d")
+            if not rows and ds == today_str:
+                try:
+                    import subprocess
+                    mootdx_path = os.path.join(factory.data_dir, "mootdx_tool.py")
+                    output = subprocess.check_output(
+                        ["python3", mootdx_path, "quotes"] + ([code] if code else []),
+                        timeout=15, encoding="utf-8",
+                    )
+                    for line in output.strip().split("\n"):
+                        parts = line.strip().split()
+                        if len(parts) >= 8 and parts[0].isdigit() and len(parts[0]) == 6:
+                            row = {
+                                "code": parts[0], "name": parts[1],
+                                "price": float(parts[2]), "pctChg": float(parts[3]),
+                                "amount_yi": float(parts[-1]) if parts[-1].replace(".", "").isdigit() else 0,
+                            }
+                            if name and name not in row["name"]:
+                                continue
+                            if code and code not in row["code"]:
+                                continue
+                            rows.append(row)
+                    actual_ts = "实时"
+                except Exception:
+                    pass
+
+            if not rows:
+                return f"无行情数据（{ds} {time or ''}），本地数据库和通达信接口均无数据"
+
+            # ─── Format output ───
+            def _fmt_pct(v):
+                if v is None: return "-"
+                n = float(v)
+                return f"{n:+.2f}%"
+
+            def _fmt_price(v):
+                if v is None: return "-"
+                return f"{float(v):.2f}"
+
+            def _fmt_amt(v):
+                if v is None: return "-"
+                return f"{float(v):.2f}"
+
+            if mode == "stock":
+                n = top_n or 5
+                filtered = rows[:n]
+                r = filtered[0]
+                lines = [
+                    f"## {r.get('name','')}（{r.get('code','')}）",
+                    f"日期: {ds}  时间: {actual_ts}", "",
+                    "| 代码 | 名称 | 现价 | 涨跌幅 | 开盘 | 最高 | 最低 | 成交额(亿) |",
+                    "|------|------|------|--------|------|------|------|-----------|",
+                ]
+                for r in filtered:
+                    lines.append(
+                        f"| {r['code']} | {r['name']} | {_fmt_price(r.get('price'))} "
+                        f"| {_fmt_pct(r.get('pctChg'))} | {_fmt_price(r.get('open'))} "
+                        f"| {_fmt_price(r.get('high'))} | {_fmt_price(r.get('low'))} "
+                        f"| {_fmt_amt(r.get('amount_yi'))} |"
+                    )
+                return "\n".join(lines)
+
+            # overview / pool
+            n = top_n or 10
+            limit_ups = [r for r in rows if r.get("is_limit_up")]
+            limit_downs = [r for r in rows if r.get("is_limit_down")]
+            up_count = sum(1 for r in rows if (r.get("pctChg") or 0) > 0)
+            down_count = sum(1 for r in rows if (r.get("pctChg") or 0) < 0)
+            total_amount = sum(r.get("amount_yi", 0) or 0 for r in rows)
+
+            sorted_rows = sorted(rows, key=lambda r: r.get("pctChg", 0) or 0, reverse=True)
+            top_gainers = sorted_rows[:n]
+            top_losers = sorted_rows[-n:][::-1]
+
+            label = "股票池" if mode == "pool" else "全市场"
+            lines = [
+                f"## 行情概览（{label}）",
+                f"日期: {ds}  时间: {actual_ts}  总数: {len(rows)}",
+                f"涨: {up_count}  跌: {down_count}  涨停: {len(limit_ups)}  跌停: {len(limit_downs)}  总成交: {total_amount:.1f}亿",
+                "", f"### 涨幅 TOP{n}",
+                "| 代码 | 名称 | 现价 | 涨跌幅 | 成交额(亿) |",
+                "|------|------|------|--------|-----------|",
+            ]
+            for r in top_gainers:
+                lines.append(f"| {r['code']} | {r['name']} | {_fmt_price(r.get('price'))} | {_fmt_pct(r.get('pctChg'))} | {_fmt_amt(r.get('amount_yi'))} |")
+
+            lines += ["", f"### 跌幅 TOP{n}"]
+            for r in top_losers:
+                lines.append(f"| {r['code']} | {r['name']} | {_fmt_price(r.get('price'))} | {_fmt_pct(r.get('pctChg'))} | {_fmt_amt(r.get('amount_yi'))} |")
+
+            if limit_ups and mode != "pool":
+                lines += ["", f"### 涨停（{len(limit_ups)}只）"]
+                for r in limit_ups:
+                    amt = r.get("amount_yi", 0) or 0
+                    lines.append(f"- {r['name']}（{r['code']}）{amt:.1f}亿")
+
+            return "\n".join(lines)
+
+        return get_market_data

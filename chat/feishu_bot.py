@@ -5,6 +5,8 @@ from __future__ import annotations
 import json
 import logging
 import threading
+import time
+from collections import OrderedDict
 from typing import Callable, Optional
 
 import lark_oapi as lark
@@ -14,6 +16,29 @@ from lark_oapi.api.im.v1 import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+class _LRUDedup:
+    """LRU 消息去重，防止飞书 WebSocket 重复推送。"""
+
+    def __init__(self, maxsize: int = 1000, ttl: int = 1800):
+        self._cache: OrderedDict[str, float] = OrderedDict()
+        self._maxsize = maxsize
+        self._ttl = ttl
+
+    def is_duplicate(self, msg_id: str) -> bool:
+        now = time.time()
+        # 清理过期条目
+        expired = [k for k, v in self._cache.items() if now - v > self._ttl]
+        for k in expired:
+            del self._cache[k]
+
+        if msg_id in self._cache:
+            return True
+        self._cache[msg_id] = now
+        if len(self._cache) > self._maxsize:
+            self._cache.popitem(last=False)
+        return False
 
 
 class FeishuBot:
@@ -34,6 +59,7 @@ class FeishuBot:
         self.app_id = app_id
         self.app_secret = app_secret
         self.on_message = on_message
+        self._dedup = _LRUDedup()
 
         self._client = (
             lark.Client.builder()
@@ -139,6 +165,12 @@ class FeishuBot:
         try:
             msg = data.event.message
             if msg is None:
+                return
+
+            # 消息去重（飞书 WebSocket 可能重复推送）
+            msg_id = msg.message_id or ""
+            if msg_id and self._dedup.is_duplicate(msg_id):
+                logger.debug("重复消息已跳过: %s", msg_id)
                 return
 
             # 只处理文本消息
