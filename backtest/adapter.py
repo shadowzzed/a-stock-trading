@@ -9,7 +9,7 @@ from __future__ import annotations
 import os
 from typing import Optional
 
-from .engine.protocols import DataProvider, AgentRunner, LLMCaller, MarketData
+from .engine.protocols import DataProvider, AgentRunner, LLMCaller, MarketData, StockDataProvider
 
 
 class ReviewDataProvider:
@@ -125,3 +125,153 @@ class LangChainLLMCaller:
             HumanMessage(content=user_message),
         ])
         return response.content
+
+
+class CSVStockDataProvider:
+    """个股日线数据提供者 — 从 daily CSV 文件加载"""
+
+    def __init__(self):
+        self._name_code_cache: dict[str, str] = {}  # {name: code}
+
+    def load_stock_daily(
+        self, data_dir: str, date: str, stock_name: str,
+    ) -> Optional[dict]:
+        """从行情 CSV 加载指定股票的日线数据"""
+        import csv as csv_mod
+        import glob as glob_mod
+
+        d_dir = os.path.join(data_dir, "daily", date)
+        csv_files = glob_mod.glob(os.path.join(d_dir, "行情_*.csv"))
+        if not csv_files:
+            return None
+
+        for csv_file in csv_files:
+            try:
+                with open(csv_file, "r", encoding="utf-8-sig") as f:
+                    reader = csv_mod.DictReader(f)
+                    for row in reader:
+                        name = row.get("名称", "").strip()
+                        if name == stock_name:
+                            return self._row_to_dict(row, date)
+            except Exception:
+                continue
+
+        return None
+
+    def load_stock_daily_by_code(
+        self, data_dir: str, date: str, stock_code: str,
+    ) -> Optional[dict]:
+        """按股票代码加载日线数据"""
+        import csv as csv_mod
+        import glob as glob_mod
+
+        d_dir = os.path.join(data_dir, "daily", date)
+        csv_files = glob_mod.glob(os.path.join(d_dir, "行情_*.csv"))
+        if not csv_files:
+            return None
+
+        for csv_file in csv_files:
+            try:
+                with open(csv_file, "r", encoding="utf-8-sig") as f:
+                    reader = csv_mod.DictReader(f)
+                    for row in reader:
+                        code = row.get("代码", "").strip()
+                        if code == stock_code:
+                            return self._row_to_dict(row, date)
+            except Exception:
+                continue
+
+        return None
+
+    def load_limit_up_info(
+        self, data_dir: str, date: str, stock_name: str,
+    ) -> Optional[dict]:
+        """从涨停板 CSV 加载炸板次数等信息"""
+        import csv as csv_mod
+        import glob as glob_mod
+
+        d_dir = os.path.join(data_dir, "daily", date)
+        csv_files = glob_mod.glob(os.path.join(d_dir, "涨停板_*.csv"))
+        if not csv_files:
+            return None
+
+        for csv_file in csv_files:
+            try:
+                with open(csv_file, "r", encoding="utf-8-sig") as f:
+                    reader = csv_mod.DictReader(f)
+                    for row in reader:
+                        name = row.get("名称", "").strip()
+                        if name == stock_name:
+                            return {
+                                "name": name,
+                                "code": row.get("代码", ""),
+                                "broken_count": int(row.get("炸板次数", 0)),
+                                "first_seal_time": row.get("首次封板时间", ""),
+                                "board_count": int(row.get("连板数", 1)),
+                            }
+            except Exception:
+                continue
+
+        return None
+
+    def resolve_stock_code(
+        self, data_dir: str, stock_name: str, date: str = "",
+    ) -> Optional[str]:
+        """股票名称 → 代码"""
+        if stock_name in self._name_code_cache:
+            return self._name_code_cache[stock_name]
+
+        # 从最近的行情 CSV 查找
+        import csv as csv_mod
+        import glob as glob_mod
+
+        daily_root = os.path.join(data_dir, "daily")
+        if not os.path.isdir(daily_root):
+            return None
+
+        # 优先查指定日期，再查最近的
+        search_dates = [date] if date else []
+        if not search_dates:
+            dirs = sorted(os.listdir(daily_root), reverse=True)
+            search_dates = dirs[:5]
+
+        for d in search_dates:
+            csv_files = glob_mod.glob(
+                os.path.join(daily_root, d, "行情_*.csv")
+            )
+            for csv_file in csv_files:
+                try:
+                    with open(csv_file, "r", encoding="utf-8-sig") as f:
+                        reader = csv_mod.DictReader(f)
+                        for row in reader:
+                            if row.get("名称", "").strip() == stock_name:
+                                code = row.get("代码", "").strip()
+                                self._name_code_cache[stock_name] = code
+                                return code
+                except Exception:
+                    continue
+
+        return None
+
+    @staticmethod
+    def _row_to_dict(row: dict, date: str) -> dict:
+        """CSV 行 → 标准化字典"""
+        def _float(val, default=0.0):
+            try:
+                return float(str(val).replace(",", ""))
+            except (ValueError, TypeError):
+                return default
+
+        return {
+            "date": date,
+            "code": row.get("代码", "").strip(),
+            "name": row.get("名称", "").strip(),
+            "open": _float(row.get("开盘价")),
+            "high": _float(row.get("最高价")),
+            "low": _float(row.get("最低价")),
+            "close": _float(row.get("收盘价")),
+            "pct_chg": _float(row.get("涨跌幅")),
+            "volume": _float(row.get("成交量")),
+            "amount": _float(row.get("成交额")),
+            "last_close": _float(row.get("昨收", row.get("前收盘"))),
+        }
