@@ -36,7 +36,7 @@ def main():
 
     args = parser.parse_args()
 
-    from intraday.runner import run_agent
+    from trading_agent.intraday.runner import run_agent
 
     report = run_agent(
         agent_name=args.agent,

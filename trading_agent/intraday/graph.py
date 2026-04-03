@@ -21,11 +21,11 @@ from typing import Optional
 from langgraph.graph import StateGraph, START, END
 
 # 确保项目根在 path 中
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
 from config import get_config, init_data_dirs, get_ai_providers
-from intraday.config import load_prompt
-from intraday.state import IntradayState
+from trading_agent.intraday.config import load_prompt
+from trading_agent.intraday.state import IntradayState
 
 
 # ── Node 1: fetch_data ────────────────────────────────────────

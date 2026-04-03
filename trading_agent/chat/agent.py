@@ -8,7 +8,7 @@ from typing import List, Optional
 from langchain_core.messages import BaseMessage
 
 from config import get_config
-from review.tools.retrieval import RetrievalToolFactory
+from trading_agent.review.tools.retrieval import RetrievalToolFactory
 
 from .coordinator import CoordinatorAgent
 

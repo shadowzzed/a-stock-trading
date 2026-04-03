@@ -23,7 +23,7 @@ from langchain_core.messages import (
 from langchain_openai import ChatOpenAI
 
 from config import get_config, get_ai_providers
-from review.tools.retrieval import RetrievalToolFactory
+from trading_agent.review.tools.retrieval import RetrievalToolFactory
 
 logger = logging.getLogger(__name__)
 

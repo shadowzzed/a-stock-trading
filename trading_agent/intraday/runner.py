@@ -16,7 +16,7 @@ import os
 from datetime import datetime
 
 from config import get_config
-from intraday.config import load_prompt
+from trading_agent.intraday.config import load_prompt
 
 
 # ── closing_review (local) ──────────────────────────────────
@@ -133,5 +133,5 @@ def run_agent(agent_name: str, output_path: str = None, dry_run: bool = False, d
         return _run_closing_review(output_path=output_path, dry_run=dry_run, date=date)
 
     # 委托给 LangGraph 实现
-    from intraday.graph import run
+    from trading_agent.intraday.graph import run
     return run(agent_name=agent_name, date=date, dry_run=dry_run)

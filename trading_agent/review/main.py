@@ -62,7 +62,7 @@ def cli():
     args = parser.parse_args()
 
     if args.data_dir is None:
-        sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+        sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
         from config import get_config
         args.data_dir = get_config()["data_root"]
 

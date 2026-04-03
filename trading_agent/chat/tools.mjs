@@ -4,6 +4,7 @@
  */
 import fs from 'fs';
 import path from 'path';
+import { execSync } from 'child_process';
 import Database from 'better-sqlite3';
 import { getDataDir } from './config.mjs';
 
@@ -39,6 +40,22 @@ function today() {
 
 function compactDate(d) {
   return d.replace(/-/g, '');
+}
+
+function fmtPct(v) {
+  if (v == null) return '-';
+  const n = parseFloat(v);
+  return (n >= 0 ? '+' : '') + n.toFixed(2) + '%';
+}
+
+function fmtAmt(v) {
+  if (v == null) return '-';
+  return parseFloat(v).toFixed(2);
+}
+
+function fmtPrice(v) {
+  if (v == null) return '-';
+  return parseFloat(v).toFixed(2);
 }
 
 // ─── Tool definitions (OpenAI function format) ─────
@@ -166,6 +183,25 @@ export const toolDefinitions = [
           date: { type: 'string', description: '日期 YYYY-MM-DD' },
         },
         required: ['date'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'get_market_data',
+      description: '获取行情快照数据（支持按日期+时间查询）。可查市场概览、股票池行情、个股详情。数据源优先从本地 SQLite，不存在时自动从通达信接口实时拉取。',
+      parameters: {
+        type: 'object',
+        properties: {
+          date: { type: 'string', description: '日期 YYYY-MM-DD，默认今天' },
+          time: { type: 'string', description: '时间点，如 "09:25"、"10:00"、"11:30"、"close"。默认返回该日最新可用快照。历史数据支持的时间取决于已拉取的快照。' },
+          name: { type: 'string', description: '股票名称（模糊匹配，可选）' },
+          code: { type: 'string', description: '股票代码（精确匹配，可选）' },
+          mode: { type: 'string', enum: ['overview', 'stock', 'pool'], description: 'overview=市场概览（涨幅TOP+跌幅TOP+涨停统计），stock=个股详情，pool=股票池行情。默认overview' },
+          sort_by: { type: 'string', enum: ['pctChg', 'amount', 'volume'], description: '排序字段，默认 pctChg' },
+          top_n: { type: 'number', description: '返回数量（个股模式默认5，概览模式默认10）' },
+        },
       },
     },
   },
@@ -350,7 +386,7 @@ const toolHandlers = {
       const lines = [`## ${first.name}（${first.code}）`, `日期: ${ds}，共 ${rows.length} 条快照`, '', '| 时间 | 价格 | 涨跌幅 | 成交额(亿) | 涨停 |', '|------|------|--------|-----------|------|'];
       for (const r of rows) {
         const lu = r.is_limit_up ? '涨停' : (r.is_limit_down ? '跌停' : '');
-        lines.push(`| ${r.ts} | ${r.price} | ${parseFloat(r.pctChg || 0) >= 0 ? '+' : ''}${parseFloat(r.pctChg || 0).toFixed(2)}% | ${parseFloat(r.amount_yi || 0).toFixed(2)} | ${lu} |`);
+        lines.push(`| ${r.ts} | ${fmtPrice(r.price)} | ${parseFloat(r.pctChg || 0) >= 0 ? '+' : ''}${parseFloat(r.pctChg || 0).toFixed(2)}% | ${parseFloat(r.amount_yi || 0).toFixed(2)} | ${lu} |`);
       }
       return lines.join('\n');
     } catch (e) {
@@ -363,6 +399,158 @@ const toolHandlers = {
     const fp = path.join(DATA_DIR, 'daily', date, 'agent_05_裁决报告.md');
     const content = readMd(fp);
     return content || `无报告（${date}）`;
+  },
+
+  get_market_data({ date, time, name, code, mode = 'overview', sort_by = 'pctChg', top_n } = {}) {
+    const ds = date || today();
+    const dbPath = path.join(DATA_DIR, 'intraday', 'intraday.db');
+
+    // Resolve target timestamp
+    function resolveTs(db) {
+      if (time && time !== 'close' && time !== 'latest') {
+        // Find closest snapshot to requested time
+        const row = db.prepare(
+          "SELECT ts FROM snapshots WHERE date = ? AND ts <= ? ORDER BY ts DESC LIMIT 1"
+        ).get(ds, time + ':59');
+        return row ? row.ts : null;
+      }
+      // Default: latest snapshot of the day
+      const row = db.prepare(
+        "SELECT ts FROM snapshots WHERE date = ? ORDER BY ts DESC LIMIT 1"
+      ).get(ds);
+      return row ? row.ts : null;
+    }
+
+    // Try intraday.db
+    let db = null;
+    let rows = [];
+    let actualTs = null;
+
+    if (fs.existsSync(dbPath)) {
+      try {
+        db = new Database(dbPath, { readonly: true });
+
+        // Check if data exists for this date
+        const dateCheck = db.prepare("SELECT 1 FROM snapshots WHERE date = ? LIMIT 1").get(ds);
+        if (dateCheck) {
+          actualTs = resolveTs(db);
+          if (actualTs) {
+            let query = "SELECT * FROM snapshots WHERE date = ? AND ts = ?";
+            const params = [ds, actualTs];
+            if (code) { query += " AND code LIKE ?"; params.push(`%${code}%`); }
+            if (name) { query += " AND name LIKE ?"; params.push(`%${name}%`); }
+            if (mode === 'pool') { query += " AND in_pool = 1"; }
+
+            // Sorting
+            const sortCol = sort_by === 'amount' ? 'amount_yi' : (sort_by === 'volume' ? 'volume' : 'pctChg');
+            query += ` ORDER BY ${sortCol} DESC`;
+            rows = db.prepare(query).all(...params);
+          }
+        }
+      } catch (e) {
+        console.error('[get_market_data] DB error:', e.message);
+      }
+    }
+
+    // Fallback: pull real-time via mootdx_tool.py (only for today)
+    if (rows.length === 0 && ds === today()) {
+      try {
+        const mootdxPath = path.join(DATA_DIR, 'mootdx_tool.py');
+        const cmd = code
+          ? `python3 ${mootdxPath} quotes ${code}`
+          : name
+            ? `python3 ${mootdxPath} quotes`
+            : `python3 ${mootdxPath} quotes`;
+        const output = execSync(cmd, { timeout: 15000, encoding: 'utf8' });
+
+        // Parse tabular output from mootdx_tool.py
+        const lines = output.trim().split('\n');
+        const dataStart = lines.findIndex(l => l.match(/^\d{6}/));
+        if (dataStart >= 0) {
+          const headerLine = lines[dataStart - 1] || '';
+          for (let i = dataStart; i < lines.length; i++) {
+            const parts = lines[i].trim().split(/\s+/);
+            if (parts.length >= 6 && parts[0].match(/^\d{6}$/)) {
+              const row = {
+                code: parts[0], name: parts[1], price: parseFloat(parts[2]),
+                pctChg: parseFloat(parts[3]), open: parseFloat(parts[4]),
+                high: parseFloat(parts[5]), low: parseFloat(parts[6]),
+                last_close: parseFloat(parts[7]),
+                amount_yi: parseFloat(parts[parts.length - 1]) || 0,
+              };
+              // Apply filters
+              if (name && !row.name.includes(name)) continue;
+              if (code && !row.code.includes(code)) continue;
+              rows.push(row);
+            }
+          }
+          actualTs = '实时';
+        }
+      } catch (e) {
+        console.error('[get_market_data] mootdx fallback error:', e.message);
+      }
+    }
+
+    if (db) db.close();
+    if (rows.length === 0) return `无行情数据（${ds} ${time || ''}），本地数据库和通达信接口均无数据`;
+
+    // ─── Format output based on mode ───
+
+    if (mode === 'stock') {
+      // Individual stock detail
+      const n = top_n || 5;
+      const filtered = rows.slice(0, n);
+      const lines = [`## ${filtered[0].name || ''}（${filtered[0].code}）`, `日期: ${ds}  时间: ${actualTs}`, '',
+        '| 代码 | 名称 | 现价 | 涨跌幅 | 开盘 | 最高 | 最低 | 成交额(亿) | 涨停 |',
+        '|------|------|------|--------|------|------|------|-----------|------|'];
+      for (const r of filtered) {
+        const lu = r.is_limit_up ? '涨停' : (r.is_limit_down ? '跌停' : '');
+        lines.push(`| ${r.code} | ${r.name} | ${fmtPrice(r.price)} | ${fmtPct(r.pctChg)} | ${fmtPrice(r.open)} | ${fmtPrice(r.high)} | ${fmtPrice(r.low)} | ${fmtAmt(r.amount_yi)} | ${lu} |`);
+      }
+      return lines.join('\n');
+    }
+
+    // overview / pool mode
+    const n = top_n || 10;
+
+    // Statistics
+    const limitUps = rows.filter(r => r.is_limit_up);
+    const limitDowns = rows.filter(r => r.is_limit_down);
+    const upCount = rows.filter(r => (r.pctChg || 0) > 0).length;
+    const downCount = rows.filter(r => (r.pctChg || 0) < 0).length;
+    const totalAmount = rows.reduce((s, r) => s + (r.amount_yi || 0), 0);
+
+    const sorted = [...rows].sort((a, b) => (b.pctChg || 0) - (a.pctChg || 0));
+    const topGainers = sorted.slice(0, n);
+    const topLosers = sorted.slice(-n).reverse();
+
+    const lines = [
+      `## 行情概览（${mode === 'pool' ? '股票池' : '全市场'}）`,
+      `日期: ${ds}  时间: ${actualTs}  总数: ${rows.length}`,
+      `涨: ${upCount}  跌: ${downCount}  涨停: ${limitUps.length}  跌停: ${limitDowns.length}  总成交: ${totalAmount.toFixed(1)}亿`,
+      '',
+      '### 涨幅 TOP' + n,
+      '| 代码 | 名称 | 现价 | 涨跌幅 | 成交额(亿) |',
+      '|------|------|------|--------|-----------|',
+    ];
+    for (const r of topGainers) {
+      lines.push(`| ${r.code} | ${r.name} | ${fmtPrice(r.price)} | ${fmtPct(r.pctChg)} | ${fmtAmt(r.amount_yi)} |`);
+    }
+
+    lines.push('', '### 跌幅 TOP' + n);
+    for (const r of topLosers) {
+      lines.push(`| ${r.code} | ${r.name} | ${fmtPrice(r.price)} | ${fmtPct(r.pctChg)} | ${fmtAmt(r.amount_yi)} |`);
+    }
+
+    // Append limit-up details if any
+    if (limitUps.length > 0 && mode !== 'pool') {
+      lines.push('', `### 涨停（${limitUps.length}只）`);
+      for (const r of limitUps) {
+        lines.push(`- ${r.name}（${r.code}）${r.amount_yi ? r.amount_yi.toFixed(1) + '亿' : ''}`);
+      }
+    }
+
+    return lines.join('\n');
   },
 };
 

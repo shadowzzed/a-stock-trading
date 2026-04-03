@@ -16,7 +16,7 @@ class ReviewDataProvider:
     """数据提供者 — 从 review.data.loader 加载行情数据"""
 
     def load_market_data(self, data_dir: str, date: str) -> MarketData:
-        from review.data.loader import load_daily_data
+        from trading_agent.review.data.loader import load_daily_data
 
         daily_data = load_daily_data(data_dir, date)
         limit_up = daily_data.limit_up
@@ -52,8 +52,8 @@ class ReviewDataProvider:
     def load_next_day_summary(
         self, data_dir: str, date: str, report: str = ""
     ) -> tuple[str, str]:
-        from review.data.loader import load_daily_data, summarize_limit_up, summarize_limit_down
-        from review.verify import _load_stock_pnl
+        from trading_agent.review.data.loader import load_daily_data, summarize_limit_up, summarize_limit_down
+        from trading_agent.review.verify import _load_stock_pnl
 
         data_d1 = load_daily_data(data_dir, date)
         summary = "## {} 实际行情\n\n".format(date)
@@ -91,7 +91,7 @@ class ReviewAgentRunner:
         config: Optional[dict] = None,
         prev_report: str = "",
     ) -> str:
-        from review.graph import DEFAULT_CONFIG, _create_llm, _load_initial_state, build_graph
+        from trading_agent.review.graph import DEFAULT_CONFIG, _create_llm, _load_initial_state, build_graph
 
         cfg = {**DEFAULT_CONFIG, **(config or {})}
         init_state = _load_initial_state(
@@ -112,7 +112,7 @@ class LangChainLLMCaller:
 
     def _ensure_llm(self):
         if self._llm is None:
-            from review.graph import DEFAULT_CONFIG, _create_llm
+            from trading_agent.review.graph import DEFAULT_CONFIG, _create_llm
             self._llm = _create_llm(DEFAULT_CONFIG)
         return self._llm
 

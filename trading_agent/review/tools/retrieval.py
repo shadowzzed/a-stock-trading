@@ -80,7 +80,7 @@ class RetrievalToolFactory:
             cache_key = ("history_data", days_back, tuple(metrics or []))
 
             def _load():
-                from ..data.loader import _load_history, summarize_history
+                from data.loader import _load_history, summarize_history
 
                 history = _load_history(factory.data_dir, factory.date, days_back)
 
@@ -192,7 +192,7 @@ class RetrievalToolFactory:
                 cache_key = ("memory_days", days_back)
 
             def _load():
-                from ..data.loader import load_memory
+                from data.loader import load_memory
 
                 if date:
                     # 读取指定日期的单条记忆
@@ -228,7 +228,7 @@ class RetrievalToolFactory:
             cache_key = ("lessons", category)
 
             def _load():
-                from ..data.loader import load_lessons
+                from data.loader import load_lessons
 
                 text = load_lessons(factory.data_dir)
                 if not text:
@@ -313,7 +313,7 @@ class RetrievalToolFactory:
             cache_key = ("index_data", target_date)
 
             def _load():
-                from ..data.loader import load_index_data
+                from data.loader import load_index_data
 
                 return load_index_data(factory.data_dir, target_date)
 
@@ -339,7 +339,7 @@ class RetrievalToolFactory:
             cache_key = ("capital_flow", target_date)
 
             def _load():
-                from ..data.loader import load_capital_flow
+                from data.loader import load_capital_flow
 
                 return load_capital_flow(factory.data_dir, target_date)
 
@@ -364,7 +364,7 @@ class RetrievalToolFactory:
             cache_key = ("quant_rules", category)
 
             def _load():
-                from ..data.loader import load_quantitative_rules
+                from data.loader import load_quantitative_rules
 
                 text = load_quantitative_rules(factory.data_dir)
                 if not text:
