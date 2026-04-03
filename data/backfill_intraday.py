@@ -272,16 +272,10 @@ def backfill_date(date_str, db, code_to_name, pool, all_codes):
 
 
 def get_trading_dates():
-    """生成3月所有可能的交易日"""
-    dates = []
-    # 0302-0331，跳过周末
-    d = datetime(2026, 3, 2)
-    end = datetime(2026, 3, 31)
-    while d <= end:
-        if d.weekday() < 5:  # 周一到周五
-            dates.append(d.strftime("%Y%m%d"))
-        d += timedelta(days=1)
-    return dates
+    """生成3月所有交易日（含节假日判断）"""
+    from trading_agent.calendar import trading_days_between
+    days = trading_days_between("2026-03-02", "2026-03-31")
+    return [d.replace("-", "") for d in days]
 
 
 def main():
