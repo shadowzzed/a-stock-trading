@@ -140,9 +140,9 @@ def _parse_strategy_section(
     # 全局仓位建议
     position_pct = _parse_position_advice(section)
 
-    # 按标的分段：匹配 **股票名** 或 - **股票名** 开头的段落
-    # 每个段落描述一只标的
-    stock_blocks = re.split(r'\n(?=-\s*\*\*|→\s*\*\*|\d[、.]\s*\*\*)', section)
+    # 按标的分段：匹配 **股票名** 或 - **股票名** 或编号列表开头的段落
+    # 每个段落描述一只标的（注意缩进空格）
+    stock_blocks = re.split(r'\n\s*(?=-\s*\*\*|→\s*\*\*|\d[、.]\s*\*\*)', section)
 
     for block in stock_blocks:
         # 提取股票名称

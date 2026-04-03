@@ -264,14 +264,14 @@ class CSVStockDataProvider:
 
         return {
             "date": date,
-            "code": row.get("代码", "").strip(),
+            "code": row.get("代码", "").strip() or row.get("code", "").strip(),
             "name": row.get("名称", "").strip(),
-            "open": _float(row.get("开盘价")),
-            "high": _float(row.get("最高价")),
-            "low": _float(row.get("最低价")),
-            "close": _float(row.get("收盘价")),
-            "pct_chg": _float(row.get("涨跌幅")),
-            "volume": _float(row.get("成交量")),
-            "amount": _float(row.get("成交额")),
+            "open": _float(row.get("开盘价") or row.get("open")),
+            "high": _float(row.get("最高价") or row.get("high")),
+            "low": _float(row.get("最低价") or row.get("low")),
+            "close": _float(row.get("收盘价") or row.get("close")),
+            "pct_chg": _float(row.get("涨跌幅") or row.get("pctChg")),
+            "volume": _float(row.get("成交量") or row.get("volume")),
+            "amount": _float(row.get("成交额") or row.get("amount")),
             "last_close": _float(row.get("昨收", row.get("前收盘"))),
         }

@@ -4,11 +4,12 @@ from __future__ import annotations
 
 import json
 import os
-from typing import Optional
+from typing import Optional, TYPE_CHECKING
 
-from .core import BacktestResult
-from ..experience.store import ExperienceStore
-from ..experience.tracker import LessonTracker
+if TYPE_CHECKING:
+    from .core import BacktestResult
+    from ..experience.store import ExperienceStore
+    from ..experience.tracker import LessonTracker
 
 
 def generate_summary(
