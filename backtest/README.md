@@ -51,7 +51,7 @@ backtest/
 └── run.py               # CLI 入口
 ```
 
-**关键原则：反向依赖**
+### 依赖关系：反向依赖
 
 ```
 review/ (Trading Agent 本体)  ←──只此一处──→  backtest/adapter.py
@@ -64,6 +64,96 @@ review/ (Trading Agent 本体)  ←──只此一处──→  backtest/adapter
 - 引擎通过 Protocol 定义接口（DataProvider、AgentRunner、LLMCaller）
 - `adapter.py` 是唯一知道 `review/` 存在的文件，负责把具体实现注入引擎
 - 如果未来数据源换了（比如接入 AKShare、东方财富直连），只需写新 adapter，引擎和经验库不用改
+
+### 回测引擎内部流程
+
+每天回测跑 6 步：
+
+```
+Step 0: 场景识别
+    DataProvider.load_market_data(Day D)
+    → MarketData（涨停数/跌停数/炸板率/连板高度/...）
+    → ScenarioClassifier.classify()
+    → ScenarioTags（7维离散标签）
+
+Step 1: 教训匹配 & Prompt 注入
+    PromptEngine.build_injection(market_data)
+    → ExperienceStore.search(scenario=当前场景)
+    → 按效果值排序，取 Top N
+    → 按 Agent 角色分配（情绪分析师只看 sentiment 类教训等）
+    → 生成注入文本
+
+Step 2: 跑 Agent 分析（带教训注入）
+    AgentRunner.run(Day D, config={prompt_overrides: 注入文本})
+    → LangGraph 多 Agent 复盘流程
+    → 当日分析报告
+
+Step 3: 加载 Day D+1 实际行情
+    DataProvider.load_next_day_summary(Day D+1)
+    → 涨停/跌停汇总 + 推荐标的实际涨跌幅
+
+Step 4: 验证打分
+    LLMCaller.invoke(VERIFIER_PROMPT, 报告+实际行情)
+    → 四维打分（情绪/板块/龙头/策略，各 1-5 分，满分 20）
+    → key_lessons / what_was_right / what_was_wrong
+
+Step 5: 提取结构化经验
+    LLMCaller.invoke(EXPERIENCE_EXTRACTOR_PROMPT, 验证结果)
+    → Experience 对象（场景+错误类型+教训+修正规则）
+    → ExperienceStore.add()（自动去重合并同类经验）
+
+Step 6: 记录教训效果
+    LessonTracker.record_injection(注入的教训ID, 实际得分)
+    → 更新每条教训的累计改善率
+    → 自动升降权（active → deprecated → promoted）
+```
+
+### 经验库数据模型
+
+```
+Experience（一条结构化经验）
+├── id: 唯一标识（uuid hex 12位）
+├── date: 回测日期
+├── scenario: ScenarioTags 字典
+│   ├── sentiment_phase: 冰点/修复/升温/高潮/分歧/退潮
+│   ├── limit_up_range: 涨停数区间
+│   ├── limit_down_range: 跌停数区间
+│   ├── blown_rate_range: 炸板率区间
+│   ├── max_board_range: 最高连板区间
+│   ├── sector_concentration: 板块集中度
+│   └── volume_trend: 成交量趋势
+├── prediction: Agent 原始判断摘要
+├── reality: 实际结果摘要
+├── scores: 四维评分
+├── error_type: sentiment / sector / leader / strategy
+├── lesson: 提炼出的教训
+├── correction_rule: 可执行的修正规则
+├── confidence: 置信度（重复出现 → 递增，上限 0.95）
+├── effectiveness: 注入后平均改善分数（负值=有害 → deprecated）
+├── occurrence_count: 同类合并次数
+└── injection_count: 被注入 Prompt 的次数
+
+去重合并策略：
+  新经验的 (error_type + scenario 3个维度匹配) == 已有经验
+  → 合并（累加次数、保留更详细的 lesson、更新 confidence）
+  → 不合并则新增
+
+容量控制：MAX_EXPERIENCES = 200
+  超出时按 confidence × effectiveness 排序，淘汰最差
+```
+
+### 效果追踪状态机
+
+```
+                    ┌─────────────────────────────┐
+                    │                             │
+                    ▼                             │
+  [active] ──→ 注入后追踪 ──→ 3次以上改善<−1  ──→ [deprecated]（降权至 0.1，不再注入）
+                    │
+                    │ 5次以上改善>+2
+                    ▼
+              [promoted]（候选升级为量化规则）
+```
 
 ## 限制
 
