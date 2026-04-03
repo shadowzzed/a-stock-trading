@@ -11,9 +11,9 @@ from __future__ import annotations
 
 from typing import Optional
 
-from .experience_store import ExperienceStore, Experience
-from .scenario_classifier import ScenarioClassifier, ScenarioTags
-from .lesson_tracker import LessonTracker
+from .store import ExperienceStore, Experience
+from .classifier import ScenarioClassifier, ScenarioTags
+from .tracker import LessonTracker
 
 
 # 注入模板：不同错误类型对应的关注提醒
@@ -214,50 +214,3 @@ class PromptEngine:
             lines.append("")
 
         return "\n".join(lines)
-
-
-def build_market_data_from_daily(daily_data) -> dict:
-    """从 review.data.loader.DailyData 提取市场数据字典
-
-    Args:
-        daily_data: DailyData 实例
-    """
-    import pandas as pd
-
-    limit_up = daily_data.limit_up
-    limit_down = daily_data.limit_down
-    history = daily_data.history
-
-    result = {
-        "limit_up_count": len(limit_up) if not limit_up.empty else 0,
-        "limit_down_count": len(limit_down) if not limit_down.empty else 0,
-    }
-
-    # 炸板率
-    if not limit_up.empty and "炸板次数" in limit_up.columns:
-        total = len(limit_up)
-        blown = len(limit_up[limit_up["炸板次数"] > 0])
-        result["blown_rate"] = blown / total * 100 if total > 0 else 0
-    else:
-        result["blown_rate"] = 0
-
-    # 最高连板
-    if not limit_up.empty and "连板数" in limit_up.columns:
-        result["max_board"] = int(limit_up["连板数"].max())
-    else:
-        result["max_board"] = 0
-
-    # 板块集中度
-    if not limit_up.empty and "所属行业" in limit_up.columns:
-        top1 = limit_up["所属行业"].value_counts()
-        result["sector_top1_count"] = int(top1.iloc[0]) if len(top1) > 0 else 0
-    else:
-        result["sector_top1_count"] = 0
-
-    # 前一日涨停数
-    if history:
-        result["prev_limit_up_count"] = history[-1].get("limit_up_count", 0)
-    else:
-        result["prev_limit_up_count"] = None
-
-    return result

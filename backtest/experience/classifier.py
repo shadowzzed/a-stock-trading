@@ -66,19 +66,7 @@ class ScenarioClassifier:
         sentiment_phase: str = "",
         volume_change_pct: Optional[float] = None,
     ) -> ScenarioTags:
-        """根据市场数据生成场景标签
-
-        Args:
-            limit_up_count: 涨停家数
-            limit_down_count: 跌停家数
-            blown_rate: 炸板率 (0-100)
-            max_board: 最高连板数
-            sector_top1_count: 涨停最多板块的涨停数
-            sector_top1_total: 总涨停数
-            prev_limit_up_count: 前一日涨停数（用于计算趋势）
-            sentiment_phase: 已识别的情绪阶段（可选）
-            volume_change_pct: 成交量环比变化百分比
-        """
+        """根据市场数据生成场景标签"""
         tags = ScenarioTags()
 
         # 情绪阶段（如果已提供，直接使用）
@@ -128,7 +116,6 @@ class ScenarioClassifier:
             else:
                 tags.volume_trend = "持平"
         elif prev_limit_up_count is not None:
-            # 没有成交量数据时，用涨停数变化近似
             change = limit_up_count - prev_limit_up_count
             pct = change / max(prev_limit_up_count, 1) * 100
             if pct > 30:
@@ -142,13 +129,7 @@ class ScenarioClassifier:
 
     @staticmethod
     def classify_from_report(report_text: str, market_data: dict) -> ScenarioTags:
-        """从 Agent 报告文本 + 市场数据字典中提取场景标签
-
-        Args:
-            report_text: Agent 裁决报告文本
-            market_data: 包含 limit_up_count, limit_down_count 等的字典
-        """
-        # 尝试从报告文本中提取情绪阶段
+        """从 Agent 报告文本 + 市场数据字典中提取场景标签"""
         phase = ""
         phase_keywords = {
             "冰点": "冰点", "修复": "修复", "升温": "升温",
@@ -156,7 +137,6 @@ class ScenarioClassifier:
         }
         for keyword, phase_name in phase_keywords.items():
             if keyword in report_text:
-                # 取最常出现的阶段作为当前阶段
                 phase = phase_name
                 break
 

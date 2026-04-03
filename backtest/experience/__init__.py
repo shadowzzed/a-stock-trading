@@ -1,8 +1,8 @@
 """结构化经验库：回测教训的场景化存储、检索与效果追踪"""
 
-from .experience_store import ExperienceStore, Experience
-from .scenario_classifier import ScenarioClassifier, ScenarioTags
-from .lesson_tracker import LessonTracker
+from .store import ExperienceStore, Experience
+from .classifier import ScenarioClassifier, ScenarioTags, classify_error_type
+from .tracker import LessonTracker
 from .prompt_engine import PromptEngine
 
 __all__ = [
@@ -10,6 +10,7 @@ __all__ = [
     "Experience",
     "ScenarioClassifier",
     "ScenarioTags",
+    "classify_error_type",
     "LessonTracker",
     "PromptEngine",
 ]

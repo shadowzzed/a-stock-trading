@@ -24,5 +24,6 @@ runtime_data/
 # 日志
 logs/
 
-# backtest 输出
-backtest*/
+# backtest 输出（但保留 backtest/ 源码）
+backtest_v*/
+backtest_results/

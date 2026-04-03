@@ -13,7 +13,7 @@ from dataclasses import dataclass, field, asdict
 from datetime import datetime
 from typing import Optional
 
-from .scenario_classifier import ScenarioTags
+from .classifier import ScenarioTags
 
 
 @dataclass
@@ -301,8 +301,6 @@ class ExperienceStore:
         if not exp_tags:
             return 0.3  # 无标签时给基础分
 
-        total_dims = 0
-        matched = 0
         weights = {
             "sentiment_phase": 3,      # 情绪阶段权重最高
             "limit_up_range": 2,

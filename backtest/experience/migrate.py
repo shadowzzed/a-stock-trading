@@ -22,7 +22,7 @@ from __future__ import annotations
 import json
 import os
 
-from .experience_store import ExperienceStore, Experience
+from .store import ExperienceStore, Experience
 
 
 def migrate_legacy_lessons(data_dir: str, dry_run: bool = False) -> int:
@@ -120,10 +120,8 @@ def _infer_error_type(lesson_text: str) -> str:
 
 def _infer_correction(lesson_text: str) -> str:
     """从教训文本提取修正规则（简单启发式）"""
-    # 如果教训中有"应该"/"必须"/"不要"等关键词，直接用作修正规则
     for keyword in ["应该", "必须", "不要", "不宜", "需要"]:
         if keyword in lesson_text:
-            # 截取关键词所在句子
             idx = lesson_text.index(keyword)
             start = max(0, lesson_text.rfind("。", 0, idx) + 1)
             end = lesson_text.find("。", idx)
