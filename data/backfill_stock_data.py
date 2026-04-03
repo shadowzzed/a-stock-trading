@@ -10,17 +10,10 @@ from datetime import datetime
 REFERENCE_CSV = os.path.join(os.path.dirname(__file__), "daily/2026-03-09/行情_20260309.csv")
 DAILY_DIR = os.path.join(os.path.dirname(__file__), "daily")
 
-# 需要补齐的日期（2月2日 ~ 3月3日的工作日）
+# 需要补齐的日期（2月2日 ~ 3月3日的交易日）
 def _generate_dates(start, end):
-    from datetime import date, timedelta
-    dates = []
-    d = date.fromisoformat(start)
-    e = date.fromisoformat(end)
-    while d <= e:
-        if d.weekday() < 5:
-            dates.append(d.isoformat())
-        d += timedelta(days=1)
-    return dates
+    from trading_agent.calendar import trading_days_between
+    return trading_days_between(start, end)
 
 MISSING_DATES = _generate_dates("2026-02-02", "2026-03-03")
 

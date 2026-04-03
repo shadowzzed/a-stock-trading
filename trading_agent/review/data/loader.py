@@ -3,11 +3,40 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import glob
+import sqlite3
 from datetime import datetime, timedelta
+from typing import Optional
 import pandas as pd
 from dataclasses import dataclass, field
+
+logger = logging.getLogger(__name__)
+
+
+# ── 数据质量标记 ──────────────────────────────────────────────
+
+
+@dataclass
+class DataResult:
+    """带质量标记的数据返回值。
+
+    对 LLM 消费者透明：str() 返回带警告前缀的文本。
+    对代码消费者可检查 warnings / data_sources_missing。
+    """
+    content: str
+    warnings: list[str] = field(default_factory=list)
+    data_sources_missing: list[str] = field(default_factory=list)
+
+    def __str__(self) -> str:
+        if self.warnings:
+            prefix = "\n".join(f"> ⚠️ 数据警告: {w}" for w in self.warnings)
+            return f"{prefix}\n\n{self.content}"
+        return self.content
+
+    def __bool__(self) -> bool:
+        return bool(self.content)
 
 
 @dataclass
@@ -148,7 +177,11 @@ def _load_history(data_dir: str, current_date: str, days: int = 5) -> list:
 def summarize_history(history: list) -> str:
     """将历史数据转为文本摘要（含板块分布、连板梯队、龙头存续）"""
     if not history:
-        return "（无历史数据）"
+        return DataResult(
+            content="（无历史数据）",
+            warnings=["无历史数据，无法进行跨日情绪对比，情绪阶段判断可能不可靠"],
+            data_sources_missing=["history"],
+        )
 
     lines = ["## 近期情绪数据对比"]
     lines.append("| 日期 | 涨停数 | 跌停数 | 最高连板 | 炸板率 |")
@@ -226,7 +259,11 @@ def _load_csv(directory: str, filename: str) -> pd.DataFrame:
 def summarize_limit_up(df: pd.DataFrame) -> str:
     """将涨停板 DataFrame 转为分析师可读的文本摘要"""
     if df.empty:
-        return "无涨停板数据"
+        return DataResult(
+            content="无涨停板数据",
+            warnings=["涨停板数据为空，情绪分析（涨停数、连板高度、炸板率）将不可靠"],
+            data_sources_missing=["limit_up_csv"],
+        )
 
     total = len(df)
     # 按行业统计
@@ -296,7 +333,11 @@ def summarize_limit_up(df: pd.DataFrame) -> str:
 def summarize_limit_down(df: pd.DataFrame) -> str:
     """跌停板摘要（含连续跌停信号和开板次数）"""
     if df.empty:
-        return "无跌停板数据"
+        return DataResult(
+            content="无跌停板数据",
+            warnings=["跌停板数据缺失，退潮/冰点判断缺少依据"],
+            data_sources_missing=["limit_down_csv"],
+        )
 
     total = len(df)
     industry_counts = df["所属行业"].value_counts().head(5)
@@ -628,7 +669,11 @@ def load_quantitative_rules(data_dir: str = "") -> str:
 def summarize_stock_data(df: pd.DataFrame) -> str:
     """个股行情摘要（按板块分组统计涨跌）"""
     if df.empty:
-        return "无个股行情数据"
+        return DataResult(
+            content="无个股行情数据",
+            warnings=["个股行情数据为空，板块强弱分析不可靠"],
+            data_sources_missing=["stock_csv"],
+        )
 
     lines = ["## 跟踪股票池行情"]
 
@@ -662,3 +707,463 @@ def summarize_stock_data(df: pd.DataFrame) -> str:
             ))
 
     return "\n".join(lines)
+
+
+# ════════════════════════════════════════════════════════════════
+# SQLite 数据加载函数（从 retrieval.py 统一到此处）
+# ════════════════════════════════════════════════════════════════
+
+
+def _get_db_path(data_dir: str) -> str:
+    """获取 intraday.db 路径。"""
+    return os.path.join(data_dir, "intraday", "intraday.db")
+
+
+def load_stock_detail(
+    data_dir: str,
+    name: Optional[str] = None,
+    code: Optional[str] = None,
+    date: Optional[str] = None,
+) -> str:
+    """从 intraday 数据库查询个股详细行情（分时快照）。
+
+    至少提供 name 或 code 之一。
+    """
+    if not name and not code:
+        return "请提供 name 或 code 参数"
+
+    target_date = date or datetime.now().strftime("%Y-%m-%d")
+    db_path = _get_db_path(data_dir)
+    if not os.path.exists(db_path):
+        return DataResult(
+            content="无数据",
+            warnings=["intraday.db 不存在，无法查询个股详情"],
+            data_sources_missing=["intraday_db"],
+        )
+
+    try:
+        conn = sqlite3.connect(db_path)
+        conn.row_factory = sqlite3.Row
+    except Exception:
+        return DataResult(
+            content="无数据",
+            warnings=["数据库连接失败"],
+            data_sources_missing=["intraday_db"],
+        )
+
+    try:
+        conditions = ["date = ?"]
+        params: list = [target_date]
+        if code:
+            conditions.append("code LIKE ?")
+            params.append(f"%{code}%")
+        if name:
+            conditions.append("name LIKE ?")
+            params.append(f"%{name}%")
+
+        where = " AND ".join(conditions)
+        query = f"""
+            SELECT date, ts, code, name, price, pctChg,
+                   open, high, low, last_close,
+                   volume, amount, amount_yi,
+                   is_limit_up, is_limit_down, sector
+            FROM snapshots WHERE {where} ORDER BY ts
+        """
+        rows = conn.execute(query, params).fetchall()
+    finally:
+        conn.close()
+
+    if not rows:
+        return DataResult(
+            content="无数据（未找到匹配的股票快照）",
+            warnings=[f"未找到 {name or code} 在 {target_date} 的分时数据"],
+            data_sources_missing=["intraday_snapshot"],
+        )
+
+    lines = []
+    first = rows[0]
+    stock_name = first["name"]
+    stock_code = first["code"]
+    sector = first["sector"] or ""
+    header = f"## {stock_name}（{stock_code}）{f' - {sector}' if sector else ''}"
+    header += f"\n日期: {target_date}，共 {len(rows)} 条快照\n"
+    lines.append(header)
+
+    lines.append("| 时间 | 价格 | 涨跌幅 | 成交额(亿) | 涨停 |")
+    lines.append("|------|------|--------|-----------|------|")
+    for row in rows:
+        ts = row["ts"]
+        price = row["price"] or 0
+        pct = row["pctChg"] or 0
+        amt = row["amount_yi"] or 0
+        limit = "是" if row["is_limit_up"] else ""
+        lines.append(f"| {ts} | {price:.2f} | {pct:+.2f}% | {amt:.2f} | {limit} |")
+
+    prices = [r["price"] for r in rows if r["price"]]
+    if prices:
+        lines.append("")
+        lines.append(
+            f"开盘 {prices[0]:.2f}，最高 {max(prices):.2f}，"
+            f"最低 {min(prices):.2f}，收盘 {prices[-1]:.2f}"
+        )
+
+    return "\n".join(lines)
+
+
+def load_market_snapshot(
+    data_dir: str,
+    date: Optional[str] = None,
+    time: Optional[str] = None,
+    name: Optional[str] = None,
+    code: Optional[str] = None,
+    mode: Optional[str] = "overview",
+    sort_by: Optional[str] = "pctChg",
+    top_n: Optional[int] = None,
+) -> str:
+    """获取行情快照数据（支持概览/个股/股票池模式）。
+
+    数据源: SQLite 优先, mootdx 实时 fallback。
+    """
+    ds = date or datetime.now().strftime("%Y-%m-%d")
+    db_path = _get_db_path(data_dir)
+    rows = []
+    actual_ts = None
+
+    if os.path.exists(db_path):
+        conn = None
+        try:
+            conn = sqlite3.connect(db_path)
+            conn.row_factory = sqlite3.Row
+            has_data = conn.execute(
+                "SELECT 1 FROM snapshots WHERE date = ? LIMIT 1", (ds,)
+            ).fetchone()
+
+            if has_data:
+                if time and time not in ("close", "latest"):
+                    ts_row = conn.execute(
+                        "SELECT ts FROM snapshots WHERE date = ? AND ts <= ? ORDER BY ts DESC LIMIT 1",
+                        (ds, time + ":59"),
+                    ).fetchone()
+                else:
+                    ts_row = conn.execute(
+                        "SELECT ts FROM snapshots WHERE date = ? ORDER BY ts DESC LIMIT 1",
+                        (ds,),
+                    ).fetchone()
+
+                if ts_row:
+                    actual_ts = ts_row[0]
+                    conditions = ["date = ?", "ts = ?"]
+                    params: list = [ds, actual_ts]
+                    if code:
+                        conditions.append("code LIKE ?")
+                        params.append(f"%{code}%")
+                    if name:
+                        conditions.append("name LIKE ?")
+                        params.append(f"%{name}%")
+                    if mode == "pool":
+                        conditions.append("in_pool = 1")
+
+                    where = " AND ".join(conditions)
+                    sort_col = (
+                        "amount_yi" if sort_by == "amount"
+                        else "volume" if sort_by == "volume"
+                        else "pctChg"
+                    )
+                    query = f"SELECT * FROM snapshots WHERE {where} ORDER BY {sort_col} DESC"
+                    rows = [dict(r) for r in conn.execute(query, params).fetchall()]
+        except Exception as e:
+            logger.error("[load_market_snapshot] DB error: %s", e)
+        finally:
+            if conn:
+                conn.close()
+
+    if not rows:
+        return DataResult(
+            content=f"无行情数据（{ds} {time or ''}），本地数据库和通达信接口均无数据",
+            warnings=[f"{ds} 无行情快照数据"],
+            data_sources_missing=["intraday_snapshot"],
+        )
+
+    def _fmt_pct(v):
+        if v is None: return "-"
+        return f"{float(v):+.2f}%"
+
+    def _fmt_price(v):
+        if v is None: return "-"
+        return f"{float(v):.2f}"
+
+    def _fmt_amt(v):
+        if v is None: return "-"
+        return f"{float(v):.2f}"
+
+    if mode == "stock":
+        n = top_n or 5
+        filtered = rows[:n]
+        r = filtered[0]
+        lines = [
+            f"## {r.get('name','')}（{r.get('code','')}）",
+            f"日期: {ds}  时间: {actual_ts}", "",
+            "| 代码 | 名称 | 现价 | 涨跌幅 | 开盘 | 最高 | 最低 | 成交额(亿) |",
+            "|------|------|------|--------|------|------|------|-----------|",
+        ]
+        for r in filtered:
+            lines.append(
+                f"| {r['code']} | {r['name']} | {_fmt_price(r.get('price'))} "
+                f"| {_fmt_pct(r.get('pctChg'))} | {_fmt_price(r.get('open'))} "
+                f"| {_fmt_price(r.get('high'))} | {_fmt_price(r.get('low'))} "
+                f"| {_fmt_amt(r.get('amount_yi'))} |"
+            )
+        return "\n".join(lines)
+
+    # overview / pool
+    n = top_n or 10
+    limit_ups = [r for r in rows if r.get("is_limit_up")]
+    limit_downs = [r for r in rows if r.get("is_limit_down")]
+    up_count = sum(1 for r in rows if (r.get("pctChg") or 0) > 0)
+    down_count = sum(1 for r in rows if (r.get("pctChg") or 0) < 0)
+    total_amount = sum(r.get("amount_yi", 0) or 0 for r in rows)
+
+    sorted_rows = sorted(rows, key=lambda r: r.get("pctChg", 0) or 0, reverse=True)
+    top_gainers = sorted_rows[:n]
+    top_losers = sorted_rows[-n:][::-1]
+
+    label = "股票池" if mode == "pool" else "全市场"
+    lines = [
+        f"## 行情概览（{label}）",
+        f"日期: {ds}  时间: {actual_ts}  总数: {len(rows)}",
+        f"涨: {up_count}  跌: {down_count}  涨停: {len(limit_ups)}  跌停: {len(limit_downs)}  总成交: {total_amount:.1f}亿",
+        "", f"### 涨幅 TOP{n}",
+        "| 代码 | 名称 | 现价 | 涨跌幅 | 成交额(亿) |",
+        "|------|------|------|--------|-----------|",
+    ]
+    for r in top_gainers:
+        lines.append(f"| {r['code']} | {r['name']} | {_fmt_price(r.get('price'))} | {_fmt_pct(r.get('pctChg'))} | {_fmt_amt(r.get('amount_yi'))} |")
+
+    lines += ["", f"### 跌幅 TOP{n}"]
+    for r in top_losers:
+        lines.append(f"| {r['code']} | {r['name']} | {_fmt_price(r.get('price'))} | {_fmt_pct(r.get('pctChg'))} | {_fmt_amt(r.get('amount_yi'))} |")
+
+    if limit_ups and mode != "pool":
+        lines += ["", f"### 涨停（{len(limit_ups)}只）"]
+        for r in limit_ups:
+            amt = r.get("amount_yi", 0) or 0
+            lines.append(f"- {r['name']}（{r['code']}）{amt:.1f}亿")
+
+    return "\n".join(lines)
+
+
+def scan_trend_stocks(
+    data_dir: str,
+    date: Optional[str] = None,
+    min_pct: float = 3.0,
+    max_pct: Optional[float] = None,
+    sector: Optional[str] = None,
+    ma_type: str = "both",
+    top_n: int = 30,
+    hot_only: bool = False,
+) -> str:
+    """全市场趋势股扫描 — 寻找沿5日线或10日线上方运行的趋势股。
+
+    从 intraday.db 读取日线收盘数据，计算 MA5/MA10。
+    """
+    ds = date or datetime.now().strftime("%Y-%m-%d")
+    db_path = _get_db_path(data_dir)
+    if not os.path.exists(db_path):
+        return DataResult(
+            content="无数据",
+            warnings=["intraday.db 不存在，无法扫描趋势股"],
+            data_sources_missing=["intraday_db"],
+        )
+
+    try:
+        conn = sqlite3.connect(db_path)
+        conn.row_factory = sqlite3.Row
+    except Exception:
+        return DataResult(
+            content="无数据",
+            warnings=["数据库连接失败"],
+            data_sources_missing=["intraday_db"],
+        )
+
+    try:
+        trading_days = [
+            r[0] for r in conn.execute(
+                "SELECT DISTINCT date FROM snapshots "
+                "WHERE ts = '15:00:00' ORDER BY date DESC LIMIT 12"
+            ).fetchall()
+        ]
+        if len(trading_days) < 6:
+            return DataResult(
+                content=f"数据不足：仅 {len(trading_days)} 个交易日，至少需要6个",
+                warnings=["日线数据不足，无法计算均线"],
+                data_sources_missing=["daily_snapshots"],
+            )
+
+        today = trading_days[0]
+        calc_days = trading_days[:11]
+
+        placeholders = ",".join(["?"] * len(calc_days))
+        rows = conn.execute(f"""
+            SELECT date, code, name, price, pctChg, open, high, low,
+                   amount_yi, volume, sector, star, in_pool
+            FROM snapshots
+            WHERE date IN ({placeholders}) AND ts = '15:00:00'
+            ORDER BY code, date DESC
+        """, calc_days).fetchall()
+
+        if not rows:
+            return DataResult(
+                content="无收盘数据",
+                warnings=["SQLite 中无收盘快照数据"],
+                data_sources_missing=["daily_snapshots"],
+            )
+
+        stock_data = {}
+        for r in rows:
+            code = r["code"]
+            if code not in stock_data:
+                stock_data[code] = {
+                    "prices": {}, "name": r["name"],
+                    "sector": r["sector"] or "", "star": r["star"], "in_pool": r["in_pool"],
+                }
+            stock_data[code]["prices"][r["date"]] = r["price"]
+
+        results = []
+        need_ma5 = ma_type in ("5", "both")
+        need_ma10 = ma_type in ("10", "both")
+
+        for code, sd in stock_data.items():
+            prices = sd["prices"]
+            if today not in prices:
+                continue
+            today_price = prices[today]
+            if not today_price or today_price <= 0:
+                continue
+
+            sorted_dates = sorted(prices.keys(), reverse=True)
+            today_row = next(
+                (r for r in rows if r["code"] == code and r["date"] == today), None
+            )
+            if not today_row:
+                continue
+            today_pct = today_row["pctChg"] or 0
+            today_amount = today_row["amount_yi"] or 0
+
+            if today_pct < min_pct:
+                continue
+            if max_pct is not None and today_pct > max_pct:
+                continue
+
+            ma5 = None
+            if need_ma5 and len(sorted_dates) >= 5:
+                ma5_dates = sorted_dates[:5]
+                ma5_prices = [prices[d] for d in ma5_dates if prices.get(d)]
+                if len(ma5_prices) >= 5:
+                    ma5 = sum(ma5_prices) / len(ma5_prices)
+
+            ma10 = None
+            if need_ma10 and len(sorted_dates) >= 10:
+                ma10_dates = sorted_dates[:10]
+                ma10_prices = [prices[d] for d in ma10_dates if prices.get(d)]
+                if len(ma10_prices) >= 10:
+                    ma10 = sum(ma10_prices) / len(ma10_prices)
+
+            above_ma5 = False
+            above_ma10 = False
+
+            if need_ma5 and ma5 and today_price >= ma5:
+                days_above = sum(1 for d in ma5_dates if prices.get(d, 0) >= ma5 * 0.99)
+                if days_above >= 3:
+                    above_ma5 = True
+
+            if need_ma10 and ma10 and today_price >= ma10:
+                ma10_check = sorted_dates[:min(5, len(sorted_dates))]
+                days_above = sum(1 for d in ma10_check if prices.get(d, 0) >= ma10 * 0.99)
+                if days_above >= 3:
+                    above_ma10 = True
+
+            if not above_ma5 and not above_ma10:
+                continue
+
+            results.append({
+                "code": code, "name": sd["name"], "price": today_price,
+                "pctChg": today_pct, "amount_yi": today_amount,
+                "sector": sd["sector"], "star": sd["star"], "in_pool": sd["in_pool"],
+                "ma5": round(ma5, 2) if ma5 else None,
+                "ma10": round(ma10, 2) if ma10 else None,
+                "above_ma5": above_ma5, "above_ma10": above_ma10,
+                "dist_ma5": round((today_price / ma5 - 1) * 100, 2) if ma5 else None,
+                "dist_ma10": round((today_price / ma10 - 1) * 100, 2) if ma10 else None,
+            })
+
+        if hot_only:
+            sector_avg = {}
+            sector_counts = {}
+            for r in results:
+                s = r["sector"]
+                if not s: continue
+                sector_avg.setdefault(s, []).append(r["pctChg"])
+                sector_counts[s] = sector_counts.get(s, 0) + 1
+            hot_sectors = {
+                s for s, pcts in sector_avg.items()
+                if sum(pcts) / len(pcts) > 1.0 and sector_counts.get(s, 0) >= 2
+            }
+            results = [r for r in results if r["sector"] in hot_sectors]
+
+        if sector:
+            results = [r for r in results if sector in r["sector"]]
+
+        results.sort(key=lambda x: (-int(x["in_pool"] or 0), -int(x["star"] or 0), -(x["pctChg"] or 0)))
+        results = results[:top_n]
+
+        if not results:
+            return "未找到符合条件的趋势股"
+
+        lines = [
+            f"## 趋势股扫描结果（{ds}）",
+            f"筛选条件：涨幅≥{min_pct}%" + (f"≤{max_pct}%" if max_pct else "")
+            + f" | 均线类型={ma_type}"
+            + (f" | 板块含「{sector}」" if sector else "")
+            + (f" | 仅热门板块" if hot_only else ""),
+            f"共找到 {len(results)} 只趋势股\n",
+            "| 代码 | 名称 | 现价 | 涨幅 | 5日线 | 10日线 | 距5日线 | 距10日线 | 成交额(亿) | 板块 |",
+            "|------|------|------|------|-------|--------|---------|----------|-----------|------|",
+        ]
+
+        for r in results:
+            star_mark = "⭐" if r["star"] else ""
+            pool_mark = "🏊" if r["in_pool"] else ""
+            name_display = f"{star_mark}{pool_mark}{r['name']}"
+            ma5_str = f"{r['ma5']:.2f}" if r["ma5"] else "-"
+            ma10_str = f"{r['ma10']:.2f}" if r["ma10"] else "-"
+            dist5 = f"{r['dist_ma5']:+.1f}%" if r["dist_ma5"] is not None else "-"
+            dist10 = f"{r['dist_ma10']:+.1f}%" if r["dist_ma10"] is not None else "-"
+            lines.append(
+                f"| {r['code']} | {name_display} | {r['price']:.2f} "
+                f"| {r['pctChg']:+.2f}% | {ma5_str} | {ma10_str} "
+                f"| {dist5} | {dist10} | {r['amount_yi']:.1f} | {r['sector']} |"
+            )
+
+        sector_summary = {}
+        for r in results:
+            s = r["sector"] or "未知"
+            sector_summary.setdefault(s, {"count": 0, "pcts": []})
+            sector_summary[s]["count"] += 1
+            sector_summary[s]["pcts"].append(r["pctChg"])
+
+        lines.append("\n### 板块分布")
+        for s, info in sorted(sector_summary.items(), key=lambda x: -x[1]["count"]):
+            avg_pct = sum(info["pcts"]) / len(info["pcts"])
+            lines.append(f"- **{s}**：{info['count']}只，平均涨幅 {avg_pct:+.2f}%")
+
+        return "\n".join(lines)
+
+    except Exception as e:
+        logger.error("[scan_trend_stocks] error: %s", e)
+        return DataResult(
+            content=f"扫描失败: {e}",
+            warnings=[f"趋势股扫描异常: {e}"],
+            data_sources_missing=["intraday_db"],
+        )
+    finally:
+        conn.close()

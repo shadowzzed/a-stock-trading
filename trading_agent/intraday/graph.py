@@ -382,14 +382,9 @@ def _load_recent_news(daily_dir: str, today: str, days: int = 2) -> str:
 
 
 def _recent_trading_days(today: str, n: int) -> list:
-    """简单估算最近 n 个交易日（跳周末）"""
-    dates = []
-    dt = datetime.strptime(today, "%Y-%m-%d")
-    while len(dates) < n:
-        dt -= timedelta(days=1)
-        if dt.weekday() < 5:
-            dates.append(dt.strftime("%Y-%m-%d"))
-    return dates
+    """获取最近 n 个交易日（含节假日判断）"""
+    from trading_agent.calendar import recent_trading_days
+    return recent_trading_days(n, before=today)
 
 
 # ── Graph 构建 & 运行 ──────────────────────────────────────────
