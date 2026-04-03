@@ -25,7 +25,7 @@ class TradingChatAgent:
     def __init__(self):
         cfg = get_config()
         data_dir = cfg["data_root"]
-        memory_dir = RetrievalToolFactory._infer_memory_dir(data_dir)
+        memory_dir = cfg["memory_dir"]
 
         self.coordinator = CoordinatorAgent(data_dir, memory_dir)
         logger.info("Trade Agent Teams 已初始化（4 位分析师）")

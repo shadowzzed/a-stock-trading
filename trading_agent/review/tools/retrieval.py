@@ -14,6 +14,8 @@ from typing import Optional
 
 from langchain_core.tools import tool
 
+from config import get_config
+
 
 class RetrievalToolFactory:
     """创建绑定到特定 data_dir 和 date 的检索工具。
@@ -21,20 +23,14 @@ class RetrievalToolFactory:
     Args:
         data_dir: trading 数据根目录
         date: 分析日期 (YYYY-MM-DD)
-        memory_dir: 跨周期记忆目录 (默认自动推导)
+        memory_dir: 跨周期记忆目录 (默认从 config 获取)
     """
 
     def __init__(self, data_dir: str, date: str, memory_dir: str = ""):
         self.data_dir = data_dir
         self.date = date
-        self.memory_dir = memory_dir or self._infer_memory_dir(data_dir)
+        self.memory_dir = memory_dir or get_config()["memory_dir"]
         self._cache: dict = {}
-
-    @staticmethod
-    def _infer_memory_dir(data_dir: str) -> str:
-        """从 data_dir 推导 memory 目录路径"""
-        data_top = os.path.dirname(os.path.dirname(os.path.dirname(data_dir)))
-        return os.path.join(data_top, "memory", "main")
 
     def _cached(self, key: tuple, loader):
         """简单的字典缓存，避免同一次运行重复读文件"""

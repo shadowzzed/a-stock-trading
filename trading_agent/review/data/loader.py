@@ -382,10 +382,11 @@ def load_stock_pool(data_dir: str) -> str:
 def load_lessons(data_dir: str, max_lessons: int = 15) -> str:
     """加载持久化经验教训库
 
-    从 agent_lessons.json 中读取历史验证积累的教训，返回文本供注入 prompt。
+    从 config 中获取经验库路径，读取历史验证积累的教训。
     只保留最近 max_lessons 条，避免 prompt 过长。
     """
-    lessons_path = os.path.join(data_dir, "agent_lessons.json")
+    from config import get_config
+    lessons_path = get_config()["lessons_file"]
     if not os.path.exists(lessons_path):
         return ""
 
@@ -423,7 +424,8 @@ def save_lessons(data_dir: str, date: str, new_lessons: list,
         what_was_right: 正确判断列表
         scores: 各维度评分
     """
-    lessons_path = os.path.join(data_dir, "agent_lessons.json")
+    from config import get_config
+    lessons_path = get_config()["lessons_file"]
 
     # 加载已有数据
     if os.path.exists(lessons_path):
@@ -594,9 +596,11 @@ def load_memory(memory_dir: str, date: str, max_days: int = 5) -> str:
     return "\n".join(lines)
 
 
-def load_quantitative_rules(data_dir: str) -> str:
+def load_quantitative_rules(data_dir: str = "") -> str:
     """加载量化规律库"""
-    rules_path = os.path.join(data_dir, "knowledge", "quantitative_rules.json")
+    from config import get_config
+    knowledge_dir = get_config()["knowledge_dir"]
+    rules_path = os.path.join(knowledge_dir, "quantitative_rules.json")
     if not os.path.exists(rules_path):
         return ""
 

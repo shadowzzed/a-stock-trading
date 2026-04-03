@@ -9,6 +9,11 @@
     {data_root}/
     ├── daily/YYYY-MM-DD/
     ├── intraday/intraday.db
+    ├── memory/main/              ← 记忆目录（跨周期复盘记忆）
+    ├── knowledge/                ← 知识库目录（交易规则、量化参数）
+    │   ├── quantitative_rules.json
+    │   └── 框架.md
+    ├── agent_lessons.json        ← 经验库文件（回测验证的教训）
     ├── news_monitor.db
     ├── stocks.md
     ├── logs/
@@ -85,6 +90,9 @@ def get_config():
         "stocks_file": os.path.join(data_root, "stocks.md"),
         "logs_dir": os.path.join(data_root, "logs"),
         "backtest_dir": os.path.join(data_root, "backtest"),
+        "memory_dir": os.path.join(data_root, "memory", "main"),
+        "knowledge_dir": os.path.join(_PROJECT_ROOT, "knowledge"),
+        "lessons_file": os.path.join(data_root, "agent_lessons.json"),
         "trendradar_output": trendradar_output,
         "news_state_dir": news_state_dir,
 
@@ -122,6 +130,8 @@ def init_data_dirs():
         cfg["intraday_dir"],
         cfg["logs_dir"],
         cfg["backtest_dir"],
+        cfg["memory_dir"],
+        cfg["knowledge_dir"],
         cfg["trendradar_output"],
         cfg["news_state_dir"],
     ]
