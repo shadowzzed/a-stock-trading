@@ -53,3 +53,6 @@ class AgentState(TypedDict):
 
     # Agent 自定义 prompt 覆盖
     prompt_overrides: dict      # {agent_name: extra_prompt}
+
+    # 数据质量
+    data_quality_warnings: list  # 数据缺失/质量警告汇总

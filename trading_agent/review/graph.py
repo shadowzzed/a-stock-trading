@@ -213,19 +213,35 @@ def _load_initial_state(
         summarize_limit_down,
         summarize_stock_data,
         load_stock_pool,
+        DataResult,
     )
 
     cfg = config or {}
     history_days = cfg.get("history_days", 7)
     data = load_daily_data(data_dir, date, history_days=history_days)
 
+    # 生成各摘要，同时收集 DataResult 的质量警告
+    lu_summary = summarize_limit_up(data.limit_up)
+    ld_summary = summarize_limit_down(data.limit_down)
+    stock_summary = summarize_stock_data(data.stock_data)
+
+    warnings = []
+    for name, result in [
+        ("涨停板", lu_summary),
+        ("跌停板", ld_summary),
+        ("个股行情", stock_summary),
+    ]:
+        if isinstance(result, DataResult) and result.warnings:
+            warnings.extend(result.warnings)
+
     return {
         "date": date,
-        "limit_up_summary": summarize_limit_up(data.limit_up),
-        "limit_down_summary": summarize_limit_down(data.limit_down),
-        "stock_summary": summarize_stock_data(data.stock_data),
+        "limit_up_summary": lu_summary,
+        "limit_down_summary": ld_summary,
+        "stock_summary": stock_summary,
         "events_text": data.events or "",
         "stock_pool_text": load_stock_pool(data_dir),
+        "data_quality_warnings": warnings,
         # 阶段1：分析师报告
         "sentiment_report": "",
         "sector_report": "",
