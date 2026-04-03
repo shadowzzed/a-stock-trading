@@ -1,22 +1,27 @@
 # A股短线交易分析工具集
 
-A 股短线交易分析系统，覆盖数据采集、盘中实时分析、盘后多 Agent 复盘、新闻监控全流程。
+A 股短线交易分析系统，覆盖数据采集、盘中实时分析、盘后多 Agent 复盘、新闻监控、策略回测全流程。
 
-所有模块代码与数据分离，clone 后配置 `config.yaml` 即可运行。
+按产品线组织为三大模块 + 共享层，各产品可独立开发和部署。
 
 ## 架构
 
 ```
-┌─────────────┐    ┌──────────────┐    ┌─────────────┐
-│   data/     │───▶│  intraday/   │───▶│   review/   │
-│  数据采集    │    │  盘中分析     │    │  盘后复盘    │
-└─────────────┘    └──────────────┘    └─────────────┘
-       │                  ▲
-       ▼                  │
-┌─────────────┐           │
-│  monitor/   │───────────┘
-│  新闻监控    │  (新闻 & 事件催化作为分析输入)
-└─────────────┘
+┌─────────────────────────────────────────────────────┐
+│                   共享层 (shared)                     │
+│   data/ ─ 数据采集    tools/ ─ 独立脚本    config.py  │
+│   knowledge/ ─ 交易知识库                             │
+└──────────┬──────────────┬──────────────┬─────────────┘
+           │              │              │
+     ┌─────▼─────┐  ┌────▼─────┐  ┌─────▼──────┐
+     │ trading_  │  │ backtest/│  │ news_      │
+     │ agent/    │  │          │  │ monitor/   │
+     │           │  │ 经验系统  │  │            │
+     │ chat/     │  │ 回测引擎  │  │ 新闻聚合   │
+     │ intraday/ │  │          │  │ AI 解读    │
+     │ review/   │  │          │  │ 事件催化   │
+     └───────────┘  └──────────┘  └────────────┘
+     Trading Agent   回测系统      News Monitor
 ```
 
 ## 快速开始
@@ -38,7 +43,7 @@ export ARK_API_KEY="your_api_key"
 export ARK_MODEL="your_model_endpoint"
 
 # 5. 首次运行（自动创建数据目录结构）
-python -m intraday opening_analysis --dry-run
+python -m trading_agent.intraday opening_analysis --dry-run
 ```
 
 ## 代码与数据分离
@@ -56,9 +61,102 @@ python -m intraday opening_analysis --dry-run
 
 配置优先级：环境变量 `TRADING_DATA_ROOT` > `config.yaml` > 默认值 `./runtime_data/`
 
-## 模块说明
+## 产品线说明
 
-### data/ — 数据采集与存储
+### trading_agent/ — Trading Agent（盘中交易代理）
+
+AI 驱动的盘中交易分析系统，包含三个子系统：
+
+#### chat/ — 飞书对话 Bot
+
+Agent Teams 架构的盘中实时交易助手：
+
+```
+Coordinator（意图识别+综合）──▶ 4 Sub-Agents
+  ├── dragon     龙头分析师
+  ├── sentiment  情绪分析师
+  ├── bullbear   多空分析师
+  └── trend      趋势分析师
+```
+
+```bash
+# 飞书 Bot 模式
+python -m trading_agent.chat
+
+# 本地 CLI 测试
+python -m trading_agent.chat --cli
+```
+
+#### intraday/ — 盘中定时分析
+
+LangGraph 编排的定时分析流水线：
+
+| 时间 | Agent | 功能 |
+|------|-------|------|
+| 09:26 | `opening_analysis` | 高开过顶筛选、板块强弱排名、断板反包识别 |
+| 09:41 | `early_session_analysis` | 涨停股套利机会、超预期股分析、强势板块跟踪 |
+| 18:00 | `closing_review` | 收盘数据确认、关键指标汇报 |
+
+```bash
+python -m trading_agent.intraday opening_analysis
+python -m trading_agent.intraday early_session_analysis
+python -m trading_agent.intraday closing_review
+python -m trading_agent.intraday opening_analysis --dry-run   # 调试模式
+```
+
+#### review/ — 盘后多 Agent 复盘
+
+基于 LangGraph 的多 Agent 复盘框架：
+
+```
+情绪分析师 ─┐
+板块分析师 ─┼──▶ 多空辩论 ──▶ 裁决报告
+龙头分析师 ─┘
+```
+
+```bash
+python -m trading_agent.review 2026-03-31                 # 直接出报告
+python -m trading_agent.review 2026-03-31 -i              # 交互模式
+python -m trading_agent.review 2026-03-31 --model gpt-4   # 指定模型
+```
+
+### backtest/ — 回测系统
+
+策略回测引擎 + 结构化经验库，支持 Trading Agent 自我迭代：
+
+| 模块 | 功能 |
+|------|------|
+| `engine/` | 回测引擎核心（数据加载、策略执行、报告生成） |
+| `experience/` | 结构化经验库（教训分类、场景匹配、prompt 注入） |
+| `adapter.py` | 数据适配层，桥接 trading_agent/review/ 的数据 |
+| `run.py` | 回测运行入口 |
+
+```bash
+python -m backtest
+```
+
+### news_monitor/ — News Monitor（新闻监控）
+
+实时财经新闻聚合 + AI 解读 + 事件催化提取。
+
+**数据源**（30 秒轮询）：
+- TrendRadar DB（11 个热榜平台）
+- 财联社电报（重要级别）
+- 华尔街见闻（A 股频道）
+- 金十数据（重要标记）
+
+```bash
+# 新闻监控（全天运行）
+python news_monitor/news_monitor.py
+
+# 事件催化提取
+python -m news_monitor catalyst
+
+# 盘前简报
+python -m news_monitor briefing
+```
+
+### data/ — 共享数据层
 
 通达信行情接口 + 盘中快照采集 + 收盘数据导出，数据存入 SQLite。
 
@@ -70,63 +168,15 @@ python -m intraday opening_analysis --dry-run
 | `backfill_stock_data.py` | 历史 K 线数据回填 |
 | `import_history.py` | 外部数据导入 |
 
-### intraday/ — 盘中分析 Agent
-
-AI 驱动的实时盘中分析，支持任何 OpenAI-compatible API。
-
-| 时间 | Agent | 功能 |
-|------|-------|------|
-| 09:26 | `opening_analysis` | 高开过顶筛选、板块强弱排名、断板反包识别、风险提示 |
-| 09:41 | `early_session_analysis` | 涨停股套利机会、超预期股分析、强势板块跟踪 |
-| 18:00 | `closing_review` | 收盘数据确认、关键指标汇报、等待博主复盘 |
-
-```bash
-python -m intraday opening_analysis
-python -m intraday early_session_analysis
-python -m intraday closing_review
-python -m intraday opening_analysis --dry-run   # 调试模式
-```
-
-### review/ — 盘后多 Agent 复盘
-
-基于 LangGraph 的多 Agent 复盘框架：
-
-```
-情绪分析师 ─┐
-板块分析师 ─┼──▶ 多空辩论 ──▶ 裁决报告
-龙头分析师 ─┘
-```
-
-```bash
-python -m review 2026-03-31                 # 直接出报告
-python -m review 2026-03-31 -i              # 交互模式（AI 出报告后等你终审）
-python -m review 2026-03-31 --model gpt-4   # 指定模型
-```
-
-### monitor/ — 新闻监控
-
-实时财经新闻聚合 + AI 解读 + 事件催化提取 + 盘前简报。
-
-**数据源**（30 秒轮询）：
-- TrendRadar DB（11 个热榜平台）
-- 财联社电报（重要级别）
-- 华尔街见闻（A 股频道）
-- 金十数据（重要标记）
-
-**Agent 能力**：
-
-| Agent | 命令 | 时机 | 功能 |
-|-------|------|------|------|
-| 新闻采集 + AI 解读 | `python monitor/news_monitor.py` | 全天 30s 轮询 | 4 源采集 → AI 逐条解读 → 保存 |
-| 事件催化提取 | `python -m monitor catalyst` | 盘后 | 从当日新闻提取次日催化事件 |
-| 盘前简报 | `python -m monitor briefing` | 09:00 前 | 汇总隔夜新闻生成交易参考 |
-
-### tools/ — 独立工具
+### tools/ — 独立脚本
 
 | 文件 | 功能 |
 |------|------|
+| `glm_launcher.sh` | 双账号并行抢单启动器 |
 | `glm_sniper.py` | 智谱 GLM Coding Plan 自动抢单 |
-| `glm_launcher.sh` | 双账号并行抢单启动器（配合 launchd） |
+| `opening_analysis.py` | 开盘分析独立脚本 |
+| `backtest_gap_up.py` | 涨停回测工具 |
+| `doctor.py` | 环境诊断工具 |
 
 ### knowledge/ — 交易知识库
 
@@ -141,25 +191,25 @@ python -m review 2026-03-31 --model gpt-4   # 指定模型
 
 ```
 盘前
-  09:00  monitor/ briefing                 → daily/YYYY-MM-DD/盘前简报.md
-  09:25  data/intraday_data.py snapshot    → intraday.db (竞价快照)
+  09:00  news_monitor/ briefing                         → daily/YYYY-MM-DD/盘前简报.md
+  09:25  data/intraday_data.py snapshot                 → intraday.db (竞价快照)
 
 盘中
-  09:26  intraday/ opening_analysis        → daily/YYYY-MM-DD/开盘分析.md
-  09:40  data/intraday_data.py snapshot    → intraday.db (早盘快照)
-  09:41  intraday/ early_session_analysis  → daily/YYYY-MM-DD/早盘机会分析.md
-  10:00  data/intraday_data.py snapshot    → intraday.db
-  11:30  data/intraday_data.py snapshot    → intraday.db
-  14:40  data/intraday_data.py snapshot    → intraday.db
+  09:26  trading_agent/intraday/ opening_analysis       → daily/YYYY-MM-DD/开盘分析.md
+  09:40  data/intraday_data.py snapshot                 → intraday.db (早盘快照)
+  09:41  trading_agent/intraday/ early_session_analysis → daily/YYYY-MM-DD/早盘机会分析.md
+  10:00  data/intraday_data.py snapshot                 → intraday.db
+  11:30  data/intraday_data.py snapshot                 → intraday.db
+  14:40  data/intraday_data.py snapshot                 → intraday.db
 
 盘后
-  15:05  data/export_daily_summary.py      → daily/YYYY-MM-DD/{行情,涨停板,跌停板}.csv
-  18:00  intraday/ closing_review          → 通知用户数据就绪
-  晚间    review/ 多Agent复盘              → daily/YYYY-MM-DD/agent_*.md
-  晚间    monitor/ catalyst                → daily/YYYY-MM-DD/事件催化.md
+  15:05  data/export_daily_summary.py                   → daily/YYYY-MM-DD/{行情,涨停板,跌停板}.csv
+  18:00  trading_agent/intraday/ closing_review         → 通知用户数据就绪
+  晚间    trading_agent/review/ 多Agent复盘              → daily/YYYY-MM-DD/agent_*.md
+  晚间    news_monitor/ catalyst                        → daily/YYYY-MM-DD/事件催化.md
 
 全天
-  30s    monitor/news_monitor.py           → daily/YYYY-MM-DD/新闻.md
+  30s    news_monitor/news_monitor.py                   → daily/YYYY-MM-DD/新闻.md
 ```
 
 ## 环境变量
