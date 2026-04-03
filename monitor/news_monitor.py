@@ -1094,6 +1094,33 @@ def classify_priority(title, interpretation=""):
     return None
 
 
+def _parse_ai_tags(interpretation):
+    """从 AI 解读文本中提取板块和个股，用于打标"""
+    import re as _re
+    plates = []
+    stocks = []
+    if not interpretation:
+        return plates, stocks
+
+    # 匹配 "板块：xxx" 模式（支持多种分隔符）
+    plate_match = _re.search(r'板块[：:]\s*(.+?)(?:\s*[|｜]|\n|$)', interpretation)
+    if plate_match:
+        plate_str = plate_match.group(1).strip()
+        if plate_str and plate_str != "无":
+            plates = [p.strip() for p in _re.split(r'[、,，\s]+', plate_str)
+                      if p.strip() and p.strip() not in ("无", "—", "-")]
+
+    # 匹配 "个股：xxx(代码)" 模式
+    stock_match = _re.search(r'个股[：:]\s*(.+?)(?:\s*[|｜]|\n|$)', interpretation)
+    if stock_match:
+        stock_str = stock_match.group(1).strip()
+        if stock_str and stock_str != "无":
+            stocks = [s.strip() for s in _re.split(r'[、,，]+', stock_str)
+                      if s.strip() and s.strip() not in ("无", "—", "-")]
+
+    return plates, stocks
+
+
 def load_aggregate_prompt():
     """加载聚合 Agent prompt"""
     prompt_path = os.path.join(os.path.dirname(__file__), "prompts", "news_aggregate.md")
@@ -1336,9 +1363,16 @@ def run_once():
         interpretation = interps.get(i, "（AI 解读暂不可用）")
         priority = classify_priority(item["title"], interpretation)
 
+        # 从 AI 解读中提取板块和个股（数据源未提供时回填，用于打标）
+        ai_plates, ai_stocks = _parse_ai_tags(interpretation)
+        if not item.get("plates") and ai_plates:
+            item["plates"] = ai_plates
+        if not item.get("stocks") and ai_stocks:
+            item["stocks"] = ai_stocks
+
         if trading and priority:
             # 交易时间 + 高优先级 → 立即推送
-            tag = {"supply_demand": "供需", "earnings": "业绩", "research": "研报", "geopolitics": "地缘"}.get(priority, "")
+            tag = {"supply_demand": "供需", "earnings": "财报", "research": "研报", "geopolitics": "地缘"}.get(priority, "")
             msg = "🔔 **[%s]** %s" % (tag, format_feishu(item, interpretation, ai_provider, priority=priority))
             if send_feishu(msg):
                 save_to_trading(today, item, interpretation)
@@ -1349,10 +1383,10 @@ def run_once():
                 print("  🔔 [%s] %s" % (tag, item["title"][:30]), flush=True)
             time.sleep(0.3)
             # 标记为已单独推送，聚合时跳过
-            _news_buffer.append({"item": item, "interpretation": interpretation, "sent_immediately": True})
+            _news_buffer.append({"item": item, "interpretation": interpretation, "priority": priority, "sent_immediately": True})
         else:
             # 暂存到聚合缓冲区
-            _news_buffer.append({"item": item, "interpretation": interpretation, "sent_immediately": False})
+            _news_buffer.append({"item": item, "interpretation": interpretation, "priority": priority, "sent_immediately": False})
             print("  📦 缓存: %s" % item["title"][:35], flush=True)
 
     # 检查是否到了聚合时间
