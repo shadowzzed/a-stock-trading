@@ -73,3 +73,25 @@ class LLMCaller(Protocol):
     def invoke(self, system_prompt: str, user_message: str) -> str:
         """调用 LLM，返回原始响应文本"""
         ...
+
+
+class StockDataProvider(Protocol):
+    """交易模拟所需的个股日线数据接口"""
+
+    def load_stock_daily(
+        self, data_dir: str, date: str, stock_name: str,
+    ) -> Optional[dict]:
+        """加载指定日期指定股票的日线行情
+
+        Returns:
+            dict with keys: code, name, open, high, low, close, pct_chg,
+                           last_close, amount, is_limit_up, broken_count
+            或 None（无数据）
+        """
+        ...
+
+    def load_limit_up_info(
+        self, data_dir: str, date: str, stock_name: str,
+    ) -> Optional[dict]:
+        """加载涨停板数据（炸板次数、封板时间等）"""
+        ...
