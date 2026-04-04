@@ -779,6 +779,7 @@ def load_stock_detail(
         return "请提供 name 或 code 参数"
 
     target_date = date or datetime.now().strftime("%Y-%m-%d")
+    date_fallback = False
     db_path = _get_db_path(data_dir)
     if not os.path.exists(db_path):
         return DataResult(
@@ -787,6 +788,7 @@ def load_stock_detail(
             data_sources_missing=["intraday_db"],
         )
 
+    conn = None
     try:
         conn = sqlite3.connect(db_path)
         conn.row_factory = sqlite3.Row
@@ -798,6 +800,19 @@ def load_stock_detail(
         )
 
     try:
+        # 先检查指定日期是否有数据，无数据且用户未显式指定日期时 fallback
+        has_date_data = conn.execute(
+            "SELECT 1 FROM snapshots WHERE date = ? LIMIT 1", (target_date,)
+        ).fetchone()
+
+        if not has_date_data and not date:
+            fallback_row = conn.execute(
+                "SELECT date FROM snapshots ORDER BY date DESC LIMIT 1"
+            ).fetchone()
+            if fallback_row:
+                target_date = fallback_row[0]
+                date_fallback = True
+
         conditions = ["date = ?"]
         params: list = [target_date]
         if code:
@@ -831,6 +846,8 @@ def load_stock_detail(
     stock_name = first["name"]
     stock_code = first["code"]
     sector = first["sector"] or ""
+    if date_fallback:
+        lines.append(f"> 注：今日为非交易日，已自动切换到最近交易日 {target_date}\n")
     header = f"## {stock_name}（{stock_code}）{f' - {sector}' if sector else ''}"
     header += f"\n日期: {target_date}，共 {len(rows)} 条快照\n"
     lines.append(header)
@@ -874,6 +891,7 @@ def load_market_snapshot(
     db_path = _get_db_path(data_dir)
     rows = []
     actual_ts = None
+    date_fallback = False
 
     if os.path.exists(db_path):
         conn = None
@@ -883,6 +901,16 @@ def load_market_snapshot(
             has_data = conn.execute(
                 "SELECT 1 FROM snapshots WHERE date = ? LIMIT 1", (ds,)
             ).fetchone()
+
+            # 用户未显式指定日期时，自动 fallback 到最近一个交易日
+            if not has_data and not date:
+                fallback_row = conn.execute(
+                    "SELECT date FROM snapshots ORDER BY date DESC LIMIT 1"
+                ).fetchone()
+                if fallback_row:
+                    ds = fallback_row[0]
+                    has_data = True
+                    date_fallback = True
 
             if has_data:
                 if time and time not in ("close", "latest"):
@@ -942,11 +970,16 @@ def load_market_snapshot(
         if v is None: return "-"
         return f"{float(v):.2f}"
 
+    fallback_note = ""
+    if date_fallback:
+        fallback_note = f"\n> 注：今日为非交易日，已自动切换到最近交易日 {ds}\n"
+
     if mode == "stock":
         n = top_n or 5
         filtered = rows[:n]
         r = filtered[0]
         lines = [
+            fallback_note,
             f"## {r.get('name','')}（{r.get('code','')}）",
             f"日期: {ds}  时间: {actual_ts}", "",
             "| 代码 | 名称 | 现价 | 涨跌幅 | 开盘 | 最高 | 最低 | 成交额(亿) |",
@@ -975,6 +1008,7 @@ def load_market_snapshot(
 
     label = "股票池" if mode == "pool" else "全市场"
     lines = [
+        fallback_note,
         f"## 行情概览（{label}）",
         f"日期: {ds}  时间: {actual_ts}  总数: {len(rows)}",
         f"涨: {up_count}  跌: {down_count}  涨停: {len(limit_ups)}  跌停: {len(limit_downs)}  总成交: {total_amount:.1f}亿",
