@@ -38,6 +38,7 @@ from .agents.bullbear import BullBearAgent
 from .agents.dragon import DragonAgent
 from .agents.sentiment import SentimentAgent
 from .agents.trend import TrendAgent
+from .coordinator import CoordinatorAgent
 
 logger = logging.getLogger(__name__)
 
@@ -97,7 +98,6 @@ def manage_context(state: TradingState) -> dict:
     # --- 摘要：消息过多时压缩旧消息 ---
     if len(messages) > SUMMARY_THRESHOLD:
         old_msgs = messages[:-KEEP_RECENT]
-        recent_msgs = messages[-KEEP_RECENT:]
 
         # 构建摘要 prompt
         old_text = "\n".join(
@@ -154,13 +154,14 @@ def dispatch(state: TradingState) -> dict:
         last = messages[-1]
         user_msg = last.content if hasattr(last, "content") else str(last)
 
-    # 构建上下文
+    # 构建上下文（排除当前消息）
     context_parts = []
     if summary:
         context_parts.append(f"[早期对话摘要] {summary}")
 
-    recent = messages[-6:] if len(messages) > 6 else messages
-    for m in recent[:-1]:  # 排除当前消息
+    history_msgs = messages[:-1]  # 排除当前消息
+    recent = history_msgs[-6:] if len(history_msgs) > 6 else history_msgs
+    for m in recent:
         role = "用户" if isinstance(m, HumanMessage) else "助手"
         content = m.content[:200] if hasattr(m, "content") else str(m)[:200]
         context_parts.append(f"{role}: {content}")
@@ -221,7 +222,9 @@ def direct_reply(state: TradingState) -> dict:
         user_msg = last.content if hasattr(last, "content") else str(last)
 
     coordinator = _get_coordinator()
-    reply = coordinator._direct_reply(user_msg)
+    # 传入 history（排除当前消息）以支持多轮上下文
+    history = messages[:-1] if len(messages) > 1 else None
+    reply = coordinator._direct_reply(user_msg, history=history)
     return {"messages": [AIMessage(content=reply)]}
 
 
@@ -256,6 +259,11 @@ def synthesize(state: TradingState) -> dict:
 
     coordinator = _get_coordinator()
     messages_for_llm: list[BaseMessage] = [SystemMessage(content=coordinator.system_prompt)]
+    # 注入近期对话历史（排除当前消息）以支持多轮上下文
+    history = messages[:-1] if len(messages) > 1 else []
+    if history:
+        # 只注入最近 6 条（3 轮），避免 token 膨胀
+        messages_for_llm.extend(history[-6:])
     messages_for_llm.append(HumanMessage(content=synthesis_prompt))
 
     try:
@@ -290,11 +298,12 @@ def route_or_fan_out(state: TradingState):
         last = messages[-1]
         user_msg = last.content if hasattr(last, "content") else str(last)
 
-    # 构建上下文
+    # 构建上下文（排除当前消息，只取历史）
     context_parts = []
     if summary:
         context_parts.append(f"[早期对话摘要] {summary}")
-    recent = messages[-6:] if len(messages) > 6 else messages[:-1]
+    history_msgs = messages[:-1]  # 排除当前消息
+    recent = history_msgs[-6:] if len(history_msgs) > 6 else history_msgs
     for m in recent:
         role = "用户" if isinstance(m, HumanMessage) else "助手"
         content = m.content[:200] if hasattr(m, "content") else str(m)[:200]

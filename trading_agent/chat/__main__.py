@@ -163,14 +163,21 @@ def run_bot() -> None:
     # Create bot
     bot = FeishuBot(app_id, app_secret)
 
+    # 每个 chat_id 对应的 thread_id（/clear 时更换）
+    _thread_ids: Dict[str, str] = {}
+
+    def _get_thread_id(chat_id: str) -> str:
+        """获取 chat_id 当前的 thread_id。"""
+        if chat_id not in _thread_ids:
+            _thread_ids[chat_id] = chat_id
+        return _thread_ids[chat_id]
+
     # Message handler
     def on_message(chat_id: str, user_id: str, text: str) -> None:
-        # /clear: 重置对话上下文（使用新 thread_id）
+        # /clear: 重置对话上下文（更换 thread_id，旧 checkpoint 保留但不加载）
         if text.strip() == "/clear":
-            # LangGraph checkpoint 按 thread_id 隔离，
-            # 换一个新的 thread_id 即可重置上下文
-            new_thread = f"{chat_id}-reset-{id(text)}"
-            # 注意：这里只是清空当前会话，下次消息会用新的 thread
+            import time
+            _thread_ids[chat_id] = f"{chat_id}-reset-{int(time.time())}"
             bot.send_text(chat_id, "上下文已重置")
             return
 
@@ -181,7 +188,8 @@ def run_bot() -> None:
         logger.info("收到消息 [%s]: %s", chat_id, text[:80])
 
         try:
-            config = _chat_id_to_thread(chat_id)
+            thread_id = _get_thread_id(chat_id)
+            config = _chat_id_to_thread(thread_id)
             result = graph.invoke(
                 {"messages": [HumanMessage(content=text)]},
                 config=config,
