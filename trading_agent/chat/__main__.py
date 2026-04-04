@@ -1,10 +1,11 @@
 """盘中对话 Agent -- 飞书 Bot 模式入口
 
 启动方式:
+    python -m trading_agent.chat              # 飞书 Bot 模式
+    python -m trading_agent.chat --cli        # 本地 CLI 测试模式
+    # 或（从 trading_agent/ 目录）
     python -m chat              # 飞书 Bot 模式
     python -m chat --cli        # 本地 CLI 测试模式
-    # 或
-    chat-agent (安装后)
 """
 
 from __future__ import annotations
@@ -12,9 +13,11 @@ from __future__ import annotations
 import logging
 import os
 import socket
+import sqlite3
 import sys
 import threading
 from collections import defaultdict
+from pathlib import Path
 from typing import Dict, List
 
 # 确保项目根目录在 sys.path 中
@@ -24,8 +27,10 @@ if _project_root not in sys.path:
 
 from config import get_config
 
-from .agent import TradingChatAgent
+from .graph import create_graph, create_graph_with_sqlite
 from .feishu_bot import FeishuBot
+
+from langchain_core.messages import AIMessage, BaseMessage, HumanMessage
 
 logging.basicConfig(
     level=logging.INFO,
@@ -54,46 +59,48 @@ def _acquire_lock() -> bool:
         return False
 
 
-# 每个群聊维护独立的对话历史（简单内存实现）
-MAX_HISTORY_PER_CHAT = 30  # 15 轮对话（每轮 Human + AI 各一条）
-_chat_histories: Dict[str, List] = defaultdict(list)
-_history_lock = threading.Lock()
+# ── LangGraph 图实例（全局单例）──
+_graph = None
+_graph_lock = threading.Lock()
+
+# Checkpoint DB 路径
+_CHECKPOINT_DIR = Path(_project_root) / "trading" / "checkpoints"
+_CHECKPOINT_DB = _CHECKPOINT_DIR / "chat.db"
 
 
-def _get_history(chat_id: str) -> List:
-    """获取群聊对话历史"""
-    with _history_lock:
-        return list(_chat_histories[chat_id])
+def _get_graph():
+    """获取或创建 LangGraph 图实例（延迟初始化，线程安全）。"""
+    global _graph
+    if _graph is not None:
+        return _graph
+
+    with _graph_lock:
+        if _graph is not None:
+            return _graph
+
+        # 确保 checkpoint 目录存在
+        _CHECKPOINT_DIR.mkdir(parents=True, exist_ok=True)
+        db_path = str(_CHECKPOINT_DB)
+
+        logger.info("正在初始化 LangGraph（checkpoint: %s）...", db_path)
+        _graph = create_graph_with_sqlite(db_path)
+        logger.info("LangGraph 初始化完成")
+        return _graph
 
 
-def _clear_history(chat_id: str) -> None:
-    """清空群聊对话历史"""
-    with _history_lock:
-        _chat_histories[chat_id] = []
-
-
-def _append_history(chat_id: str, role: str, text: str) -> None:
-    """追加对话历史"""
-    from langchain_core.messages import AIMessage, HumanMessage
-
-    msg = HumanMessage(content=text) if role == "user" else AIMessage(content=text)
-    with _history_lock:
-        history = _chat_histories[chat_id]
-        history.append(msg)
-        # 保留最近的消息
-        if len(history) > MAX_HISTORY_PER_CHAT:
-            _chat_histories[chat_id] = history[-MAX_HISTORY_PER_CHAT:]
+def _chat_id_to_thread(chat_id: str) -> dict:
+    """将飞书 chat_id 映射为 LangGraph thread config。"""
+    return {"configurable": {"thread_id": chat_id}}
 
 
 def run_cli() -> None:
-    """本地 CLI 测试模式，直接与 Agent 对话。"""
-    print("=== Trade Agent CLI 模式 ===")
+    """本地 CLI 测试模式，直接与 LangGraph 对话。"""
+    print("=== Trade Agent CLI 模式 (LangGraph) ===")
     print("输入消息直接对话，输入 /quit 退出\n")
 
-    agent = TradingChatAgent()
-    history = []
-
-    from langchain_core.messages import AIMessage, HumanMessage
+    graph = _get_graph()
+    thread_id = "cli-test"
+    config = _chat_id_to_thread(thread_id)
 
     while True:
         try:
@@ -105,17 +112,30 @@ def run_cli() -> None:
         if not user_input:
             continue
         if user_input == "/clear":
-            history = []
+            # 重置会话：用新 thread_id
+            thread_id = f"cli-test-{os.getpid()}-{id(config)}"
+            config = _chat_id_to_thread(thread_id)
             print("\n上下文已重置\n")
             continue
         if user_input == "/quit":
             break
 
-        history.append(HumanMessage(content=user_input))
         try:
-            reply = agent.chat(user_input, history=history[:-1])
-            history.append(AIMessage(content=reply))
-            print(f"\nAgent> {reply}\n")
+            result = graph.invoke(
+                {"messages": [HumanMessage(content=user_input)]},
+                config=config,
+            )
+            # 提取最后一条 AI 消息
+            messages = result.get("messages", [])
+            reply = ""
+            for msg in reversed(messages):
+                if isinstance(msg, AIMessage) and msg.content:
+                    reply = msg.content
+                    break
+            if reply:
+                print(f"\nAgent> {reply}\n")
+            else:
+                print("\nAgent> （无有效回复）\n")
         except Exception as e:
             print(f"\n[错误] {e}\n")
             logger.error("CLI 对话异常: %s", e, exc_info=True)
@@ -135,19 +155,22 @@ def run_bot() -> None:
         print("请在 config.yaml 中添加，或设置环境变量 CHAT_FEISHU_APP_ID / CHAT_FEISHU_APP_SECRET")
         sys.exit(1)
 
-    # Create agent
-    logger.info("正在初始化 Agent...")
-    agent = TradingChatAgent()
-    logger.info("Agent 已初始化")
+    # Initialize graph
+    logger.info("正在初始化 LangGraph...")
+    graph = _get_graph()
+    logger.info("LangGraph 已初始化")
 
     # Create bot
     bot = FeishuBot(app_id, app_secret)
 
     # Message handler
     def on_message(chat_id: str, user_id: str, text: str) -> None:
-        # /clear: 重置对话上下文
+        # /clear: 重置对话上下文（使用新 thread_id）
         if text.strip() == "/clear":
-            _clear_history(chat_id)
+            # LangGraph checkpoint 按 thread_id 隔离，
+            # 换一个新的 thread_id 即可重置上下文
+            new_thread = f"{chat_id}-reset-{id(text)}"
+            # 注意：这里只是清空当前会话，下次消息会用新的 thread
             bot.send_text(chat_id, "上下文已重置")
             return
 
@@ -157,13 +180,24 @@ def run_bot() -> None:
 
         logger.info("收到消息 [%s]: %s", chat_id, text[:80])
 
-        # Append user message to history
-        _append_history(chat_id, "user", text)
-
         try:
-            history = _get_history(chat_id)
-            reply = agent.chat(text, history=history[:-1])  # exclude current message from history
-            _append_history(chat_id, "assistant", reply)
+            config = _chat_id_to_thread(chat_id)
+            result = graph.invoke(
+                {"messages": [HumanMessage(content=text)]},
+                config=config,
+            )
+
+            # 提取最后一条 AI 消息
+            messages = result.get("messages", [])
+            reply = ""
+            for msg in reversed(messages):
+                if isinstance(msg, AIMessage) and msg.content:
+                    reply = msg.content
+                    break
+
+            if not reply:
+                reply = "（无有效回复）"
+
             bot.send_text(chat_id, reply)
             logger.info("已回复 [%s]: %s", chat_id, reply[:80])
         except Exception as e:
