@@ -55,7 +55,7 @@ def _acquire_lock() -> bool:
 
 
 # 每个群聊维护独立的对话历史（简单内存实现）
-MAX_HISTORY_PER_CHAT = 20
+MAX_HISTORY_PER_CHAT = 30  # 15 轮对话（每轮 Human + AI 各一条）
 _chat_histories: Dict[str, List] = defaultdict(list)
 _history_lock = threading.Lock()
 
@@ -64,6 +64,12 @@ def _get_history(chat_id: str) -> List:
     """获取群聊对话历史"""
     with _history_lock:
         return list(_chat_histories[chat_id])
+
+
+def _clear_history(chat_id: str) -> None:
+    """清空群聊对话历史"""
+    with _history_lock:
+        _chat_histories[chat_id] = []
 
 
 def _append_history(chat_id: str, role: str, text: str) -> None:
@@ -97,6 +103,10 @@ def run_cli() -> None:
             break
 
         if not user_input:
+            continue
+        if user_input == "/clear":
+            history = []
+            print("\n上下文已重置\n")
             continue
         if user_input == "/quit":
             break
@@ -135,6 +145,12 @@ def run_bot() -> None:
 
     # Message handler
     def on_message(chat_id: str, user_id: str, text: str) -> None:
+        # /clear: 重置对话上下文
+        if text.strip() == "/clear":
+            _clear_history(chat_id)
+            bot.send_text(chat_id, "上下文已重置")
+            return
+
         # Skip empty messages
         if not text.strip():
             return
