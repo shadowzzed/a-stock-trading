@@ -48,6 +48,37 @@ _DISPATCH_PROMPT = """根据用户消息，判断需要调用哪些分析师。
 请只输出一个 JSON 数组，不要其他内容。例如：["dragon", "sentiment"]
 如果不需要分发，输出空数组：[]"""
 
+# 带上下文的意图识别提示词
+_DISPATCH_PROMPT_WITH_CTX = """根据用户消息和最近的对话历史，判断需要调用哪些分析师。
+
+注意：用户的当前消息可能包含指代（如"它的"、"核心辨识度"等），需要结合历史上下文理解完整意图。
+
+可选分析师：
+- dragon: 龙头分析师（龙头辨识、连板梯队、破局龙、节点股）
+- sentiment: 情绪分析师（情绪周期、涨跌停统计、赚钱效应）
+- bullbear: 多空分析师（主线判断、板块轮动、资金流向、策略）
+- trend: 趋势分析师（均线系统、量价背离、支撑压力位、技术面、趋势股扫描）
+
+规则：
+- 简单数据查询（"XX多少钱"、"涨停几家"）→ 空列表 []
+- 龙头/连板/涨停梯队 → ["dragon"]
+- 情绪/周期/赚钱效应 → ["sentiment"]
+- 主线/轮动/策略 → ["bullbear"]
+- 趋势/均线/技术面 → ["trend"]
+- 找趋势股/均线上的股票/趋势扫描/沿均线运行 → ["trend"]
+- 综合行情/整体分析 → ["dragon", "sentiment", "bullbear", "trend"]
+- 个股分析（能不能买） → ["dragon", "bullbear", "trend"]
+- 情绪+策略 → ["sentiment", "bullbear"]
+- 板块分析 → ["bullbear", "trend"]
+
+最近的对话历史：
+{context}
+
+用户当前消息：{message}
+
+请只输出一个 JSON 数组，不要其他内容。例如：["dragon", "sentiment"]
+如果不需要分发，输出空数组：[]"""
+
 
 class CoordinatorAgent(BaseAgent):
     """协调器 Agent：意图识别 → 分发 → 综合。"""
@@ -75,9 +106,23 @@ class CoordinatorAgent(BaseAgent):
             "trend": self.trend,
         }
 
-    def _dispatch(self, user_message: str) -> List[str]:
-        """意图识别：判断需要调用哪些分析师。"""
-        prompt = _DISPATCH_PROMPT.format(message=user_message)
+    def _dispatch(
+        self, user_message: str, history: Optional[List[BaseMessage]] = None
+    ) -> List[str]:
+        """意图识别：判断需要调用哪些分析师。结合历史上下文理解指代。"""
+        # 构建包含历史的 prompt，让意图识别能理解上下文指代
+        context_lines = []
+        if history:
+            for msg in history[-6:]:  # 最近 3 轮（每轮 Human + AI）
+                role = "用户" if isinstance(msg, HumanMessage) else "助手"
+                context_lines.append(f"{role}: {msg.content}")
+            context_block = "\n".join(context_lines)
+            prompt = _DISPATCH_PROMPT_WITH_CTX.format(
+                context=context_block, message=user_message
+            )
+        else:
+            prompt = _DISPATCH_PROMPT.format(message=user_message)
+
         messages = [HumanMessage(content=prompt)]
 
         try:
@@ -98,7 +143,10 @@ class CoordinatorAgent(BaseAgent):
         return list(self._agent_map.keys())
 
     def _collect_analyses(
-        self, user_message: str, agent_names: List[str]
+        self,
+        user_message: str,
+        agent_names: List[str],
+        history: Optional[List[BaseMessage]] = None,
     ) -> Dict[str, str]:
         """并行调用 Sub-Agents 并收集结果。"""
         results: Dict[str, str] = {}
@@ -106,11 +154,25 @@ class CoordinatorAgent(BaseAgent):
         if not agent_names:
             return results
 
+        # 构建带上下文的完整问题
+        if history:
+            context_lines = []
+            for msg in history[-4:]:  # 最近 2 轮
+                role = "用户" if isinstance(msg, HumanMessage) else "助手"
+                context_lines.append(f"{role}: {msg.content}")
+            context_block = "\n".join(context_lines)
+            enriched_message = (
+                f"[对话上下文]\n{context_block}\n\n"
+                f"[用户当前问题]\n{user_message}"
+            )
+        else:
+            enriched_message = user_message
+
         with ThreadPoolExecutor(max_workers=len(agent_names)) as executor:
             futures = {}
             for name in agent_names:
                 agent = self._agent_map[name]
-                future = executor.submit(agent.analyze, user_message)
+                future = executor.submit(agent.analyze, enriched_message)
                 futures[future] = name
 
             for future in as_completed(futures):
@@ -134,16 +196,16 @@ class CoordinatorAgent(BaseAgent):
         history: Optional[List[BaseMessage]] = None,
     ) -> str:
         """主入口：意图识别 → 分发 → 综合。"""
-        # 1. 意图识别
-        agent_names = self._dispatch(user_message)
+        # 1. 意图识别（带历史上下文）
+        agent_names = self._dispatch(user_message, history=history)
         logger.info("意图识别结果: %s → %s", user_message[:50], agent_names)
 
         # 2. 简单查询：不分发，直接用工具回复
         if not agent_names:
             return self._direct_reply(user_message, history)
 
-        # 3. 复杂分析：分发到 Sub-Agents
-        analyses = self._collect_analyses(user_message, agent_names)
+        # 3. 复杂分析：分发到 Sub-Agents（带历史上下文）
+        analyses = self._collect_analyses(user_message, agent_names, history=history)
 
         # 4. 综合回复
         return self._synthesize(user_message, analyses, history)
