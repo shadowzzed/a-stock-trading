@@ -220,7 +220,11 @@ class BacktestEngine:
             if on_progress:
                 on_progress(idx + 1, len(pairs), day_d, "verifying")
 
-            recs = self._verify_recommendations(data_dir, day_d1, report)
+            try:
+                recs = self._verify_recommendations(data_dir, day_d1, report)
+            except Exception as e:
+                print(f"  [验证错误] {e}")
+                recs = []
             result.recommendations = recs
 
             if recs:
@@ -369,7 +373,7 @@ class BacktestEngine:
                 data = json.loads(json_match.group(1))
                 stocks = data.get("focus_stocks", [])
                 if stocks:
-                    return [s for s in stocks if s.get("name") and len(s["name"]) >= 2]
+                    return [s for s in stocks if isinstance(s, dict) and s.get("name") and len(s["name"]) >= 2]
             except json.JSONDecodeError:
                 pass
 
