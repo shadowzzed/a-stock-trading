@@ -107,9 +107,14 @@ class TradeSimulator:
         for pos in sellable:
             stock_data = None
             if self.data_loader:
-                stock_data = self.data_loader.load_stock_daily(
-                    data_dir, sell_date, pos.stock_name
-                )
+                if pos.stock_code:
+                    stock_data = self.data_loader.load_stock_daily_by_code(
+                        data_dir, sell_date, pos.stock_code
+                    )
+                if not stock_data:
+                    stock_data = self.data_loader.load_stock_daily(
+                        data_dir, sell_date, pos.stock_name
+                    )
 
             if not stock_data:
                 # 无卖出日数据，用买入价平账（不亏不赚）
@@ -160,12 +165,17 @@ class TradeSimulator:
 
     def _try_buy(self, signal: TradeSignal, data_dir: str) -> Optional[TradeRecord]:
         """尝试买入一只标的"""
-        # 加载 D+1 行情
+        # 加载 D+1 行情：优先用代码查询，fallback 到名称
         stock_data = None
         if self.data_loader:
-            stock_data = self.data_loader.load_stock_daily(
-                data_dir, signal.target_date, signal.stock_name
-            )
+            if signal.stock_code:
+                stock_data = self.data_loader.load_stock_daily_by_code(
+                    data_dir, signal.target_date, signal.stock_code
+                )
+            if not stock_data:
+                stock_data = self.data_loader.load_stock_daily(
+                    data_dir, signal.target_date, signal.stock_name
+                )
 
         if not stock_data:
             return TradeRecord(

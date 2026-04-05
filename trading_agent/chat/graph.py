@@ -394,23 +394,43 @@ def _ensure_initialized():
         raise ValueError("未配置 AI 提供商")
 
     primary = providers[0]
-    _llm = ChatOpenAI(
-        model=primary["model"],
-        base_url=primary["base"],
-        api_key=primary["key"],
-        temperature=0.3,
-    )
+
+    # 根据 protocol 选择 LLM 类
+    if primary.get("protocol") == "anthropic":
+        from langchain_anthropic import ChatAnthropic
+        _llm = ChatAnthropic(
+            model=primary["model"],
+            anthropic_api_url=primary["base"],
+            anthropic_api_key=primary["key"],
+            temperature=0.3,
+        )
+    else:
+        _llm = ChatOpenAI(
+            model=primary["model"],
+            base_url=primary["base"],
+            api_key=primary["key"],
+            temperature=0.3,
+        )
+
     if len(providers) > 1:
-        fallbacks = [
-            ChatOpenAI(
-                model=p["model"],
-                base_url=p["base"],
-                api_key=p["key"],
-                temperature=0.3,
-            )
-            for p in providers[1:]
-        ]
-        _llm = _llm.with_fallbacks(fallbacks)
+        fb_list = []
+        for p in providers[1:]:
+            if p.get("protocol") == "anthropic":
+                from langchain_anthropic import ChatAnthropic
+                fb_list.append(ChatAnthropic(
+                    model=p["model"],
+                    anthropic_api_url=p["base"],
+                    anthropic_api_key=p["key"],
+                    temperature=0.3,
+                ))
+            else:
+                fb_list.append(ChatOpenAI(
+                    model=p["model"],
+                    base_url=p["base"],
+                    api_key=p["key"],
+                    temperature=0.3,
+                ))
+        _llm = _llm.with_fallbacks(fb_list)
 
     # 初始化各 Agent（共享 cache）
     _coordinator.llm = _llm

@@ -1,24 +1,43 @@
-"""回测引擎核心 — 经验驱动的 D→D+1 回测
+"""回测引擎核心 — 收益率驱动的 D→D+1 回测
 
-通过依赖注入接收 DataProvider / AgentRunner / LLMCaller 实现，
+通过依赖注入接收 DataProvider / AgentRunner 实现，
 引擎本身零耦合于具体数据源和 Agent 框架。
+
+验证方式：不使用 LLM 打分，而是基于 Agent 推荐标的的实际涨跌幅计算收益。
 """
 
 from __future__ import annotations
 
 import json
 import os
+import re
 import time
 from dataclasses import dataclass, field
 from typing import Optional
 
-from .protocols import DataProvider, AgentRunner, LLMCaller, MarketData
-from .prompts import VERIFIER_PROMPT, EXPERIENCE_EXTRACTOR_PROMPT
+from .protocols import DataProvider, AgentRunner, MarketData
 from .report import generate_summary
 from ..experience.store import ExperienceStore, Experience
-from ..experience.classifier import ScenarioClassifier, classify_error_type
-from ..experience.tracker import LessonTracker
+from ..experience.classifier import ScenarioClassifier
 from ..experience.prompt_engine import PromptEngine
+
+
+@dataclass
+class Recommendation:
+    """单只推荐标的的实际表现"""
+    stock: str
+    action: str              # 买入/卖出/观望
+    buy_condition: str       # 买入条件
+    position: str            # 仓位建议
+    # D+1 实际表现
+    next_open: float = 0.0
+    next_close: float = 0.0
+    next_high: float = 0.0
+    next_low: float = 0.0
+    next_pct_chg: float = 0.0
+    is_limit_up: bool = False
+    is_limit_down: bool = False
+    pnl_pct: float = 0.0     # 按开盘买入计算的收益率
 
 
 @dataclass
@@ -29,22 +48,21 @@ class BacktestResult:
     status: str = "pending"           # completed / analysis_failed / d1_data_failed
     scenario: dict = field(default_factory=dict)
     injected_lessons: int = 0
-    scores: dict = field(default_factory=dict)
-    total_score: float = 0.0
+    # 收益率验证（替代评分）
+    recommendations: list = field(default_factory=list)   # list[Recommendation]
+    avg_pnl_pct: float = 0.0
+    hit_rate: float = 0.0            # 推荐标的中上涨的比例
     key_lessons: list = field(default_factory=list)
-    what_was_right: list = field(default_factory=list)
-    what_was_wrong: list = field(default_factory=list)
     error: str = ""
 
 
 class BacktestEngine:
-    """经验驱动的回测引擎
+    """收益率驱动的回测引擎
 
     使用方式:
         engine = BacktestEngine(
             data_provider=ReviewDataProvider(),
-            agent_runner=ReviewAgentRunner(),
-            llm_caller=LangChainLLMCaller(llm),
+            agent_runner=ChatAgentRunner(),
         )
         summary = engine.run(data_dir="...", dates=[...])
     """
@@ -53,11 +71,9 @@ class BacktestEngine:
         self,
         data_provider: DataProvider,
         agent_runner: AgentRunner,
-        llm_caller: LLMCaller,
     ):
         self.data_provider = data_provider
         self.agent_runner = agent_runner
-        self.llm_caller = llm_caller
 
     def run(
         self,
@@ -66,7 +82,7 @@ class BacktestEngine:
         output_dir: Optional[str] = None,
         on_progress=None,
     ) -> dict:
-        """运行经验驱动的回测
+        """运行收益率驱动的回测
 
         Args:
             data_dir: 数据根目录
@@ -80,7 +96,6 @@ class BacktestEngine:
 
         # 初始化经验系统
         exp_store = ExperienceStore(data_dir)
-        lesson_tracker = LessonTracker(data_dir)
         prompt_engine = PromptEngine(data_dir)
         classifier = ScenarioClassifier()
 
@@ -93,7 +108,7 @@ class BacktestEngine:
                 on_progress(idx + 1, len(pairs), day_d, "analyzing")
 
             print("=" * 60)
-            print("回测 {}/{}: {} → {} [v6 经验驱动]".format(
+            print("回测 {}/{}: {} → {} [v6 收益率驱动]".format(
                 idx + 1, len(pairs), day_d, day_d1))
             print("=" * 60)
 
@@ -146,12 +161,10 @@ class BacktestEngine:
                     overrides[agent] = inject_text
                 run_config["prompt_overrides"] = overrides
 
-                # 检索注入了哪些教训 ID
                 relevant = exp_store.search(
                     scenario=scenario, min_confidence=0.3, limit=10,
                 )
-                active_ids = set(lesson_tracker.get_active_lessons()) or {e.id for e in relevant}
-                injected_ids = [e.id for e in relevant if e.id in active_ids][:9]
+                injected_ids = [e.id for e in relevant][:9]
 
                 print("  [教训注入] {} 条，涉及 {}".format(
                     sum(len(v) for v in injection.values()),
@@ -203,265 +216,273 @@ class BacktestEngine:
                 results.append(result)
                 continue
 
-            # ── Step 4: 验证打分 ──
+            # ── Step 4: 收益率验证（数据驱动，无 LLM）──
             if on_progress:
                 on_progress(idx + 1, len(pairs), day_d, "verifying")
 
-            verify_path = os.path.join(output_dir, "{}_verify.json".format(day_d))
-            if os.path.exists(verify_path):
-                with open(verify_path, "r", encoding="utf-8") as f:
-                    verify_result = json.load(f)
-                print("  [跳过] {} 验证已存在".format(day_d))
-            else:
-                verify_msg = (
-                    "## Day D ({day_d}) 的 Agent 预测报告\n\n"
-                    "{report}\n\n"
-                    "---\n\n"
-                    "## Day D+1 ({day_d1}) 的实际行情数据\n\n"
-                    "{d1_summary}\n\n"
-                    "请对比预测与实际，给出评分和教训。"
-                ).format(day_d=day_d, day_d1=day_d1, report=report, d1_summary=d1_summary)
+            recs = self._verify_recommendations(data_dir, day_d1, report)
+            result.recommendations = recs
 
-                try:
-                    raw = self.llm_caller.invoke(VERIFIER_PROMPT, verify_msg)
-                    content = raw
-                    if "```json" in content:
-                        content = content.split("```json")[1].split("```")[0]
-                    elif "```" in content:
-                        content = content.split("```")[1].split("```")[0]
-
-                    verify_result = json.loads(content.strip())
-                    with open(verify_path, "w", encoding="utf-8") as f:
-                        json.dump(verify_result, f, ensure_ascii=False, indent=2)
-                    print("  [完成] {} 验证: 总分 {}/20".format(
-                        day_d, verify_result.get("total_score", "?")))
-                except Exception as e:
-                    print("  [失败] {} 验证失败: {}".format(day_d, e))
-                    verify_result = {"error": str(e)}
-
-            total_score = verify_result.get("total_score", 0)
-            result.total_score = total_score
-            result.scores = verify_result.get("scores", {})
-            result.key_lessons = verify_result.get("key_lessons", [])
-            result.what_was_right = verify_result.get("what_was_right", [])
-            result.what_was_wrong = verify_result.get("what_was_wrong", [])
-
-            # ── Step 4.5: 后置校验 — 磁核事实声明与 DB 对比 ──
-            corrections = self._post_verify_check(
-                data_dir, day_d1, verify_result, report,
-            )
-            if corrections:
-                # 按涉及维度去重（同一股票多次出现只扣一次）
-                affected_dims = set()
-                print("  [校验] 发现 {} 处事实修正:".format(len(corrections)))
-                for c in corrections:
-                    print("    - {}: {} → {}".format(c["stock"], c["claimed"], c["actual"]))
-                    # 修正分数中涉及该股票的错误判断
-                    for dim in ["sentiment", "sector", "leader", "strategy"]:
-                        dim_score = result.scores.get(dim, {})
-                        reason = dim_score.get("reason", "")
-                        if c["stock"] in reason:
-                            dim_score["reason"] = reason.replace(
-                                c["claimed"], c["actual"]
-                            )
-                            affected_dims.add(dim)
-
-                # 事实错误扣分：每个受影响维度扣 1 分
-                for dim in affected_dims:
-                    dim_info = result.scores.get(dim, {})
-                    old_score = dim_info.get("score", 0)
-                    new_score = max(1, old_score - 1)
-                    dim_info["score"] = new_score
-                    dim_info["reason"] = (
-                        "[事实修正: {}→{}] ".format(
-                            c["claimed"], c["actual"]
-                        ) + dim_info.get("reason", "")
+            if recs:
+                pnl_list = [r.pnl_pct for r in recs if r.action == "买入"]
+                if pnl_list:
+                    result.avg_pnl_pct = round(sum(pnl_list) / len(pnl_list), 2)
+                    result.hit_rate = round(
+                        sum(1 for p in pnl_list if p > 0) / len(pnl_list) * 100, 1
                     )
-                    print("    - 扣分: {} 维度 {} → {}".format(
-                        dim, old_score, new_score))
+                print("  [验证] {} 只推荐标的, 平均收益 {:+.2f}%, 命中率 {:.0f}%".format(
+                    len(recs), result.avg_pnl_pct, result.hit_rate))
+            else:
+                print("  [验证] 未发现推荐标的")
 
-                # 重新计算总分
-                total_score = sum(
-                    result.scores.get(d, {}).get("score", 0)
-                    for d in ["sentiment", "sector", "leader", "strategy"]
-                )
-                result.total_score = total_score
-                verify_result["total_score"] = total_score
-                # 更新保存的验证结果
-                verify_path = os.path.join(output_dir, "{}_verify.json".format(day_d))
-                with open(verify_path, "w", encoding="utf-8") as f:
-                    json.dump(verify_result, f, ensure_ascii=False, indent=2)
-                print("  [校验] 修正后总分: {}/20".format(total_score))
+            # 保存验证结果
+            verify_path = os.path.join(output_dir, "{}_verify.json".format(day_d))
+            verify_data = {
+                "day_d": day_d,
+                "day_d1": day_d1,
+                "recommendations": [
+                    {
+                        "stock": r.stock,
+                        "action": r.action,
+                        "buy_condition": r.buy_condition,
+                        "position": r.position,
+                        "next_pct_chg": r.next_pct_chg,
+                        "pnl_pct": r.pnl_pct,
+                        "is_limit_up": r.is_limit_up,
+                        "is_limit_down": r.is_limit_down,
+                    }
+                    for r in recs
+                ],
+                "avg_pnl_pct": result.avg_pnl_pct,
+                "hit_rate": result.hit_rate,
+            }
+            with open(verify_path, "w", encoding="utf-8") as f:
+                json.dump(verify_data, f, ensure_ascii=False, indent=2)
 
-            # ── Step 5: 提取结构化经验 ──
+            # ── Step 5: 基于实盘结果提取经验 ──
             if on_progress:
                 on_progress(idx + 1, len(pairs), day_d, "extracting_experience")
 
             extract_path = os.path.join(output_dir, "{}_experience.json".format(day_d))
-            if not os.path.exists(extract_path) and "error" not in verify_result:
-                try:
-                    experience = self._extract_experience(
-                        day_d=day_d, day_d1=day_d1,
-                        report=report, verify_result=verify_result,
-                        scenario=scenario,
-                    )
-                    if experience:
-                        exp_store.add(experience)
-                        with open(extract_path, "w", encoding="utf-8") as f:
-                            json.dump({
-                                "experience_id": experience.id,
-                                "scenario": experience.scenario,
-                                "lesson": experience.lesson,
-                                "correction_rule": experience.correction_rule,
-                                "error_type": experience.error_type,
-                            }, f, ensure_ascii=False, indent=2)
-                        print("  [经验提取] 新增教训: {}".format(
-                            experience.lesson[:50]))
-                except Exception as e:
-                    print("  [经验提取失败] {}".format(e))
+            if not os.path.exists(extract_path) and recs:
+                # 只在亏损或误判时提取教训
+                losses = [r for r in recs if r.action == "买入" and r.pnl_pct < -2]
+                wrong_calls = [r for r in recs if r.action == "买入" and r.next_pct_chg < -5]
 
-            # ── Step 6: 记录教训效果 ──
-            if injected_ids:
-                lesson_tracker.record_injection(
-                    date=day_d, lesson_ids=injected_ids, score=total_score,
-                )
-                lesson_tracker.feedback_to_store(exp_store)
+                if losses or wrong_calls:
+                    try:
+                        experience = self._extract_experience_from_outcome(
+                            day_d=day_d, day_d1=day_d1,
+                            report=report, recs=recs,
+                            scenario=scenario,
+                        )
+                        if experience:
+                            exp_store.add(experience)
+                            with open(extract_path, "w", encoding="utf-8") as f:
+                                json.dump({
+                                    "experience_id": experience.id,
+                                    "scenario": experience.scenario,
+                                    "lesson": experience.lesson,
+                                    "correction_rule": experience.correction_rule,
+                                    "error_type": experience.error_type,
+                                }, f, ensure_ascii=False, indent=2)
+                            print("  [经验提取] 新增教训: {}".format(
+                                experience.lesson[:50]))
+                    except Exception as e:
+                        print("  [经验提取失败] {}".format(e))
 
             result.status = "completed"
             results.append(result)
             time.sleep(1)
 
         # ── 生成汇总报告 ──
-        summary = generate_summary(
-            results, output_dir, exp_store, lesson_tracker,
-        )
+        summary = generate_summary(results, output_dir, exp_store)
         return summary
 
-    def _post_verify_check(
+    def _verify_recommendations(
         self,
         data_dir: str,
         day_d1: str,
-        verify_result: dict,
         report: str,
-    ) -> list[dict]:
-        """后置校验：对比验证 LLM 的事实声明与 intraday DB 实际数据
+    ) -> list[Recommendation]:
+        """从报告中提取推荐标的，验证 D+1 实际表现（纯数据驱动）"""
+        from ..adapter import CSVStockDataProvider
 
-        扫描 verify_result 中的 reason 文本，检测对具体股票的涨跌判断，
-        与 DB 中的实际行情对比，发现矛盾则返回修正列表。
-        """
-        import re as re_mod
-        import sqlite3 as sqlite3_mod
+        stock_provider = CSVStockDataProvider()
+        recs = []
 
-        db_path = os.path.join(data_dir, "intraday", "intraday.db")
-        if not os.path.exists(db_path):
-            return []
+        # 从报告 JSON 前置块提取 focus_stocks
+        stocks_info = self._extract_focus_stocks(report)
 
-        # 收集所有 reason 中提到的股票名 + 判断
-        all_reasons = ""
-        scores = verify_result.get("scores", {})
-        for dim_scores in scores.values():
-            if isinstance(dim_scores, dict):
-                all_reasons += dim_scores.get("reason", "") + " "
+        # 从"买入计划"章节提取更详细的操作信息
+        buy_plans = self._extract_buy_plans(report)
 
-        # 提取 "XXX跌停" 或 "XXX涨停" 的声明
-        corrections = []
-        for m in re_mod.finditer(r"([\u4e00-\u9fa5]{2,4})(涨停|跌停)", all_reasons):
-            stock_name = m.group(1)
-            claim = m.group(2)  # "涨停" or "跌停"
-
-            # 查询 DB
-            try:
-                conn = sqlite3_mod.connect(f"file:{db_path}?mode=ro")
-                cursor = conn.cursor()
-                cursor.execute("""
-                    SELECT is_limit_up, is_limit_down, pctChg
-                    FROM snapshots
-                    WHERE date = ? AND name = ?
-                    AND ts = (SELECT MAX(ts) FROM snapshots WHERE date = ?)
-                    LIMIT 1
-                """, (day_d1, stock_name, day_d1))
-                row = cursor.fetchone()
-                conn.close()
-
-                if row:
-                    is_up, is_down, pct = row[0], row[1], row[2]
-                    # 检查矛盾
-                    if claim == "跌停" and is_up:
-                        corrections.append({
-                            "stock": stock_name,
-                            "claimed": "跌停",
-                            "actual": "涨停（{:+.2f}%）".format(pct),
-                        })
-                    elif claim == "涨停" and is_down:
-                        corrections.append({
-                            "stock": stock_name,
-                            "claimed": "涨停",
-                            "actual": "跌停（{:+.2f}%）".format(pct),
-                        })
-            except Exception:
+        for info in stocks_info:
+            stock_name = info.get("name", "")
+            if not stock_name or len(stock_name) < 2:
                 continue
 
-        return corrections
+            plan = buy_plans.get(stock_name, {})
 
-    def _extract_experience(
+            # 加载 D+1 实际行情
+            daily = stock_provider.load_stock_daily(data_dir, day_d1, stock_name)
+            if not daily or daily.get("open", 0) <= 0:
+                recs.append(Recommendation(
+                    stock=stock_name,
+                    action=plan.get("action", "买入"),
+                    buy_condition=plan.get("condition", ""),
+                    position=plan.get("position", ""),
+                ))
+                continue
+
+            open_price = daily["open"]
+            close_price = daily.get("close", open_price)
+            pct_chg = daily.get("pct_chg", 0)
+            is_up = daily.get("is_limit_up", False)
+            is_down = daily.get("is_limit_down", False)
+
+            # 按开盘买入计算收益率（回测默认 D+1 开盘执行）
+            pnl_pct = round((close_price - open_price) / open_price * 100, 2) if open_price > 0 else 0
+
+            recs.append(Recommendation(
+                stock=stock_name,
+                action=plan.get("action", "买入"),
+                buy_condition=plan.get("condition", ""),
+                position=plan.get("position", ""),
+                next_open=open_price,
+                next_close=close_price,
+                next_high=daily.get("high", close_price),
+                next_low=daily.get("low", close_price),
+                next_pct_chg=round(pct_chg, 2) if pct_chg else 0,
+                is_limit_up=is_up,
+                is_limit_down=is_down,
+                pnl_pct=pnl_pct,
+            ))
+
+        return recs
+
+    def _extract_focus_stocks(self, report: str) -> list[dict]:
+        """从报告 JSON 前置块中提取 focus_stocks"""
+        json_match = re.search(r'```json\s*\n(.*?)\n```', report, re.DOTALL)
+        if json_match:
+            try:
+                data = json.loads(json_match.group(1))
+                stocks = data.get("focus_stocks", [])
+                if stocks:
+                    return [s for s in stocks if s.get("name") and len(s["name"]) >= 2]
+            except json.JSONDecodeError:
+                pass
+
+        # Fallback: 匹配裸 JSON
+        json_match = re.search(r'"focus_stocks"\s*:\s*\[(.*?)\]', report)
+        if json_match:
+            try:
+                stocks = json.loads("[" + json_match.group(1) + "]")
+                return [s for s in stocks if isinstance(s, dict) and s.get("name") and len(s["name"]) >= 2]
+            except json.JSONDecodeError:
+                pass
+
+        return []
+
+    def _extract_buy_plans(self, report: str) -> dict[str, dict]:
+        """从"买入计划"章节提取各标的的详细操作信息"""
+        plans = {}
+        # 匹配 "买入计划" 后的各标的段落
+        # 典型格式：
+        # **标的**：兰石重装
+        # **买入条件**：竞价高开3%以上
+        # **仓位**：3成
+        buy_section = re.search(
+            r'###?\s*买入计划(.*?)(?=###?\s*(?:卖出|空仓|持仓)|$)',
+            report, re.DOTALL,
+        )
+        if not buy_section:
+            return plans
+
+        section_text = buy_section.group(1)
+        # 按标的分段（**标的**：xxx 或 | 标的 | ...）
+        stock_blocks = re.split(r'(?=\*\*标的\*\*[：:]|^\|\s*.*?\s*\|)', section_text, flags=re.MULTILINE)
+
+        for block in stock_blocks:
+            name_match = re.search(r'\*\*标的\*\*[：:]\s*(.+?)(?:\n|$)', block)
+            if not name_match:
+                continue
+            stock_name = name_match.group(1).strip()
+            if len(stock_name) < 2:
+                continue
+
+            condition = ""
+            cond_match = re.search(r'\*\*买入条件\*\*[：:]\s*(.+?)(?:\n|$)', block)
+            if cond_match:
+                condition = cond_match.group(1).strip()
+
+            position = ""
+            pos_match = re.search(r'\*\*仓位\*\*[：:]\s*(.+?)(?:\n|$)', block)
+            if pos_match:
+                position = pos_match.group(1).strip()
+
+            plans[stock_name] = {
+                "action": "买入",
+                "condition": condition,
+                "position": position,
+            }
+
+        return plans
+
+    def _extract_experience_from_outcome(
         self,
         day_d: str,
         day_d1: str,
         report: str,
-        verify_result: dict,
+        recs: list[Recommendation],
         scenario,
     ) -> Optional[Experience]:
-        """从验证结果中提取结构化经验"""
-        scores_text = json.dumps(verify_result.get("scores", {}), ensure_ascii=False)
-        wrong_items = "\n".join(
-            "- {}".format(w) for w in verify_result.get("what_was_wrong", [])
-        )
-        lessons_items = "\n".join(
-            "- {}".format(l) for l in verify_result.get("key_lessons", [])
-        )
+        """从实际交易结果中提取结构化经验（不再依赖 LLM）"""
+        # 收集亏损标的信息
+        loss_details = []
+        for r in recs:
+            if r.action == "买入" and r.pnl_pct < -2:
+                loss_details.append(
+                    "{}: 推荐{买入}, D+1实际{:+.2f}%{}".format(
+                        r.stock,
+                        r.next_pct_chg,
+                        "（涨停）" if r.is_limit_up else "（跌停）" if r.is_limit_down else "",
+                    )
+                )
 
-        extract_msg = (
-            "## 回测验证结果\n\n"
-            "**分析日期**: {day_d}\n"
-            "**验证日期**: {day_d1}\n"
-            "**市场场景**: {scenario}\n"
-            "**总分**: {total}/20\n\n"
-            "### 各维度评分\n{scores}\n\n"
-            "### 错误判断\n{wrong}\n\n"
-            "### 已有教训摘要\n{lessons}\n\n"
-            "请提炼一条最关键的结构化经验教训。"
-        ).format(
-            day_d=day_d, day_d1=day_d1,
-            scenario=scenario.to_description(),
-            total=verify_result.get("total_score", 0),
-            scores=scores_text,
-            wrong=wrong_items or "无",
-            lessons=lessons_items or "无",
-        )
-
-        raw = self.llm_caller.invoke(EXPERIENCE_EXTRACTOR_PROMPT, extract_msg)
-        content = raw
-        if "```json" in content:
-            content = content.split("```json")[1].split("```")[0]
-        elif "```" in content:
-            content = content.split("```")[1].split("```")[0]
-
-        try:
-            extracted = json.loads(content.strip())
-        except json.JSONDecodeError:
+        if not loss_details:
             return None
 
-        error_type = extracted.get("error_type") or classify_error_type(
-            verify_result.get("scores", {})
+        # 构建教训（规则化，不需要 LLM）
+        lesson = "在{}场景下，推荐{}等标的实际亏损。市场场景: {}".format(
+            scenario.to_description(),
+            "、".join(r.stock for r in recs if r.action == "买入" and r.pnl_pct < -2),
+            scenario.to_description(),
         )
+
+        # 分析错误类型
+        worst = min(recs, key=lambda r: r.pnl_pct) if recs else None
+        if worst:
+            if worst.is_limit_down:
+                error_type = "strategy"
+                correction = "推荐标的次日跌停时，应在前日分析中识别退潮风险，避免推荐"
+            elif worst.next_pct_chg < -5:
+                error_type = "strategy"
+                correction = "推荐标的次日大跌超5%，需加强选股过滤，避免在分歧/退潮期推荐非核心标的"
+            else:
+                error_type = "strategy"
+                correction = "推荐标的次日表现不佳，需结合情绪阶段严格控制仓位或放弃操作"
+        else:
+            error_type = "unknown"
+            correction = "选股失误"
 
         return Experience(
             date=day_d,
             scenario=scenario.to_dict(),
-            prediction=extracted.get("prediction_summary", ""),
-            reality=extracted.get("reality_summary", ""),
-            scores=verify_result.get("scores", {}),
+            prediction="推荐: " + "、".join(r.stock for r in recs if r.action == "买入"),
+            reality="; ".join(loss_details),
+            scores={},
             error_type=error_type,
-            lesson=extracted.get("lesson", ""),
-            correction_rule=extracted.get("correction_rule", ""),
+            lesson=lesson,
+            correction_rule=correction,
         )

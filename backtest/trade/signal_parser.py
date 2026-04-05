@@ -20,7 +20,8 @@ ACTION_PATTERNS = [
     ("打板", re.compile(r'打板|封板|板上买|排板|涨停[介入买]|板价买')),
     ("竞价买入", re.compile(r'竞价[买入参与]|集合竞价|竞价介入')),
     ("低吸", re.compile(r'低吸|回调买|水下买|绿盘买|低点买|回踩[买接]|逢低')),
-    ("观望", re.compile(r'观望|关注|不参与|不追|等确认|看戏')),
+    ("卖出", re.compile(r'卖出|清仓|离场|止损|止盈|板砸|竞价卖出')),
+    ("观望", re.compile(r'观望|关注|不参与|不追|等确认|看戏|空仓')),
 ]
 
 # 竞价/条件关键词
@@ -47,6 +48,13 @@ STOCK_NAME_STOPWORDS = {
     '风险提示', '关注标的', '情绪阶段', '一致点', '分歧点', '情绪转换预判',
     '情绪阶段对应策略', '核心数据', '与前日对比', '策略方向', '明日策略',
     '进攻', '防守', '观望', '试探', '情绪周期', '龙头生态', 'AI',
+    # 新格式中的节标题
+    '买入条件', '放弃条件', '操作方式', '仓位', '持有条件', '卖出条件',
+    '卖出时间', '买入计划', '持仓卖出条件', '空仓判定', '风险点',
+    '条件1', '条件2', '条件3', '条件4', '条件5',
+    # 操作指令词（易被误识别为股票名）
+    '注意', '空仓', '理由', '回避', '谨慎', '重点', '等待', '回避',
+    '避雷', '止损', '止盈', '减仓', '加仓', '清仓', '持股', '打板',
 }
 
 
@@ -114,10 +122,10 @@ def _extract_json_block(report: str) -> Optional[dict]:
 
 
 def _extract_strategy_section(report: str) -> str:
-    """提取 '五、明日策略' 或 '明日策略' 节"""
-    # 尝试匹配 "## 五、明日策略" 或 "## 明日策略"
+    """提取 '五、明日策略' 或 '明日策略' 或 '买入计划' 节"""
+    # 优先匹配：## 买入计划 或 ## 五...明日策略 或 四.明日策略
     match = re.search(
-        r'(?:^|\n)(?:##\s*(?:五[、.]?)?\s*明日策略|四、明日策略)\s*\n(.*?)(?=\n##\s|\Z)',
+        r'(?:^|\n)(?:##\s*买入计划|##\s*五.{0,10}明日策略|四.{1,2}明日策略)[^\n]*\n(.*?)(?=\n##\s|\Z)',
         report, re.DOTALL,
     )
     if match:
@@ -140,20 +148,42 @@ def _parse_strategy_section(
     # 全局仓位建议
     position_pct = _parse_position_advice(section)
 
-    # 按标的分段：匹配 **股票名** 或 - **股票名** 或编号列表开头的段落
-    # 每个段落描述一只标的（注意缩进空格）
-    stock_blocks = re.split(r'\n\s*(?=-\s*\*\*|→\s*\*\*|\d[、.]\s*\*\*)', section)
+    # 按标的分段：
+    # 1. 新格式 #### 标的X：股票名
+    # 2. 旧格式 **股票名** 或 - **股票名** 或编号列表
+    stock_blocks = re.split(r'\n\s*(?=#{2,4}\s*标的)', section)
+    # 也按旧的 ** 格式分
+    if len(stock_blocks) <= 1:
+        stock_blocks = re.split(r'\n\s*(?=-\s*\*\*|→\s*\*\*|\d[、.]\s*\*\*)', section)
 
     for block in stock_blocks:
         # 提取股票名称
-        name_match = re.search(r'\*\*([^*]{2,8})\*\*', block)
-        if not name_match:
-            continue
+        name = None
 
-        name = name_match.group(1).strip()
+        # 新格式：#### 标的X：股票名（说明）或 #### 标的X：股票名
+        heading_match = re.search(r'#{2,4}\s*标的[一二三四五六七八九十\d]*[：:]\s*([\u4e00-\u9fa5]{2,4})', block)
+        if heading_match:
+            name = heading_match.group(1).strip()
+
+        # 旧格式：**股票名**
+        if not name:
+            name_match = re.search(r'\*\*([^*]{2,8})\*\*', block)
+            if name_match:
+                name = name_match.group(1).strip()
+
+        if not name:
+            continue
         if name in STOCK_NAME_STOPWORDS:
             continue
-        if any(k in name for k in ['板块', '策略', '建议', '方向', '逻辑', '阶段', '仓位']):
+        if any(k in name for k in ['板块', '策略', '建议', '方向', '逻辑', '阶段', '仓位',
+                                     '风险', '独狼', '炸板', '封板', '负反馈', '压制',
+                                     '跌停', '涨停', '溢价', '早盘', '高度']):
+            continue
+        # 过滤含数字的名称（如"炸板率40.9%"、"早盘封板0只"）
+        if re.search(r'\d', name):
+            continue
+        # 必须是纯中文2-4字
+        if not re.match(r'^[\u4e00-\u9fa5]{2,4}$', name):
             continue
 
         # 识别操作类型
@@ -212,18 +242,41 @@ def _parse_position_advice(text: str) -> float:
     return 0.3  # 默认 3 成
 
 
+def _normalize_focus_stocks(focus_stocks: list) -> list[dict]:
+    """统一 focus_stocks 格式：支持旧版 ["名称"] 和新版 [{"name":"X","code":"Y"}]"""
+    result = []
+    for item in focus_stocks:
+        if isinstance(item, dict):
+            name = item.get("name", "")
+            code = item.get("code", "")
+            if name:
+                result.append({"name": name, "code": code})
+        elif isinstance(item, str) and item:
+            result.append({"name": item, "code": ""})
+    return result
+
+
 def _enrich_from_json(signals: list[TradeSignal], json_data: dict):
     """用 JSON 数据补充 Markdown 解析结果"""
-    focus_stocks = json_data.get("focus_stocks", [])
+    focus_stocks = _normalize_focus_stocks(json_data.get("focus_stocks", []))
     do_actions = json_data.get("do_actions", [])
     pos_advice = json_data.get("position_advice", "")
 
-    # 如果 JSON 中有 focus_stocks 但 Markdown 没解析到，补充
-    signal_names = {s.stock_name for s in signals}
-    for stock in focus_stocks:
-        if stock and stock not in signal_names and stock not in STOCK_NAME_STOPWORDS:
-            # JSON 有但 Markdown 没解析到的标的
-            pass  # 暂不自动补充，避免误匹配
+    # 用 JSON 的 focus_stocks 补充 stock_code 和修正 stock_name
+    for stock_info in focus_stocks:
+        json_name = stock_info["name"]
+        json_code = stock_info["code"]
+        if not json_name or json_name in STOCK_NAME_STOPWORDS:
+            continue
+        for signal in signals:
+            # 名称匹配（包含关系，处理简称）
+            if json_name in signal.stock_name or signal.stock_name in json_name:
+                if json_code and not signal.stock_code:
+                    signal.stock_code = json_code
+                # 用 JSON 中的完整名称覆盖（如"粤电力A"覆盖"粤电力"）
+                if len(json_name) > len(signal.stock_name):
+                    signal.stock_name = json_name
+                break
 
     # 用 JSON 的 do_actions 补充操作类型
     for action_text in do_actions:
@@ -246,27 +299,30 @@ def _build_from_json(
 ) -> list[TradeSignal]:
     """仅从 JSON 构建信号（fallback）"""
     signals = []
-    focus_stocks = json_data.get("focus_stocks", [])
+    focus_stocks = _normalize_focus_stocks(json_data.get("focus_stocks", []))
     do_actions = json_data.get("do_actions", [])
     pos_advice = json_data.get("position_advice", "")
 
     position_pct = _parse_position_advice(pos_advice) if pos_advice else 0.3
 
-    for i, stock in enumerate(focus_stocks):
-        if not stock or stock in STOCK_NAME_STOPWORDS:
+    for i, stock_info in enumerate(focus_stocks):
+        stock_name = stock_info["name"]
+        stock_code = stock_info["code"]
+        if not stock_name or stock_name in STOCK_NAME_STOPWORDS:
             continue
 
         # 从 do_actions 中找对应的操作类型
         action_type = "观望"
         for action_text in do_actions:
-            if stock in action_text:
+            if stock_name in action_text:
                 action_type = _detect_action_type(action_text)
                 break
 
         signals.append(TradeSignal(
             signal_date=signal_date,
             target_date=target_date,
-            stock_name=stock,
+            stock_name=stock_name,
+            stock_code=stock_code,
             action_type=action_type,
             position_pct=position_pct,
             priority=i + 1,
