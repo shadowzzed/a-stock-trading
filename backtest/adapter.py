@@ -1,7 +1,7 @@
-"""数据适配层 — 唯一桥接 review/ 的文件
+"""数据适配层 — 桥接 backtest 引擎与 Trade Agent
 
-将 review/ 模块的具体实现适配为 backtest/engine/protocols 定义的接口。
-如果未来数据源变更，只需修改此文件。
+将 Trade Agent (chat/) 的能力适配为 backtest/engine/protocols 定义的接口。
+数据加载复用 review/data/ 和 review/tools/ 的基础设施。
 """
 
 from __future__ import annotations
@@ -53,26 +53,12 @@ class ReviewDataProvider:
         self, data_dir: str, date: str, report: str = ""
     ) -> tuple[str, str]:
         from trading_agent.review.data.loader import load_daily_data, summarize_limit_up, summarize_limit_down
-        from trading_agent.review.verify import _load_stock_pnl, _enrich_from_db, _query_intraday_db
 
         data_d1 = load_daily_data(data_dir, date, backtest_mode=True)
 
-        # 先生成 DB 补充数据（前置到 CSV 之前，避免 LLM 忽略）
-        db_supplement = _enrich_from_db(data_dir, date, data_d1)
-
         summary = "## {} 实际行情\n\n".format(date)
-
-        # DB 补充数据前置 + 醒目警告（CSV 数据不完整时）
-        if db_supplement:
-            summary += "> ⚠️ **以下为 intraday DB 验证的完整数据（比 CSV 更准确），请优先以此为准：**\n\n"
-            summary += db_supplement + "\n\n---\n\n"
-
         summary += summarize_limit_up(data_d1.limit_up) + "\n\n"
         summary += summarize_limit_down(data_d1.limit_down)
-
-        stock_pnl = _load_stock_pnl(data_dir, date, report)
-        if stock_pnl:
-            summary += "\n\n" + stock_pnl
 
         return date, summary
 
@@ -98,8 +84,12 @@ class ReviewDataProvider:
         return trading_dates
 
 
-class ReviewAgentRunner:
-    """Agent 运行器 — 调用 review.graph 执行分析"""
+class ChatAgentRunner:
+    """Agent 运行器 — 调用 Trade Agent (chat/) 执行分析
+
+    与实盘使用完全相同的提示词和决策逻辑，
+    回测验证的就是真正的 Trade Agent 能力。
+    """
 
     def run(
         self,
@@ -108,29 +98,62 @@ class ReviewAgentRunner:
         config: Optional[dict] = None,
         prev_report: str = "",
     ) -> str:
-        from trading_agent.review.graph import DEFAULT_CONFIG, _create_llm, _load_initial_state, build_graph
+        from trading_agent.chat.agent import TradingChatAgent
 
-        cfg = {**DEFAULT_CONFIG, **(config or {})}
-        init_state = _load_initial_state(
-            data_dir=data_dir, date=date,
-            config=config or {}, prev_report=prev_report,
-        )
-        run_cfg = {**(config or {}), "data_dir": data_dir, "date": date}
-        graph = build_graph(run_cfg)
-        final = graph.invoke(init_state)
-        return final.get("final_report", "（未生成报告）")
+        # 构造和实盘一样的自然语言消息
+        message = self._build_backtest_message(date, prev_report)
+        agent = TradingChatAgent(backtest_max_date=date)
+        return agent.chat(message)
+
+    @staticmethod
+    def _build_backtest_message(date: str, prev_report: str = "") -> str:
+        """构造回测模式的用户消息"""
+        parts = [
+            "请对 {} 的 A 股短线行情进行全面复盘分析。".format(date),
+            "",
+            "需要你完成：",
+            "1. 情绪周期定位（当前阶段、关键数据、与前日对比）",
+            "2. 主线与板块分析（主线、支线、退潮方向）",
+            "3. 龙头生态（总龙头、板块龙头、梯队结构、补涨标的）",
+            "4. **次日操盘计划**（必须包含具体的买入标的、买入条件、仓位建议）",
+            "",
+            "重点关注：",
+            "- 涨停/跌停统计和炸板率",
+            "- 连板梯队和龙头辨识",
+            "- 板块资金流向和主线持续性",
+            "- 事件催化对次日的影响",
+        ]
+        if prev_report:
+            parts.extend([
+                "",
+                "---",
+                "以下是前一交易日的 AI 分析报告，供参考校准：",
+                prev_report[:3000],
+            ])
+        return "\n".join(parts)
 
 
 class LangChainLLMCaller:
-    """LLM 调用器 — 封装 langchain LLM"""
+    """LLM 调用器 — 封装 langchain LLM（保留接口兼容）"""
 
     def __init__(self, llm=None):
         self._llm = llm
 
     def _ensure_llm(self):
         if self._llm is None:
-            from trading_agent.review.graph import DEFAULT_CONFIG, _create_llm
-            self._llm = _create_llm(DEFAULT_CONFIG)
+            from config import get_ai_providers
+            from langchain_openai import ChatOpenAI
+
+            providers = get_ai_providers()
+            if not providers:
+                raise ValueError("未配置 AI 提供商")
+            primary = providers[0]
+            self._llm = ChatOpenAI(
+                model=primary["model"],
+                base_url=primary["base"],
+                api_key=primary["key"],
+                temperature=0.3,
+            )
         return self._llm
 
     def invoke(self, system_prompt: str, user_message: str) -> str:
@@ -174,24 +197,34 @@ class CSVStockDataProvider:
     def load_stock_daily_by_code(
         self, data_dir: str, date: str, stock_code: str,
     ) -> Optional[dict]:
-        """按股票代码加载日线数据"""
+        """按股票代码加载日线数据（CSV 优先，mootdx fallback）"""
         import glob as glob_mod
+
+        # 兼容代码格式：000788 或 sz.000788 都支持
+        normalized = stock_code.strip()
+        if "." in normalized:
+            normalized = normalized.split(".", 1)[1]
 
         d_dir = os.path.join(data_dir, "daily", date)
         csv_files = glob_mod.glob(os.path.join(d_dir, "行情_*.csv"))
-        if not csv_files:
-            return None
 
         for csv_file in csv_files:
             try:
                 for row in self._read_csv_safe(csv_file):
                     code = row.get("代码", "").strip()
-                    if code == stock_code:
+                    # CSV 中可能是 "sz.000788" 或 "000788"，都匹配
+                    code_short = code.split(".", 1)[1] if "." in code else code
+                    if code_short == normalized:
                         return self._row_to_dict(row, date)
             except Exception:
                 continue
 
-        return None
+        # CSV 未命中 → mootdx fallback
+        from trading_agent.review.data.loader import load_stock_daily_ohlcv_by_code
+        result = load_stock_daily_ohlcv_by_code(data_dir, date, normalized)
+        if result:
+            result.pop("_source", None)
+        return result
 
     def load_limit_up_info(
         self, data_dir: str, date: str, stock_name: str,

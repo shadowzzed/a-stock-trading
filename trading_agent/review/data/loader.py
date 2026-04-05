@@ -770,10 +770,14 @@ def load_stock_detail(
     name: Optional[str] = None,
     code: Optional[str] = None,
     date: Optional[str] = None,
+    max_date: Optional[str] = None,
 ) -> str:
     """从 intraday 数据库查询个股详细行情（分时快照）。
 
     至少提供 name 或 code 之一。
+
+    Args:
+        max_date: 回测模式下的日期上界（只返回 date <= max_date 的数据，防止未来数据泄露）
     """
     if not name and not code:
         return "请提供 name 或 code 参数"
@@ -806,15 +810,29 @@ def load_stock_detail(
         ).fetchone()
 
         if not has_date_data and not date:
-            fallback_row = conn.execute(
-                "SELECT date FROM snapshots ORDER BY date DESC LIMIT 1"
-            ).fetchone()
+            # 回测模式下，fallback 不超过 max_date
+            if max_date:
+                fallback_row = conn.execute(
+                    "SELECT date FROM snapshots WHERE date <= ? ORDER BY date DESC LIMIT 1",
+                    (max_date,),
+                ).fetchone()
+            else:
+                fallback_row = conn.execute(
+                    "SELECT date FROM snapshots ORDER BY date DESC LIMIT 1"
+                ).fetchone()
             if fallback_row:
                 target_date = fallback_row[0]
                 date_fallback = True
 
         conditions = ["date = ?"]
         params: list = [target_date]
+        # 回测模式下，额外校验日期不超过 max_date
+        if max_date and target_date > max_date:
+            return DataResult(
+                content="无数据（回测模式下日期超出范围）",
+                warnings=[f"请求日期 {target_date} 超出回测截止日期 {max_date}"],
+                data_sources_missing=["intraday_snapshot"],
+            )
         if code:
             conditions.append("code LIKE ?")
             params.append(f"%{code}%")
@@ -882,10 +900,14 @@ def load_market_snapshot(
     mode: Optional[str] = "overview",
     sort_by: Optional[str] = "pctChg",
     top_n: Optional[int] = None,
+    max_date: Optional[str] = None,
 ) -> str:
     """获取行情快照数据（支持概览/个股/股票池模式）。
 
     数据源: SQLite 优先, mootdx 实时 fallback。
+
+    Args:
+        max_date: 回测模式下的日期上界（只返回 date <= max_date 的数据，防止未来数据泄露）
     """
     ds = date or datetime.now().strftime("%Y-%m-%d")
     db_path = _get_db_path(data_dir)
@@ -904,9 +926,16 @@ def load_market_snapshot(
 
             # 用户未显式指定日期时，自动 fallback 到最近一个交易日
             if not has_data and not date:
-                fallback_row = conn.execute(
-                    "SELECT date FROM snapshots ORDER BY date DESC LIMIT 1"
-                ).fetchone()
+                # 回测模式下 fallback 不超过 max_date
+                if max_date:
+                    fallback_row = conn.execute(
+                        "SELECT date FROM snapshots WHERE date <= ? ORDER BY date DESC LIMIT 1",
+                        (max_date,),
+                    ).fetchone()
+                else:
+                    fallback_row = conn.execute(
+                        "SELECT date FROM snapshots ORDER BY date DESC LIMIT 1"
+                    ).fetchone()
                 if fallback_row:
                     ds = fallback_row[0]
                     has_data = True
@@ -1041,10 +1070,14 @@ def scan_trend_stocks(
     ma_type: str = "both",
     top_n: int = 30,
     hot_only: bool = False,
+    max_date: Optional[str] = None,
 ) -> str:
     """全市场趋势股扫描 — 寻找沿5日线或10日线上方运行的趋势股。
 
     从 intraday.db 读取日线收盘数据，计算 MA5/MA10。
+
+    Args:
+        max_date: 回测模式下的日期上界（只使用 date <= max_date 的数据，防止未来数据泄露）
     """
     ds = date or datetime.now().strftime("%Y-%m-%d")
     db_path = _get_db_path(data_dir)
@@ -1066,10 +1099,13 @@ def scan_trend_stocks(
         )
 
     try:
+        # 回测模式下，只使用 <= max_date 的交易日
+        date_filter = max_date or date or datetime.now().strftime("%Y-%m-%d")
         trading_days = [
             r[0] for r in conn.execute(
                 "SELECT DISTINCT date FROM snapshots "
-                "WHERE ts = '15:00:00' ORDER BY date DESC LIMIT 12"
+                "WHERE ts = '15:00:00' AND date <= ? ORDER BY date DESC LIMIT 12",
+                (date_filter,),
             ).fetchall()
         ]
         if len(trading_days) < 6:
@@ -1277,6 +1313,105 @@ def load_stock_daily_ohlcv(
 
     # Step 2: mootdx fallback
     return _load_stock_from_mootdx(data_dir, date, stock_name)
+
+
+def load_stock_daily_ohlcv_by_code(
+    data_dir: str,
+    date: str,
+    stock_code: str,
+) -> Optional[dict]:
+    """按股票代码加载日线 OHLCV 数据（CSV 优先，mootdx fallback）。
+
+    Args:
+        data_dir: trading 数据根目录
+        date: 日期 (YYYY-MM-DD)
+        stock_code: 股票代码（6位数字，如 "000788"）
+
+    Returns:
+        同 load_stock_daily_ohlcv 或 None
+    """
+    # Step 1: 尝试从本地 CSV 读取
+    result = _load_stock_from_csv_by_code(data_dir, date, stock_code)
+    if result:
+        return result
+
+    # Step 2: mootdx fallback（直接用代码查询，无需名称映射）
+    return _load_stock_from_mootdx_by_code(data_dir, date, stock_code)
+
+
+def _load_stock_from_csv_by_code(
+    data_dir: str, date: str, stock_code: str,
+) -> Optional[dict]:
+    """从本地行情 CSV 按代码查找"""
+    import csv as csv_mod
+    import io as io_mod
+
+    # 兼容 "000788" 和 "sz.000788" 格式
+    normalized = stock_code.strip()
+    if "." in normalized:
+        normalized = normalized.split(".", 1)[1]
+
+    d_dir = os.path.join(data_dir, "daily", date)
+    csv_files = glob.glob(os.path.join(d_dir, "行情_*.csv"))
+
+    for csv_file in csv_files:
+        try:
+            with open(csv_file, "r", encoding="utf-8-sig") as f:
+                raw = f.read().replace("\x00", "")
+            for row in csv_mod.DictReader(io_mod.StringIO(raw)):
+                code = row.get("代码", "").strip()
+                code_short = code.split(".", 1)[1] if "." in code else code
+                if code_short == normalized:
+                    return _csv_row_to_dict(row, date)
+        except Exception:
+            continue
+
+    return None
+
+
+def _load_stock_from_mootdx_by_code(
+    data_dir: str, date: str, stock_code: str,
+) -> Optional[dict]:
+    """通过 mootdx 按代码直接拉取日线数据"""
+    try:
+        from mootdx.quotes import Quotes
+
+        code = stock_code.strip()
+        if "." in code:
+            code = code.split(".", 1)[1]
+
+        client = Quotes.factory(market="std")
+        df = client.bars(symbol=code, frequency=9, offset=10)
+        if df is None or df.empty:
+            return None
+
+        target = date.replace("-", "")
+        df["date_str"] = df["datetime"].astype(str).str[:10].str.replace("-", "")
+        match = df[df["date_str"] == target]
+        if match.empty:
+            df["date_str2"] = df["datetime"].astype(str).str[:10]
+            match = df[df["date_str2"] == date]
+        if match.empty:
+            return None
+
+        row = match.iloc[-1]
+        return {
+            "date": date,
+            "code": code,
+            "name": "",
+            "open": float(row["open"]),
+            "high": float(row["high"]),
+            "low": float(row["low"]),
+            "close": float(row["close"]),
+            "pct_chg": float(row.get("pctChg", 0)),
+            "volume": float(row.get("vol", row.get("volume", 0))),
+            "amount": float(row.get("amount", 0)),
+            "last_close": float(row.get("last_close", 0)),
+            "_source": "mootdx",
+        }
+    except Exception as e:
+        logger.debug("[mootdx] by_code fallback 失败 %s %s: %s", date, stock_code, e)
+        return None
 
 
 def _load_stock_from_csv(

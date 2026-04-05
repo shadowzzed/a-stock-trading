@@ -65,10 +65,12 @@ class BaseAgent:
         data_dir: str,
         memory_dir: str,
         cache: Optional[SharedDataCache] = None,
+        backtest_max_date: Optional[str] = None,
     ):
         self.data_dir = data_dir
         self.memory_dir = memory_dir
         self.cache = cache
+        self.backtest_max_date = backtest_max_date
 
         # LLM（复用同一套 provider 配置）
         providers = get_ai_providers()
@@ -97,7 +99,10 @@ class BaseAgent:
 
         # 工具
         today = datetime.now().strftime("%Y-%m-%d")
-        factory = RetrievalToolFactory(data_dir, today, memory_dir)
+        factory = RetrievalToolFactory(
+            data_dir, today, memory_dir,
+            backtest_max_date=self.backtest_max_date,
+        )
         all_tools = factory.create_tools()
 
         if self.tools_filter:

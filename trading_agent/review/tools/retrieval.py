@@ -31,12 +31,15 @@ class RetrievalToolFactory:
         data_dir: trading 数据根目录
         date: 分析日期 (YYYY-MM-DD)
         memory_dir: 跨周期记忆目录 (默认从 config 获取)
+        backtest_max_date: 回测模式下的日期上界，防止未来数据泄露
     """
 
-    def __init__(self, data_dir: str, date: str, memory_dir: str = ""):
+    def __init__(self, data_dir: str, date: str, memory_dir: str = "",
+                 backtest_max_date: Optional[str] = None):
         self.data_dir = data_dir
         self.date = date
         self.memory_dir = memory_dir or get_config()["memory_dir"]
+        self.backtest_max_date = backtest_max_date
         self._cache: dict = {}
 
     def _cached(self, key: tuple, loader):
@@ -419,7 +422,8 @@ class RetrievalToolFactory:
 
             def _load():
                 from trading_agent.review.data.loader import load_stock_detail
-                return load_stock_detail(factory.data_dir, name=name, code=code, date=target_date)
+                return load_stock_detail(factory.data_dir, name=name, code=code, date=target_date,
+                                          max_date=factory.backtest_max_date)
 
             result = factory._cached(cache_key, _load)
             return _str_result(result)
@@ -500,6 +504,7 @@ class RetrievalToolFactory:
                     factory.data_dir,
                     date=date, time=time, name=name, code=code,
                     mode=mode, sort_by=sort_by, top_n=top_n,
+                    max_date=factory.backtest_max_date,
                 )
 
             result = factory._cached(cache_key, _load)
@@ -545,6 +550,7 @@ class RetrievalToolFactory:
                     min_pct=min_pct, max_pct=max_pct,
                     sector=sector, ma_type=ma_type,
                     top_n=top_n, hot_only=hot_only,
+                    max_date=factory.backtest_max_date,
                 )
 
             result = factory._cached(cache_key, _load)

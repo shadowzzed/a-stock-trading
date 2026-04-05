@@ -22,12 +22,13 @@ class TradingChatAgent:
     意图识别、任务分发和结果综合。
     """
 
-    def __init__(self):
+    def __init__(self, backtest_max_date: Optional[str] = None):
         cfg = get_config()
         data_dir = cfg["data_root"]
         memory_dir = cfg["memory_dir"]
 
-        self.coordinator = CoordinatorAgent(data_dir, memory_dir)
+        self.coordinator = CoordinatorAgent(data_dir, memory_dir,
+                                            backtest_max_date=backtest_max_date)
         logger.info("Trade Agent Teams 已初始化（4 位分析师）")
 
     def chat(

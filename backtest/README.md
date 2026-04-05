@@ -163,6 +163,64 @@ Experience（一条结构化经验）
 4. **场景标签粒度**：当前场景分类基于硬编码的阈值区间（如涨停数 0/1-30/31-50/...），不会自动适应市场格局变化
 5. **回测 ≠ 实盘**：回测验证的是"Agent 的分析逻辑是否自洽"，不代表实盘收益。Day D 报告中的具体标的推荐，受盘中时效性影响，回测无法完全还原
 
+## 数据隔离：防止未来数据泄露
+
+回测时 Agent 必须只能看到 Day D 及之前的数据，否则验证结果无效。
+
+### 实现方案：工具层日期边界过滤
+
+LLM 只能通过 LangChain Tool 访问数据。所有涉及 `intraday.db` 查询的工具都支持 `max_date` 参数，在 SQL 层面添加 `WHERE date <= ?` 过滤，物理上阻止未来数据泄露。
+
+### 受影响的工具（3个 DB 查询工具）
+
+| 工具 | loader 函数 | 过滤方式 |
+|------|------------|---------|
+| `get_market_data` | `load_market_snapshot` | fallback 不超过 max_date；SQL `WHERE date <= ?` |
+| `get_stock_detail` | `load_stock_detail` | fallback 不超过 max_date；请求日期超 max_date 时返回空 |
+| `scan_trend_stocks` | `scan_trend_stocks` | trading_days 查询加 `WHERE date <= ?` |
+
+不受影响的工具（无 DB 查询，无泄露风险）：
+
+| 工具 | 数据来源 | 为何安全 |
+|------|---------|---------|
+| `get_history_data` | CSV 文件（`daily/` 目录） | `_load_history` 按日期目录回溯，天然只看到 <= D |
+| `get_review_docs` | 文件系统（`daily/D/review_docs/`） | 按具体日期路径读取 |
+| `get_memory` | memory 文件 | `load_memory` 有日期过滤 |
+| `get_lessons` | 经验库 JSON | 静态文件 |
+| `get_prev_report` | 文件系统（`daily/<D/reports/`） | 明确限定 `d < factory.date` |
+| `get_past_report` | 文件系统 | 明确限定 `date >= factory.date` 时拒绝 |
+| `get_index_data` | CSV / mootdx | 按指定日期查询 |
+| `get_capital_flow` | CSV / mootdx | 按指定日期查询 |
+| `get_quant_rules` | 静态 JSON | 无时间维度 |
+
+### 参数传递链
+
+```
+backtest/adapter.py
+  ChatAgentRunner.run(date=D)
+    ↓  backtest_max_date=D
+trading_agent/chat/agent.py
+  TradingChatAgent(backtest_max_date=D)
+    ↓
+trading_agent/chat/coordinator.py
+  CoordinatorAgent(backtest_max_date=D)
+    ↓
+trading_agent/chat/agents/base.py
+  BaseAgent(backtest_max_date=D)
+    ↓
+trading_agent/review/tools/retrieval.py
+  RetrievalToolFactory(backtest_max_date=D)
+    ↓  max_date=factory.backtest_max_date
+trading_agent/review/data/loader.py
+  load_market_snapshot(..., max_date=D)
+  load_stock_detail(..., max_date=D)
+  scan_trend_stocks(..., max_date=D)
+    ↓
+SQL: WHERE date <= 'D'   ← 物理过滤
+```
+
+实盘模式下 `backtest_max_date=None`，所有工具行为完全不变。
+
 ## 如何测试
 
 ### 单元测试

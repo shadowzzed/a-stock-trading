@@ -87,17 +87,23 @@ class CoordinatorAgent(BaseAgent):
     prompt_file = "coordinator.md"
     tools_filter = None  # 协调器可以使用所有工具
 
-    def __init__(self, data_dir: str, memory_dir: str):
+    def __init__(self, data_dir: str, memory_dir: str,
+                 backtest_max_date: Optional[str] = None):
         # 共享数据缓存，并行分析时避免重复查询
         cache = SharedDataCache()
 
-        super().__init__(data_dir, memory_dir, cache=cache)
+        super().__init__(data_dir, memory_dir, cache=cache,
+                         backtest_max_date=backtest_max_date)
 
         # 初始化 Sub-Agents（共享同一个 cache）
-        self.dragon = DragonAgent(data_dir, memory_dir, cache=cache)
-        self.sentiment = SentimentAgent(data_dir, memory_dir, cache=cache)
-        self.bullbear = BullBearAgent(data_dir, memory_dir, cache=cache)
-        self.trend = TrendAgent(data_dir, memory_dir, cache=cache)
+        self.dragon = DragonAgent(data_dir, memory_dir, cache=cache,
+                                  backtest_max_date=backtest_max_date)
+        self.sentiment = SentimentAgent(data_dir, memory_dir, cache=cache,
+                                        backtest_max_date=backtest_max_date)
+        self.bullbear = BullBearAgent(data_dir, memory_dir, cache=cache,
+                                     backtest_max_date=backtest_max_date)
+        self.trend = TrendAgent(data_dir, memory_dir, cache=cache,
+                                backtest_max_date=backtest_max_date)
 
         self._agent_map = {
             "dragon": self.dragon,
