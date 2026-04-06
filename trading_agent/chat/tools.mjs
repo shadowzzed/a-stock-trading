@@ -247,6 +247,24 @@ const toolHandlers = {
         }
 
         lines.push(`| ${ds} | ${upCount} | ${downCount} | ${maxBoard}板 | - |`);
+
+        // 连板梯队详情（≥2板的个股）
+        if (limitUp && maxBoard >= 2) {
+          const tiers = {};
+          for (const row of limitUp) {
+            const bd = parseInt(row.连板数 || row.连续涨停天数 || '1');
+            if (bd >= 2) {
+              if (!tiers[bd]) tiers[bd] = [];
+              const stockName = (row['名称'] || row['股票名称'] || '').trim();
+              const stockCode = (row['代码'] || row['股票代码'] || '').trim();
+              tiers[bd].push(`${stockName}（${stockCode}）`);
+            }
+          }
+          const sortedTiers = Object.keys(tiers).sort((a, b) => b - a);
+          for (const bd of sortedTiers) {
+            lines.push(`  ${bd}板：${tiers[bd].join('、')}`);
+          }
+        }
       }
       return lines.length > 3 ? lines.join('\n') : '无数据';
     });
@@ -364,12 +382,28 @@ const toolHandlers = {
 
   get_stock_detail({ name, code, date: d } = {}) {
     if (!name && !code) return '请提供 name 或 code 参数';
-    const ds = d || today();
+    let ds = d || today();
     const dbPath = path.join(DATA_DIR, 'intraday', 'intraday.db');
     if (!fs.existsSync(dbPath)) return '无数据（intraday.db 不存在）';
 
     try {
       const db = new Database(dbPath, { readonly: true });
+
+      // 非交易日 fallback：如果未显式指定日期且当日无数据，自动找最近交易日
+      let fallbackDate = null;
+      if (!d) {
+        const dateCheck = db.prepare("SELECT 1 FROM snapshots WHERE date = ? LIMIT 1").get(ds);
+        if (!dateCheck) {
+          const lastTrading = db.prepare(
+            "SELECT date FROM snapshots WHERE date < ? ORDER BY date DESC LIMIT 1"
+          ).get(ds);
+          if (lastTrading) {
+            fallbackDate = lastTrading.date;
+            ds = fallbackDate;
+          }
+        }
+      }
+
       const conditions = ['date = ?'];
       const params = [ds];
       if (code) { conditions.push('code LIKE ?'); params.push(`%${code}%`); }
@@ -383,7 +417,7 @@ const toolHandlers = {
 
       const first = rows[0];
       const last = rows[rows.length - 1];
-      const lines = [`## ${first.name}（${first.code}）`, `日期: ${ds}，共 ${rows.length} 条快照`, '', '| 时间 | 价格 | 涨跌幅 | 成交额(亿) | 涨停 |', '|------|------|--------|-----------|------|'];
+      const lines = [`## ${first.name}（${first.code}）`, `日期: ${ds}，共 ${rows.length} 条快照${fallbackDate ? '（非交易日，已回退至最近交易日）' : ''}`, '', '| 时间 | 价格 | 涨跌幅 | 成交额(亿) | 涨停 |', '|------|------|--------|-----------|------|'];
       for (const r of rows) {
         const lu = r.is_limit_up ? '涨停' : (r.is_limit_down ? '跌停' : '');
         lines.push(`| ${r.ts} | ${fmtPrice(r.price)} | ${parseFloat(r.pctChg || 0) >= 0 ? '+' : ''}${parseFloat(r.pctChg || 0).toFixed(2)}% | ${parseFloat(r.amount_yi || 0).toFixed(2)} | ${lu} |`);
@@ -402,22 +436,20 @@ const toolHandlers = {
   },
 
   get_market_data({ date, time, name, code, mode = 'overview', sort_by = 'pctChg', top_n } = {}) {
-    const ds = date || today();
+    let ds = date || today();
     const dbPath = path.join(DATA_DIR, 'intraday', 'intraday.db');
 
     // Resolve target timestamp
-    function resolveTs(db) {
+    function resolveTs(db, queryDate) {
       if (time && time !== 'close' && time !== 'latest') {
-        // Find closest snapshot to requested time
         const row = db.prepare(
           "SELECT ts FROM snapshots WHERE date = ? AND ts <= ? ORDER BY ts DESC LIMIT 1"
-        ).get(ds, time + ':59');
+        ).get(queryDate, time + ':59');
         return row ? row.ts : null;
       }
-      // Default: latest snapshot of the day
       const row = db.prepare(
         "SELECT ts FROM snapshots WHERE date = ? ORDER BY ts DESC LIMIT 1"
-      ).get(ds);
+      ).get(queryDate);
       return row ? row.ts : null;
     }
 
@@ -425,15 +457,29 @@ const toolHandlers = {
     let db = null;
     let rows = [];
     let actualTs = null;
+    let fallbackDate = null;
 
     if (fs.existsSync(dbPath)) {
       try {
         db = new Database(dbPath, { readonly: true });
 
         // Check if data exists for this date
-        const dateCheck = db.prepare("SELECT 1 FROM snapshots WHERE date = ? LIMIT 1").get(ds);
+        let dateCheck = db.prepare("SELECT 1 FROM snapshots WHERE date = ? LIMIT 1").get(ds);
+
+        // 非交易日 fallback：如果未显式指定日期且当日无数据，自动找最近交易日
+        if (!dateCheck && !date) {
+          const lastTrading = db.prepare(
+            "SELECT date FROM snapshots WHERE date < ? ORDER BY date DESC LIMIT 1"
+          ).get(ds);
+          if (lastTrading) {
+            fallbackDate = lastTrading.date;
+            ds = fallbackDate;
+            dateCheck = true;
+          }
+        }
+
         if (dateCheck) {
-          actualTs = resolveTs(db);
+          actualTs = resolveTs(db, ds);
           if (actualTs) {
             let query = "SELECT * FROM snapshots WHERE date = ? AND ts = ?";
             const params = [ds, actualTs];
@@ -500,7 +546,7 @@ const toolHandlers = {
       // Individual stock detail
       const n = top_n || 5;
       const filtered = rows.slice(0, n);
-      const lines = [`## ${filtered[0].name || ''}（${filtered[0].code}）`, `日期: ${ds}  时间: ${actualTs}`, '',
+      const lines = [`## ${filtered[0].name || ''}（${filtered[0].code}）`, `日期: ${ds}  时间: ${actualTs}${fallbackDate ? '（非交易日，已回退至最近交易日）' : ''}`, '',
         '| 代码 | 名称 | 现价 | 涨跌幅 | 开盘 | 最高 | 最低 | 成交额(亿) | 涨停 |',
         '|------|------|------|--------|------|------|------|-----------|------|'];
       for (const r of filtered) {
@@ -526,7 +572,7 @@ const toolHandlers = {
 
     const lines = [
       `## 行情概览（${mode === 'pool' ? '股票池' : '全市场'}）`,
-      `日期: ${ds}  时间: ${actualTs}  总数: ${rows.length}`,
+      `日期: ${ds}  时间: ${actualTs}  总数: ${rows.length}${fallbackDate ? '（非交易日，已回退至最近交易日）' : ''}`,
       `涨: ${upCount}  跌: ${downCount}  涨停: ${limitUps.length}  跌停: ${limitDowns.length}  总成交: ${totalAmount.toFixed(1)}亿`,
       '',
       '### 涨幅 TOP' + n,
