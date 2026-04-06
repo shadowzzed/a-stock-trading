@@ -284,35 +284,38 @@ def generate_settlement_report(
         "",
         "## 二、逐笔交割单",
         "",
-        "| 编号 | 买入日→卖出日 | 股票名 | 仓位金额 | 盈亏金额(收益率) | 持仓天数 | 操作原因 |",
-        "|------|--------------|--------|---------|-----------------|---------|---------|",
     ])
 
     for i, t in enumerate(trade_records, 1):
-        reason = t.get("sell_reason", "") or t.get("buy_reason", "")
-        if len(reason) > 30:
-            reason = reason[:30] + "..."
-        lines.append("| {} | {}→{} | {} | {:,} | {:+,}({:+.2f}%) | {}天 | {} |".format(
-            i, t["buy_date"], t["sell_date"], t["name"],
-            t["position"],
-            t["pnl_amount"], t["pnl_pct"],
-            t.get("hold_days", 0),
-            reason,
-        ))
+        buy_reason = t.get("buy_reason", "")
+        sell_reason = t.get("sell_reason", "")
+        lines.extend([
+            "### {}. {}（{}→{}）".format(i, t["name"], t["buy_date"], t["sell_date"]),
+            "",
+            "- 仓位金额：{:,}（本金×30%）".format(t["position"]),
+            "- 盈亏：{:+,}（{:+.2f}%）".format(t["pnl_amount"], t["pnl_pct"]),
+            "- 持仓天数：{}天".format(t.get("hold_days", 0)),
+            "- **买入原因**：{}".format(buy_reason or "未记录"),
+            "- **卖出原因**：{}".format(sell_reason or "未记录"),
+            "",
+        ])
 
     # 未平仓
     if open_positions:
         lines.extend([
             "",
-            "### 未平仓持仓",
+            "## 三、未平仓持仓",
             "",
         ])
         for p in open_positions:
             pos_amount = equity * 0.3
-            lines.append("- {} | 买入日:{} | 仓位:{:,} | 原因:{}".format(
-                p["name"], p["buy_date"], round(pos_amount),
-                p.get("buy_reason", ""),
-            ))
+            lines.extend([
+                "### {}（买入日:{}）".format(p["name"], p["buy_date"]),
+                "",
+                "- 仓位金额：{:,}".format(round(pos_amount)),
+                "- **买入原因**：{}".format(p.get("buy_reason", "") or "未记录"),
+                "",
+            ])
 
     # 保存文件
     report_path = os.path.join(output_dir, "交割单.md")

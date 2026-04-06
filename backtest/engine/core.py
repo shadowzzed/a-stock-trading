@@ -198,9 +198,13 @@ class BacktestPortfolioTracker:
         return count
 
     def buy_from_recommendations(
-        self, recs: list, buy_date: str, data_dir: str,
+        self, recs: list, buy_date: str, data_dir: str, buy_reasons: dict = None,
     ):
-        """根据推荐标的在 buy_date 开盘价买入。"""
+        """根据推荐标的在 buy_date 开盘价买入。
+
+        Args:
+            buy_reasons: {股票名: 参与逻辑} 从报告提取的买入原因
+        """
         from ..adapter import CSVStockDataProvider
         loader = CSVStockDataProvider()
 
@@ -226,6 +230,12 @@ class BacktestPortfolioTracker:
 
             cost = shares * buy_price
             self.cash -= cost
+            # 买入原因：优先用从报告提取的参与逻辑，其次用 Recommendation 的字段
+            reason = ""
+            if buy_reasons and rec.stock in buy_reasons:
+                reason = buy_reasons[rec.stock]
+            if not reason:
+                reason = getattr(rec, 'buy_condition', '') or getattr(rec, 'reason', '')
             self.positions.append({
                 "name": rec.stock,
                 "code": "",
@@ -234,7 +244,7 @@ class BacktestPortfolioTracker:
                 "shares": shares,
                 "cost": cost,
                 "sell_condition": "",
-                "buy_reason": getattr(rec, 'buy_condition', '') or getattr(rec, 'reason', ''),
+                "buy_reason": reason,
             })
 
     def get_state(self, current_date: str, data_dir: str) -> dict:
@@ -492,7 +502,10 @@ class BacktestEngine:
 
             # ── Step 4.5: 模拟 Day D+1 买入（更新持仓追踪）──
             if recs:
-                portfolio.buy_from_recommendations(recs, day_d1, data_dir)
+                # 从报告提取买入原因
+                buy_plans = self._extract_buy_plans(report)
+                plan_reasons = {name: p.get("reason", "") for name, p in buy_plans.items()}
+                portfolio.buy_from_recommendations(recs, day_d1, data_dir, buy_reasons=plan_reasons)
                 bought = [p["name"] for p in portfolio.positions if p["buy_date"] == day_d1]
                 if bought:
                     print("  [模拟买入] {}".format(", ".join(bought)))
@@ -998,10 +1011,17 @@ class BacktestEngine:
             if pos_match:
                 position = pos_match.group(1).strip()
 
+            # 提取参与逻辑（Markdown 表格行）
+            logic = ""
+            logic_match = re.search(r'\|\s*参与逻辑\s*\|\s*(.+?)\s*\|', block)
+            if logic_match:
+                logic = logic_match.group(1).strip()
+
             plans[stock_name] = {
                 "action": "买入",
                 "condition": condition,
                 "position": position,
+                "reason": logic,
             }
 
         return plans
