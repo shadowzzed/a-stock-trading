@@ -61,38 +61,117 @@ class BacktestPortfolioTracker:
 
     规则：
     - Agent 在 Day D 推荐买入的标的，假定在 Day D+1 开盘价买入
-    - 持仓持有 1 天（T+1），在 Day D+2 开盘价卖出
-    - 每只标的固定 3 成仓位
-    - 追踪器在每日回测循环中维护，把状态传给 Agent
+    - Agent 每天对持仓做出持有/卖出决策（position_actions）
+    - 卖出在次日开盘价执行；持有则保留到下一轮决策
+    - 超过 MAX_HOLD_DAYS 天未被 Agent 主动卖出的持仓强制卖出（防护性兜底）
     """
+
+    MAX_HOLD_DAYS = 30  # 最大持仓天数兜底
 
     def __init__(self, initial_capital: float = 1_000_000.0):
         self.initial_capital = initial_capital
         self.cash = initial_capital
-        self.positions: list[dict] = []  # [{name, code, buy_date, buy_price, shares, cost}]
+        self.positions: list[dict] = []  # [{name, code, buy_date, buy_price, shares, cost, sell_condition}]
 
     @property
     def total_value(self) -> float:
         return self.cash + sum(p["cost"] for p in self.positions)
 
-    def sell_all(self, sell_date: str, data_dir: str):
-        """在 sell_date 开盘价卖出所有可卖持仓（买入日 < sell_date 的持仓）。"""
+    def apply_position_actions(
+        self, actions: list[dict], sell_date: str, data_dir: str,
+    ) -> list[dict]:
+        """根据 Agent 的 position_actions 执行卖出/持有决策。
+
+        Args:
+            actions: Agent 输出的 position_actions 列表
+                [{"name": "xxx", "action": "卖出"/"持有", "sell_condition": "..."}]
+            sell_date: 卖出执行日期（用该日开盘价）
+            data_dir: 数据目录
+
+        Returns:
+            卖出记录列表
+        """
         from ..adapter import CSVStockDataProvider
         loader = CSVStockDataProvider()
+
+        # 构建 Agent 决策映射
+        action_map = {}
+        for a in actions:
+            name = a.get("name", "")
+            if name:
+                action_map[name] = a
+
+        sold_records = []
         remaining = []
+
         for p in self.positions:
+            # T+0 当天买入的不能卖（T+1 约束）
             if p["buy_date"] >= sell_date:
                 remaining.append(p)
                 continue
-            daily = loader.load_stock_daily(data_dir, sell_date, p["name"])
-            if daily and daily.get("open", 0) > 0:
-                sell_price = daily["open"]
-                proceeds = p["shares"] * sell_price
-                self.cash += proceeds
+
+            agent_action = action_map.get(p["name"], {})
+            action = agent_action.get("action", "")
+
+            # 计算持仓天数（用于兜底）
+            hold_days = self._count_trading_days(p["buy_date"], sell_date, data_dir)
+
+            should_sell = False
+            sell_reason = ""
+
+            if action == "卖出":
+                should_sell = True
+                sell_reason = agent_action.get("reason", "Agent 决策卖出")
+            elif action == "持有":
+                # 更新持仓的卖出条件
+                p["sell_condition"] = agent_action.get("sell_condition", "")
+                if hold_days >= self.MAX_HOLD_DAYS:
+                    should_sell = True
+                    sell_reason = "持仓超过{}天强制卖出".format(self.MAX_HOLD_DAYS)
             else:
-                # 无行情数据，按成本价返还
-                self.cash += p["cost"]
+                # Agent 没有对此持仓做出决策（可能是遗漏）
+                if hold_days >= self.MAX_HOLD_DAYS:
+                    should_sell = True
+                    sell_reason = "Agent 未决策 + 持仓超过{}天".format(self.MAX_HOLD_DAYS)
+                # 否则默认持有
+
+            if should_sell:
+                daily = loader.load_stock_daily(data_dir, sell_date, p["name"])
+                if daily and daily.get("open", 0) > 0:
+                    sell_price = daily["open"]
+                    proceeds = p["shares"] * sell_price
+                    pnl_pct = (sell_price - p["buy_price"]) / p["buy_price"] * 100
+                    self.cash += proceeds
+                    sold_records.append({
+                        "name": p["name"],
+                        "sell_price": round(sell_price, 2),
+                        "pnl_pct": round(pnl_pct, 2),
+                        "reason": sell_reason,
+                    })
+                else:
+                    self.cash += p["cost"]
+                    sold_records.append({
+                        "name": p["name"],
+                        "sell_price": p["buy_price"],
+                        "pnl_pct": 0,
+                        "reason": sell_reason + "（无行情，按成本价）",
+                    })
+            else:
+                remaining.append(p)
+
         self.positions = remaining
+        return sold_records
+
+    def _count_trading_days(self, from_date: str, to_date: str, data_dir: str) -> int:
+        """简化的交易日计数（基于 daily 目录）。"""
+        daily_root = os.path.join(data_dir, "daily")
+        if not os.path.isdir(daily_root):
+            return 0
+        count = 0
+        for d in os.listdir(daily_root):
+            if from_date < d <= to_date and os.path.isdir(os.path.join(daily_root, d)):
+                count += 1
+        return count
 
     def buy_from_recommendations(
         self, recs: list, buy_date: str, data_dir: str,
@@ -130,6 +209,7 @@ class BacktestPortfolioTracker:
                 "buy_price": buy_price,
                 "shares": shares,
                 "cost": cost,
+                "sell_condition": "",
             })
 
     def get_state(self, current_date: str, data_dir: str) -> dict:
@@ -220,6 +300,7 @@ class BacktestEngine:
 
         prev_report = ""
         portfolio = BacktestPortfolioTracker()
+        all_experiences: list[Experience] = []  # 收集所有经验，不自动保存
 
         for idx, (day_d, day_d1) in enumerate(pairs):
             if on_progress:
@@ -293,12 +374,24 @@ class BacktestEngine:
 
             result.injected_lessons = len(injected_ids)
 
-            # ── Step 1.5: 卖出前日持仓（T+1，用 Day D 开盘价）──
-            portfolio.sell_all(day_d, data_dir)
+            # ── Step 1.5: 根据前一天报告的 position_actions 执行卖出 ──
+            if portfolio.positions and prev_report:
+                position_actions = self._extract_position_actions(prev_report)
+                sold = portfolio.apply_position_actions(position_actions, day_d, data_dir)
+                if sold:
+                    for s in sold:
+                        print("  [卖出] {} @ {:.2f} ({:+.2f}%) — {}".format(
+                            s["name"], s["sell_price"], s["pnl_pct"], s["reason"]))
+            elif portfolio.positions and not prev_report:
+                # 首日无前日报告，不卖出（保持持仓到下一轮 Agent 决策）
+                pass
+
             portfolio_state = portfolio.get_state(day_d, data_dir)
             if portfolio.positions:
-                print("  [持仓] {} 只持仓, 现金 {:.0f} ({:.0f}%)".format(
-                    len(portfolio.positions), portfolio_state["cash"],
+                print("  [持仓] {} 只: {}  现金 {:.0f} ({:.0f}%)".format(
+                    len(portfolio.positions),
+                    ", ".join(p["name"] for p in portfolio.positions),
+                    portfolio_state["cash"],
                     portfolio_state["cash_pct"]))
             else:
                 print("  [持仓] 空仓, 总资产 {:.0f}".format(portfolio_state["total_value"]))
@@ -409,35 +502,26 @@ class BacktestEngine:
             with open(verify_path, "w", encoding="utf-8") as f:
                 json.dump(verify_data, f, ensure_ascii=False, indent=2)
 
-            # ── Step 5: 基于实盘结果提取经验 ──
+            # ── Step 5: 基于实盘结果提取经验（不自动保存）──
             if on_progress:
                 on_progress(idx + 1, len(pairs), day_d, "extracting_experience")
 
-            extract_path = os.path.join(output_dir, "{}_experience.json".format(day_d))
-            if not os.path.exists(extract_path) and recs:
-                # 只在亏损或误判时提取教训
-                losses = [r for r in recs if r.action == "买入" and r.pnl_pct < -2]
-                wrong_calls = [r for r in recs if r.action == "买入" and r.next_pct_chg < -5]
-
-                if losses or wrong_calls:
+            if recs:
+                has_signal = (
+                    any(r.action == "买入" and r.pnl_pct < -2 for r in recs)
+                    or any(r.action == "买入" and r.pnl_pct > 3 for r in recs)
+                )
+                if has_signal:
                     try:
-                        experience = self._extract_experience_from_outcome(
+                        day_experiences = self._extract_experience_from_outcome(
                             day_d=day_d, day_d1=day_d1,
                             report=report, recs=recs,
                             scenario=scenario,
                         )
-                        if experience:
-                            exp_store.add(experience)
-                            with open(extract_path, "w", encoding="utf-8") as f:
-                                json.dump({
-                                    "experience_id": experience.id,
-                                    "scenario": experience.scenario,
-                                    "lesson": experience.lesson,
-                                    "correction_rule": experience.correction_rule,
-                                    "error_type": experience.error_type,
-                                }, f, ensure_ascii=False, indent=2)
-                            print("  [经验提取] 新增教训: {}".format(
-                                experience.lesson[:50]))
+                        if day_experiences:
+                            all_experiences.extend(day_experiences)
+                            print("  [经验提取] {} 条（累计 {} 条）".format(
+                                len(day_experiences), len(all_experiences)))
                     except Exception as e:
                         print("  [经验提取失败] {}".format(e))
 
@@ -447,6 +531,27 @@ class BacktestEngine:
 
         # ── 生成汇总报告 ──
         summary = generate_summary(results, output_dir, exp_store)
+
+        # ── 生成经验总结审阅文件 ──
+        if all_experiences:
+            review_path = self._generate_experience_review_file(all_experiences, output_dir)
+            if review_path:
+                print("\n经验总结已保存到 {}（共 {} 条，请审阅后决定是否沉淀）".format(
+                    review_path, len(all_experiences)))
+            # 保存 JSON 格式的经验列表（方便后续批量导入）
+            exp_json_path = os.path.join(output_dir, "经验总结.json")
+            with open(exp_json_path, "w", encoding="utf-8") as f:
+                json.dump([{
+                    "id": e.id,
+                    "date": e.date,
+                    "scenario": e.scenario,
+                    "prediction": e.prediction,
+                    "reality": e.reality,
+                    "error_type": e.error_type,
+                    "lesson": e.lesson,
+                    "correction_rule": e.correction_rule,
+                } for e in all_experiences], f, ensure_ascii=False, indent=2)
+
         return summary
 
     def _run_parallel(
@@ -464,6 +569,7 @@ class BacktestEngine:
         from concurrent.futures import ThreadPoolExecutor, as_completed
 
         print("\n[并行模式] {} workers, {} 天待处理".format(workers, len(pairs)))
+        all_experiences: list[Experience] = []  # 收集所有经验，不自动保存
 
         # Phase 1: 并行生成报告（LLM 调用）
         def generate_report(idx_pair):
@@ -558,26 +664,20 @@ class BacktestEngine:
             with open(verify_path, "w", encoding="utf-8") as f:
                 json.dump(verify_data, f, ensure_ascii=False, indent=2)
 
-            # 经验提取
-            extract_path = os.path.join(output_dir, "{}_experience.json".format(day_d))
-            if not os.path.exists(extract_path) and recs:
-                losses = [r for r in recs if r.action == "买入" and r.pnl_pct < -2]
-                if losses:
+            # 经验提取（不自动保存）
+            if recs:
+                has_signal = (
+                    any(r.action == "买入" and r.pnl_pct < -2 for r in recs)
+                    or any(r.action == "买入" and r.pnl_pct > 3 for r in recs)
+                )
+                if has_signal:
                     try:
-                        experience = self._extract_experience_from_outcome(
+                        day_experiences = self._extract_experience_from_outcome(
                             day_d=day_d, day_d1=day_d1, report=report,
                             recs=recs, scenario=scenario,
                         )
-                        if experience:
-                            exp_store.add(experience)
-                            with open(extract_path, "w", encoding="utf-8") as f:
-                                json.dump({
-                                    "experience_id": experience.id,
-                                    "scenario": experience.scenario,
-                                    "lesson": experience.lesson,
-                                    "correction_rule": experience.correction_rule,
-                                    "error_type": experience.error_type,
-                                }, f, ensure_ascii=False, indent=2)
+                        if day_experiences:
+                            all_experiences.extend(day_experiences)
                     except Exception as e:
                         print("  [经验提取失败] {}".format(e))
 
@@ -586,6 +686,26 @@ class BacktestEngine:
 
         # 生成汇总
         summary = generate_summary(results, output_dir, exp_store)
+
+        # 生成经验总结审阅文件
+        if all_experiences:
+            review_path = self._generate_experience_review_file(all_experiences, output_dir)
+            if review_path:
+                print("\n经验总结已保存到 {}（共 {} 条，请审阅后决定是否沉淀）".format(
+                    review_path, len(all_experiences)))
+            exp_json_path = os.path.join(output_dir, "经验总结.json")
+            with open(exp_json_path, "w", encoding="utf-8") as f:
+                json.dump([{
+                    "id": e.id,
+                    "date": e.date,
+                    "scenario": e.scenario,
+                    "prediction": e.prediction,
+                    "reality": e.reality,
+                    "error_type": e.error_type,
+                    "lesson": e.lesson,
+                    "correction_rule": e.correction_rule,
+                } for e in all_experiences], f, ensure_ascii=False, indent=2)
+
         return summary
 
     def _verify_recommendations(
@@ -649,6 +769,35 @@ class BacktestEngine:
             ))
 
         return recs
+
+    @staticmethod
+    def _extract_position_actions(report: str) -> list[dict]:
+        """从报告 JSON 中提取 position_actions（持仓决策）。
+
+        Returns:
+            [{"name": "xxx", "action": "卖出"/"持有", "reason": "...", "sell_condition": "..."}]
+        """
+        # 优先从 ```json``` 块解析
+        json_match = re.search(r'```json\s*\n(.*?)\n```', report, re.DOTALL)
+        if json_match:
+            try:
+                data = json.loads(json_match.group(1))
+                actions = data.get("position_actions", [])
+                if isinstance(actions, list):
+                    return [a for a in actions if isinstance(a, dict) and a.get("name")]
+            except json.JSONDecodeError:
+                pass
+
+        # Fallback: 裸 JSON
+        json_match = re.search(r'"position_actions"\s*:\s*\[(.*?)\]', report, re.DOTALL)
+        if json_match:
+            try:
+                actions = json.loads("[" + json_match.group(1) + "]")
+                return [a for a in actions if isinstance(a, dict) and a.get("name")]
+            except json.JSONDecodeError:
+                pass
+
+        return []
 
     def _extract_focus_stocks(self, report: str) -> list[dict]:
         """从报告中提取推荐标的（优先 JSON 结构化输出，fallback 到 Markdown 解析）"""
@@ -831,53 +980,187 @@ class BacktestEngine:
         report: str,
         recs: list[Recommendation],
         scenario,
-    ) -> Optional[Experience]:
-        """从实际交易结果中提取结构化经验（不再依赖 LLM）"""
-        # 收集亏损标的信息
-        loss_details = []
-        for r in recs:
-            if r.action == "买入" and r.pnl_pct < -2:
-                loss_details.append(
-                    "{}: 推荐买入, D+1实际{:+.2f}%{}".format(
-                        r.stock,
-                        r.next_pct_chg,
-                        "（涨停）" if r.is_limit_up else "（跌停）" if r.is_limit_down else "",
-                    )
+    ) -> list[Experience]:
+        """从实际交易结果中提取结构化经验（含成功和失败）
+
+        Returns:
+            经验列表（可能包含多条，分别对应不同标的的表现）
+        """
+        experiences = []
+        phase = scenario.sentiment_phase if hasattr(scenario, "sentiment_phase") else ""
+        phase_desc = scenario.to_description() if hasattr(scenario, "to_description") else str(scenario)
+
+        # ── 失败经验（亏损 > 2%）──
+        losses = [r for r in recs if r.action == "买入" and r.pnl_pct < -2]
+        if losses:
+            for r in losses:
+                error_type, correction = self._infer_error_and_correction(
+                    r, phase, phase_desc,
                 )
+                detail = "{}: D+1实际{:+.2f}%{}".format(
+                    r.stock, r.next_pct_chg,
+                    "（涨停）" if r.is_limit_up else "（跌停）" if r.is_limit_down else "",
+                )
+                lesson = "在[{}]场景下推荐{}，次日{:+.2f}%。{}".format(
+                    phase_desc, r.stock, r.next_pct_chg, correction,
+                )
+                experiences.append(Experience(
+                    date=day_d,
+                    scenario=scenario.to_dict(),
+                    prediction="推荐买入: {}".format(r.stock),
+                    reality=detail,
+                    scores={},
+                    error_type=error_type,
+                    lesson=lesson,
+                    correction_rule=correction,
+                ))
 
-        if not loss_details:
-            return None
-
-        # 构建教训（规则化，不需要 LLM）
-        lesson = "在{}场景下，推荐{}等标的实际亏损。市场场景: {}".format(
-            scenario.to_description(),
-            "、".join(r.stock for r in recs if r.action == "买入" and r.pnl_pct < -2),
-            scenario.to_description(),
-        )
-
-        # 分析错误类型
-        worst = min(recs, key=lambda r: r.pnl_pct) if recs else None
-        if worst:
-            if worst.is_limit_down:
-                error_type = "strategy"
-                correction = "推荐标的次日跌停时，应在前日分析中识别退潮风险，避免推荐"
-            elif worst.next_pct_chg < -5:
-                error_type = "strategy"
-                correction = "推荐标的次日大跌超5%，需加强选股过滤，避免在分歧/退潮期推荐非核心标的"
+        # ── 成功经验（盈利 > 3%）──
+        wins = [r for r in recs if r.action == "买入" and r.pnl_pct > 3]
+        for r in wins:
+            detail = "{}: D+1实际{:+.2f}%{}".format(
+                r.stock, r.next_pct_chg,
+                "（涨停）" if r.is_limit_up else "",
+            )
+            # 根据场景判断成功原因
+            if phase in ("冰点", "退潮") and r.next_pct_chg > 5:
+                success_reason = "逆势大涨，可能在冰点/退潮期选中了辨识度龙头的超跌反弹"
+                correction = "冰点/退潮期仍有结构性机会，聚焦辨识度龙头超跌反弹"
+            elif phase == "高潮" and r.is_limit_up:
+                success_reason = "高潮期涨停，可能抓住了情绪主升浪的核心标的"
+                correction = "高潮期果断上核心辨识度龙头，情绪溢价确定性高"
+            elif phase in ("升温", "修复"):
+                success_reason = "升温/修复期顺势盈利，可能抓住了情绪回暖的节奏"
+                correction = "升温/修复期积极做多，关注情绪共振方向"
             else:
-                error_type = "strategy"
-                correction = "推荐标的次日表现不佳，需结合情绪阶段严格控制仓位或放弃操作"
-        else:
-            error_type = "unknown"
-            correction = "选股失误"
+                success_reason = "选股方向正确，次日表现符合预期"
+                correction = "当前场景下选股逻辑有效，保持类似筛选标准"
 
-        return Experience(
-            date=day_d,
-            scenario=scenario.to_dict(),
-            prediction="推荐: " + "、".join(r.stock for r in recs if r.action == "买入"),
-            reality="; ".join(loss_details),
-            scores={},
-            error_type=error_type,
-            lesson=lesson,
-            correction_rule=correction,
+            lesson = "在[{}]场景下推荐{}，次日{:+.2f}%。{}".format(
+                phase_desc, r.stock, r.next_pct_chg, success_reason,
+            )
+            experiences.append(Experience(
+                date=day_d,
+                scenario=scenario.to_dict(),
+                prediction="推荐买入: {}".format(r.stock),
+                reality=detail,
+                scores={},
+                error_type="success",
+                lesson=lesson,
+                correction_rule=correction,
+            ))
+
+        return experiences
+
+    def _infer_error_and_correction(
+        self, r: Recommendation, phase: str, phase_desc: str,
+    ) -> tuple[str, str]:
+        """根据标的实际表现 + 情绪阶段推断错误类型和修正规则"""
+        # 跌停 — 最严重
+        if r.is_limit_down:
+            if phase in ("分歧", "退潮", "冰点"):
+                return (
+                    "sentiment",
+                    "{}阶段推荐标的次日跌停，在{}阶段应空仓或极致保守，禁止开新仓".format(phase, phase),
+                )
+            return (
+                "strategy",
+                "推荐标的次日跌停，选股逻辑存在重大缺陷（可能追高后排/非辨识度标的）",
+            )
+
+        # 大跌 > 5%
+        if r.next_pct_chg < -5:
+            if phase in ("分歧", "退潮"):
+                return (
+                    "sentiment",
+                    "{}阶段推荐标的次日大跌{:.1f}%，分歧/退潮期应优先防守，控制仓位或空仓".format(
+                        phase, r.next_pct_chg),
+                )
+            if phase == "高潮":
+                return (
+                    "sentiment",
+                    "高潮期次日大跌{:.1f}%，可能踩中高潮→分歧的拐点，高潮末期需警惕亏钱效应".format(
+                        r.next_pct_chg),
+                )
+            return (
+                "strategy",
+                "在[{}]场景下推荐{}次日大跌{:.1f}%，选股可能偏向非核心标的，应聚焦辨识度龙头".format(
+                    phase_desc, r.stock, r.next_pct_chg),
+            )
+
+        # 中度亏损 -2% ~ -5%
+        if phase in ("冰点", "退潮"):
+            return (
+                "sentiment",
+                "{}阶段强行操作导致亏损，冰点/退潮期应减少出手频率，等待情绪修复信号".format(phase),
+            )
+        if phase == "分歧":
+            return (
+                "sentiment",
+                "分歧期选股失误，分歧期应只做辨识度龙头的低吸，不追高不买后排",
+            )
+        return (
+            "strategy",
+            "在[{}]场景下推荐{}次日亏损{:.1f}%，选股精度不足或买入时机偏差".format(
+                phase_desc, r.stock, r.next_pct_chg),
         )
+
+    def _generate_experience_review_file(
+        self, all_experiences: list[Experience], output_dir: str,
+    ) -> str:
+        """生成经验总结 Markdown 文件供用户审阅
+
+        Returns:
+            生成的文件路径
+        """
+        if not all_experiences:
+            return ""
+
+        review_path = os.path.join(output_dir, "经验总结.md")
+        lines = [
+            "# 回测经验总结（待审阅）",
+            "",
+            "> 以下经验由回测引擎自动提取，包含成功和失败案例。",
+            "> **请审阅后决定哪些经验值得沉淀到经验库。**",
+            "",
+        ]
+
+        # 按日期分组
+        by_date: dict[str, list[Experience]] = {}
+        for exp in all_experiences:
+            by_date.setdefault(exp.date, []).append(exp)
+
+        # 统计
+        failures = [e for e in all_experiences if e.error_type != "success"]
+        successes = [e for e in all_experiences if e.error_type == "success"]
+        lines.append("## 概览")
+        lines.append("")
+        lines.append("- 提取日期数：{}".format(len(by_date)))
+        lines.append("- 失败教训：{} 条".format(len(failures)))
+        lines.append("- 成功经验：{} 条".format(len(successes)))
+        lines.append("")
+
+        # 按日期输出
+        for date in sorted(by_date.keys()):
+            exps = by_date[date]
+            lines.append("## {}".format(date))
+            lines.append("")
+
+            for i, exp in enumerate(exps, 1):
+                tag = "✅ 成功" if exp.error_type == "success" else "❌ 失败"
+                error_label = exp.error_type if exp.error_type != "success" else ""
+                lines.append("### {}. {} {} {}".format(i, exp.prediction, tag, error_label))
+                lines.append("")
+                lines.append("- **场景**: {}".format(
+                    ", ".join("{}={}".format(k, v) for k, v in exp.scenario.items() if v)
+                    if exp.scenario else "未知",
+                ))
+                lines.append("- **实际结果**: {}".format(exp.reality))
+                lines.append("- **教训**: {}".format(exp.lesson))
+                lines.append("- **修正规则**: {}".format(exp.correction_rule))
+                lines.append("")
+
+        with open(review_path, "w", encoding="utf-8") as f:
+            f.write("\n".join(lines))
+
+        return review_path
