@@ -197,3 +197,147 @@ def _result_to_dict(r) -> dict:
         ],
         "error": r.error,
     }
+
+
+def generate_settlement_report(
+    tracker,
+    output_dir: str,
+    initial_capital: float = 1_000_000.0,
+    display_capital: float = 100_000.0,
+) -> str:
+    """生成逐笔交割单 + 收益报告。
+
+    Args:
+        tracker: BacktestPortfolioTracker 实例（含 closed_trades）
+        output_dir: 输出目录
+        initial_capital: 实际回测初始资金
+        display_capital: 展示用初始资金（如10万）
+
+    Returns:
+        生成的报告文件路径
+    """
+    scale = display_capital / initial_capital
+    closed = tracker.closed_trades
+    open_positions = tracker.positions
+
+    # ── 用展示资金计算复利交割单 ──
+    equity = display_capital
+    trade_records = []
+
+    for t in closed:
+        position = equity * 0.3
+        pnl_pct = t["pnl_pct"]
+        pnl_amount = position * pnl_pct / 100
+        equity += pnl_amount
+        trade_records.append({
+            "buy_date": t["buy_date"],
+            "sell_date": t["sell_date"],
+            "name": t["name"],
+            "position": round(position),
+            "pnl_pct": pnl_pct,
+            "pnl_amount": round(pnl_amount),
+            "equity": round(equity),
+            "buy_reason": t.get("buy_reason", ""),
+            "sell_reason": t.get("reason", ""),
+            "hold_days": t.get("hold_days", 0),
+        })
+
+    # ── 生成 Markdown ──
+    lines = [
+        "# 回测交割单（{}万起步，30%仓位，复利模式）".format(int(display_capital / 10000)),
+        "",
+        "## 一、收益概况",
+        "",
+        "- 初始资金：{:,.0f}".format(display_capital),
+    ]
+
+    # 计算已平仓后资金
+    closed_equity = equity
+    closed_pnl = closed_equity - display_capital
+    closed_pnl_pct = closed_pnl / display_capital * 100
+
+    # 统计已平仓
+    wins = [t for t in trade_records if t["pnl_pct"] > 0]
+    losses = [t for t in trade_records if t["pnl_pct"] < 0]
+    win_rate = len(wins) / len(trade_records) * 100 if trade_records else 0
+    avg_win = sum(t["pnl_pct"] for t in wins) / len(wins) if wins else 0
+    avg_loss = sum(t["pnl_pct"] for t in losses) / len(losses) if losses else 0
+
+    lines.extend([
+        "- 已平仓资金：{:,.0f}".format(closed_equity),
+        "- 已平仓收益：{:>+,.0f}（{:+.2f}%）".format(closed_pnl, closed_pnl_pct),
+        "- 已平仓笔数：{}笔（{}胜{}负）".format(len(trade_records), len(wins), len(losses)),
+        "- 胜率：{:.1f}%".format(win_rate),
+        "- 平均盈利：{:+.2f}%".format(avg_win),
+        "- 平均亏损：{:+.2f}%".format(avg_loss),
+    ])
+
+    if open_positions:
+        open_value = sum(p.get("cost", 0) * scale for p in open_positions)
+        lines.extend([
+            "- 剩余持仓：{}只，市值约{:,.0f}".format(len(open_positions), open_value),
+            "- 持仓标的：{}".format("、".join(p["name"] for p in open_positions)),
+        ])
+
+    # ── 逐笔交割单 ──
+    lines.extend([
+        "",
+        "## 二、逐笔交割单",
+        "",
+        "| 编号 | 买入日→卖出日 | 股票名 | 仓位金额 | 盈亏金额(收益率) | 持仓天数 | 操作原因 |",
+        "|------|--------------|--------|---------|-----------------|---------|---------|",
+    ])
+
+    for i, t in enumerate(trade_records, 1):
+        reason = t.get("sell_reason", "") or t.get("buy_reason", "")
+        if len(reason) > 30:
+            reason = reason[:30] + "..."
+        lines.append("| {} | {}→{} | {} | {:,} | {:+,}({:+.2f}%) | {}天 | {} |".format(
+            i, t["buy_date"], t["sell_date"], t["name"],
+            t["position"],
+            t["pnl_amount"], t["pnl_pct"],
+            t.get("hold_days", 0),
+            reason,
+        ))
+
+    # 未平仓
+    if open_positions:
+        lines.extend([
+            "",
+            "### 未平仓持仓",
+            "",
+        ])
+        for p in open_positions:
+            pos_amount = equity * 0.3
+            lines.append("- {} | 买入日:{} | 仓位:{:,} | 原因:{}".format(
+                p["name"], p["buy_date"], round(pos_amount),
+                p.get("buy_reason", ""),
+            ))
+
+    # 保存文件
+    report_path = os.path.join(output_dir, "交割单.md")
+    with open(report_path, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines))
+
+    # 同时保存 JSON
+    json_path = os.path.join(output_dir, "交割单.json")
+    with open(json_path, "w", encoding="utf-8") as f:
+        json.dump({
+            "initial_capital": display_capital,
+            "closed_equity": round(closed_equity),
+            "closed_pnl_pct": round(closed_pnl_pct, 2),
+            "closed_pnl_amount": round(closed_pnl),
+            "win_rate": round(win_rate, 1),
+            "total_trades": len(trade_records),
+            "wins": len(wins),
+            "losses": len(losses),
+            "avg_win_pct": round(avg_win, 2),
+            "avg_loss_pct": round(avg_loss, 2),
+            "open_positions": len(open_positions),
+            "trades": trade_records,
+        }, f, ensure_ascii=False, indent=2)
+
+    print("交割单已保存到 {}（{}笔已平仓，{}笔持有中）".format(
+        report_path, len(trade_records), len(open_positions)))
+
+    return report_path

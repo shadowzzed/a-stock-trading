@@ -71,7 +71,8 @@ class BacktestPortfolioTracker:
     def __init__(self, initial_capital: float = 1_000_000.0):
         self.initial_capital = initial_capital
         self.cash = initial_capital
-        self.positions: list[dict] = []  # [{name, code, buy_date, buy_price, shares, cost, sell_condition}]
+        self.positions: list[dict] = []  # [{name, code, buy_date, buy_price, shares, cost, sell_condition, buy_reason}]
+        self.closed_trades: list[dict] = []  # 已平仓交易记录
 
     @property
     def total_value(self) -> float:
@@ -141,21 +142,44 @@ class BacktestPortfolioTracker:
                     sell_price = daily["open"]
                     proceeds = p["shares"] * sell_price
                     pnl_pct = (sell_price - p["buy_price"]) / p["buy_price"] * 100
+                    pnl_amount = proceeds - p["cost"]
                     self.cash += proceeds
-                    sold_records.append({
+                    trade = {
                         "name": p["name"],
+                        "code": p.get("code", ""),
+                        "buy_date": p["buy_date"],
+                        "buy_price": round(p["buy_price"], 2),
+                        "shares": p["shares"],
+                        "cost": round(p["cost"], 2),
+                        "sell_date": sell_date,
                         "sell_price": round(sell_price, 2),
                         "pnl_pct": round(pnl_pct, 2),
+                        "pnl_amount": round(pnl_amount, 2),
+                        "hold_days": hold_days,
                         "reason": sell_reason,
-                    })
+                        "buy_reason": p.get("buy_reason", ""),
+                    }
+                    sold_records.append(trade)
+                    self.closed_trades.append(trade)
                 else:
                     self.cash += p["cost"]
-                    sold_records.append({
+                    trade = {
                         "name": p["name"],
+                        "code": p.get("code", ""),
+                        "buy_date": p["buy_date"],
+                        "buy_price": round(p["buy_price"], 2),
+                        "shares": p["shares"],
+                        "cost": round(p["cost"], 2),
+                        "sell_date": sell_date,
                         "sell_price": p["buy_price"],
                         "pnl_pct": 0,
+                        "pnl_amount": 0,
+                        "hold_days": hold_days,
                         "reason": sell_reason + "（无行情，按成本价）",
-                    })
+                        "buy_reason": p.get("buy_reason", ""),
+                    }
+                    sold_records.append(trade)
+                    self.closed_trades.append(trade)
             else:
                 remaining.append(p)
 
@@ -210,6 +234,7 @@ class BacktestPortfolioTracker:
                 "shares": shares,
                 "cost": cost,
                 "sell_condition": "",
+                "buy_reason": getattr(rec, 'buy_condition', '') or getattr(rec, 'reason', ''),
             })
 
     def get_state(self, current_date: str, data_dir: str) -> dict:
@@ -531,6 +556,14 @@ class BacktestEngine:
 
         # ── 生成汇总报告 ──
         summary = generate_summary(results, output_dir, exp_store)
+
+        # ── 生成交割单 ──
+        from .report import generate_settlement_report
+        generate_settlement_report(
+            tracker=portfolio,
+            output_dir=output_dir,
+            initial_capital=portfolio.initial_capital,
+        )
 
         # ── 生成经验总结审阅文件 ──
         if all_experiences:
