@@ -270,7 +270,16 @@ def synthesize(state: TradingState) -> dict:
     try:
         llm = _get_llm()
         response = llm.invoke(messages_for_llm)
-        reply = response.content or "（综合分析未生成有效结果）"
+        content = response.content if response else ""
+        # Anthropic 协议兼容：content 可能是列表
+        if isinstance(content, list):
+            text_parts = [
+                block.text if hasattr(block, "text") else str(block)
+                for block in content
+                if hasattr(block, "text") or isinstance(block, str)
+            ]
+            content = "\n".join(text_parts) if text_parts else ""
+        reply = content or "（综合分析未生成有效结果）"
     except Exception as e:
         logger.error("综合分析异常: %s", e, exc_info=True)
         # fallback：拼接各分析师结果
@@ -403,6 +412,7 @@ def _ensure_initialized():
             anthropic_api_url=primary["base"],
             anthropic_api_key=primary["key"],
             temperature=0.3,
+            max_tokens=4096,
         )
     else:
         _llm = ChatOpenAI(
@@ -410,6 +420,7 @@ def _ensure_initialized():
             base_url=primary["base"],
             api_key=primary["key"],
             temperature=0.3,
+            request_timeout=60,
         )
 
     if len(providers) > 1:
@@ -422,6 +433,8 @@ def _ensure_initialized():
                     anthropic_api_url=p["base"],
                     anthropic_api_key=p["key"],
                     temperature=0.3,
+                    timeout=60,
+                    max_tokens=4096,
                 ))
             else:
                 fb_list.append(ChatOpenAI(
@@ -429,6 +442,7 @@ def _ensure_initialized():
                     base_url=p["base"],
                     api_key=p["key"],
                     temperature=0.3,
+                    request_timeout=60,
                 ))
         _llm = _llm.with_fallbacks(fb_list)
 

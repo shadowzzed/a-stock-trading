@@ -81,6 +81,7 @@ class BacktestEngine:
         dates: list[str],
         output_dir: Optional[str] = None,
         on_progress=None,
+        workers: int = 1,
     ) -> dict:
         """运行收益率驱动的回测
 
@@ -89,6 +90,7 @@ class BacktestEngine:
             dates: 已排序的交易日列表
             output_dir: 输出目录
             on_progress: 进度回调 fn(idx, total, date, stage)
+            workers: 并行 worker 数（加速 LLM 调用）
         """
         if not output_dir:
             output_dir = os.path.join(data_dir, "backtest_v6")
@@ -101,6 +103,14 @@ class BacktestEngine:
 
         results: list[BacktestResult] = []
         pairs = [(dates[i], dates[i + 1]) for i in range(len(dates) - 1)]
+
+        # ── 并行模式：先并行跑所有 agent 调用，再顺序验证 ──
+        if workers > 1:
+            return self._run_parallel(
+                data_dir, output_dir, pairs, results,
+                exp_store, prompt_engine, classifier, workers,
+            )
+
         prev_report = ""
 
         for idx, (day_d, day_d1) in enumerate(pairs):
@@ -304,6 +314,145 @@ class BacktestEngine:
             time.sleep(1)
 
         # ── 生成汇总报告 ──
+        summary = generate_summary(results, output_dir, exp_store)
+        return summary
+
+    def _run_parallel(
+        self,
+        data_dir: str,
+        output_dir: str,
+        pairs: list[tuple[str, str]],
+        results: list,
+        exp_store,
+        prompt_engine,
+        classifier,
+        workers: int,
+    ) -> dict:
+        """并行模式：先并行生成所有报告，再顺序验证+经验提取"""
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+
+        print("\n[并行模式] {} workers, {} 天待处理".format(workers, len(pairs)))
+
+        # Phase 1: 并行生成报告（LLM 调用）
+        def generate_report(idx_pair):
+            idx, (day_d, day_d1) = idx_pair
+            report_path = os.path.join(output_dir, "{}_report.md".format(day_d))
+            if os.path.exists(report_path):
+                with open(report_path, "r", encoding="utf-8") as f:
+                    report = f.read()
+                return idx, day_d, day_d1, report, True  # skipped
+            try:
+                report = self.agent_runner.run(
+                    data_dir=data_dir,
+                    date=day_d,
+                    config={"backtest_mode": True},
+                    prev_report="",
+                )
+                with open(report_path, "w", encoding="utf-8") as f:
+                    f.write(report)
+                return idx, day_d, day_d1, report, False
+            except Exception as e:
+                print("  [失败] {}: {}".format(day_d, e))
+                return idx, day_d, day_d1, "", False
+
+        print("[Phase 1] 并行生成报告...")
+        reports = {}
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            futures = {pool.submit(generate_report, (i, p)): i for i, p in enumerate(pairs)}
+            for future in as_completed(futures):
+                idx, day_d, day_d1, report, skipped = future.result()
+                reports[idx] = (day_d, day_d1, report, skipped)
+                status = "跳过" if skipped else ("完成" if report else "失败")
+                print("  [{}/{}] {} {}".format(
+                    len(reports), len(pairs), day_d, status))
+
+        # Phase 2: 顺序验证 + 经验提取
+        print("\n[Phase 2] 顺序验证 + 经验提取...")
+        for idx in sorted(reports.keys()):
+            day_d, day_d1, report, skipped = reports[idx]
+            if not report:
+                continue
+
+            result = BacktestResult(day_d=day_d, day_d1=day_d1)
+
+            # 场景分类
+            try:
+                market_data = self.data_provider.load_market_data(data_dir, day_d)
+                scenario = classifier.classify(
+                    limit_up_count=market_data.limit_up_count,
+                    limit_down_count=market_data.limit_down_count,
+                    blown_rate=market_data.blown_rate,
+                    max_board=market_data.max_board,
+                    sector_top1_count=market_data.sector_top1_count,
+                    sector_top1_total=market_data.sector_top1_total,
+                    prev_limit_up_count=market_data.prev_limit_up_count,
+                    sentiment_phase=market_data.sentiment_phase,
+                    volume_change_pct=market_data.volume_change_pct,
+                )
+                result.scenario = scenario.to_dict()
+            except Exception:
+                pass
+
+            # 验证推荐
+            try:
+                recs = self._verify_recommendations(data_dir, day_d1, report)
+            except Exception as e:
+                print("  [验证错误] {}: {}".format(day_d, e))
+                recs = []
+            result.recommendations = recs
+
+            if recs:
+                valid_recs = [r for r in recs if r.action == "买入" and (r.next_pct_chg != 0 or r.pnl_pct != 0)]
+                if valid_recs:
+                    pnl_list = [r.pnl_pct for r in valid_recs]
+                    result.avg_pnl_pct = round(sum(pnl_list) / len(pnl_list), 2)
+                    result.hit_rate = round(
+                        sum(1 for p in pnl_list if p > 0) / len(pnl_list) * 100, 1)
+                    print("  [验证] {} 只有效标的, 命中率 {:.0f}%, 均收益 {:+.2f}%".format(
+                        len(valid_recs), result.hit_rate, result.avg_pnl_pct))
+
+            # 保存验证结果
+            verify_path = os.path.join(output_dir, "{}_verify.json".format(day_d))
+            verify_data = {
+                "day_d": day_d, "day_d1": day_d1,
+                "recommendations": [
+                    {"stock": r.stock, "action": r.action, "buy_condition": r.buy_condition,
+                     "position": r.position, "next_pct_chg": r.next_pct_chg, "pnl_pct": r.pnl_pct,
+                     "is_limit_up": r.is_limit_up, "is_limit_down": r.is_limit_down}
+                    for r in recs
+                ],
+                "avg_pnl_pct": result.avg_pnl_pct, "hit_rate": result.hit_rate,
+            }
+            with open(verify_path, "w", encoding="utf-8") as f:
+                json.dump(verify_data, f, ensure_ascii=False, indent=2)
+
+            # 经验提取
+            extract_path = os.path.join(output_dir, "{}_experience.json".format(day_d))
+            if not os.path.exists(extract_path) and recs:
+                losses = [r for r in recs if r.action == "买入" and r.pnl_pct < -2]
+                if losses:
+                    try:
+                        experience = self._extract_experience_from_outcome(
+                            day_d=day_d, day_d1=day_d1, report=report,
+                            recs=recs, scenario=scenario,
+                        )
+                        if experience:
+                            exp_store.add(experience)
+                            with open(extract_path, "w", encoding="utf-8") as f:
+                                json.dump({
+                                    "experience_id": experience.id,
+                                    "scenario": experience.scenario,
+                                    "lesson": experience.lesson,
+                                    "correction_rule": experience.correction_rule,
+                                    "error_type": experience.error_type,
+                                }, f, ensure_ascii=False, indent=2)
+                    except Exception as e:
+                        print("  [经验提取失败] {}".format(e))
+
+            result.status = "completed"
+            results.append(result)
+
+        # 生成汇总
         summary = generate_summary(results, output_dir, exp_store)
         return summary
 

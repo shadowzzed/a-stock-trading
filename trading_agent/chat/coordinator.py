@@ -230,7 +230,7 @@ class CoordinatorAgent(BaseAgent):
         messages.append(HumanMessage(content=user_message))
 
         response = None
-        for round_idx in range(3):
+        for round_idx in range(5):
             response = llm_with_tools.invoke(messages)
 
             if not response.tool_calls:
@@ -263,8 +263,17 @@ class CoordinatorAgent(BaseAgent):
                             )
                         )
 
+        # 提取文本内容（Anthropic 协议兼容）
         if response and response.content:
-            return response.content
+            content = response.content
+            if isinstance(content, list):
+                text_parts = [
+                    block.text if hasattr(block, "text") else str(block)
+                    for block in content
+                    if hasattr(block, "text") or isinstance(block, str)
+                ]
+                return "\n".join(text_parts) if text_parts else "（无法获取有效回复）"
+            return content
         return "（无法获取有效回复）"
 
     def _synthesize(

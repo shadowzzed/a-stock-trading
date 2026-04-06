@@ -41,6 +41,8 @@ def main():
                         help="模拟初始资金（默认100万）")
     parser.add_argument("--simple-pnl", action="store_true",
                         help="简化盈亏模式：提到即买入（D+1开盘买，D+2开盘卖），纯测选股")
+    parser.add_argument("--workers", type=int, default=1,
+                        help="并行 worker 数（加速 LLM 调用，默认1=顺序）")
     args = parser.parse_args()
 
     data_provider = ReviewDataProvider()
@@ -78,6 +80,7 @@ def main():
         data_dir=args.data_dir,
         dates=dates,
         output_dir=output_dir,
+        workers=args.workers,
     )
 
     # ── 回测后追加交易模拟 ──

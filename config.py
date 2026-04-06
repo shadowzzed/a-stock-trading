@@ -155,9 +155,10 @@ def init_data_dirs():
 
 
 def get_ai_providers():
-    """返回 AI 提供商列表（按优先级：GLM > Grok > DeepSeek）"""
+    """返回 AI 提供商列表（按优先级：GLM > DeepSeek > Grok）"""
     cfg = get_config()
     providers = []
+    # GLM 为回测主力（响应快 4-5s，稳定）
     if cfg["glm_api_key"]:
         providers.append({
             "name": "GLM",
@@ -166,14 +167,6 @@ def get_ai_providers():
             "key": cfg["glm_api_key"],
             "model": cfg["glm_model"],
         })
-    if cfg["grok_api_key"]:
-        providers.append({
-            "name": "Grok",
-            "protocol": "openai",
-            "base": cfg["grok_api_base"],
-            "key": cfg["grok_api_key"],
-            "model": cfg["grok_model"],
-        })
     if cfg["ai_api_key"]:
         providers.append({
             "name": "DeepSeek",
@@ -181,6 +174,14 @@ def get_ai_providers():
             "base": cfg["ai_api_base"],
             "key": cfg["ai_api_key"],
             "model": cfg["ai_model"],
+        })
+    if cfg["grok_api_key"]:
+        providers.append({
+            "name": "Grok",
+            "protocol": "openai",
+            "base": cfg["grok_api_base"],
+            "key": cfg["grok_api_key"],
+            "model": cfg["grok_model"],
         })
     return providers
 

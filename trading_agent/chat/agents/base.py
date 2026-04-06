@@ -72,29 +72,15 @@ class BaseAgent:
         self.cache = cache
         self.backtest_max_date = backtest_max_date
 
-        # LLM（复用同一套 provider 配置）
+        # LLM（复用同一套 provider 配置，根据 protocol 选择实现类）
         providers = get_ai_providers()
         if not providers:
             raise ValueError("未配置 AI 提供商")
 
-        primary = providers[0]
-        self.llm = ChatOpenAI(
-            model=primary["model"],
-            base_url=primary["base"],
-            api_key=primary["key"],
-            temperature=0.3,
-        )
+        self.llm = self._create_llm(providers[0])
 
         if len(providers) > 1:
-            fallbacks = [
-                ChatOpenAI(
-                    model=p["model"],
-                    base_url=p["base"],
-                    api_key=p["key"],
-                    temperature=0.3,
-                )
-                for p in providers[1:]
-            ]
+            fallbacks = [self._create_llm(p) for p in providers[1:]]
             self.llm = self.llm.with_fallbacks(fallbacks)
 
         # 工具
@@ -114,6 +100,28 @@ class BaseAgent:
 
         # 系统提示词
         self.system_prompt = self._load_prompt()
+
+    @staticmethod
+    def _create_llm(provider: dict):
+        """根据 provider 的 protocol 创建对应的 LLM 实例"""
+        if provider.get("protocol") == "anthropic":
+            from langchain_anthropic import ChatAnthropic
+            return ChatAnthropic(
+                model=provider["model"],
+                anthropic_api_url=provider["base"],
+                anthropic_api_key=provider["key"],
+                temperature=0.3,
+                timeout=180,
+                max_tokens=4096,
+            )
+        else:
+            return ChatOpenAI(
+                model=provider["model"],
+                base_url=provider["base"],
+                api_key=provider["key"],
+                temperature=0.3,
+                request_timeout=180,
+            )
 
     def _load_prompt(self) -> str:
         if not self.prompt_file:
@@ -141,9 +149,9 @@ class BaseAgent:
 
         messages.append(HumanMessage(content=user_content))
 
-        # Tool-calling loop (max 3 rounds)
+        # Tool-calling loop (max 5 rounds — GLM 每轮调 2-4 个工具)
         response = None
-        for round_idx in range(3):
+        for round_idx in range(5):
             response = llm_with_tools.invoke(messages)
 
             if not response.tool_calls:
@@ -178,6 +186,16 @@ class BaseAgent:
                             )
                         )
 
+        # 提取文本内容（Anthropic 协议下 response.content 可能是列表）
         if response and response.content:
-            return response.content
+            content = response.content
+            if isinstance(content, list):
+                # Anthropic 格式: [TextBlock(...), ToolUseBlock(...)]
+                text_parts = [
+                    block.text if hasattr(block, "text") else str(block)
+                    for block in content
+                    if hasattr(block, "text") or isinstance(block, str)
+                ]
+                return "\n".join(text_parts) if text_parts else "（分析未生成有效文本）"
+            return content
         return "（分析未生成有效结果）"
