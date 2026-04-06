@@ -62,6 +62,7 @@ class AgentRunner(Protocol):
         date: str,
         config: Optional[dict] = None,
         prev_report: str = "",
+        portfolio_state: Optional[dict] = None,
     ) -> str:
         """运行 Agent 分析，返回报告文本"""
         ...

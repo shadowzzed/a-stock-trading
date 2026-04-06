@@ -85,11 +85,11 @@ class BaseAgent:
 
         # 工具
         today = datetime.now().strftime("%Y-%m-%d")
-        factory = RetrievalToolFactory(
+        self.tool_factory = RetrievalToolFactory(
             data_dir, today, memory_dir,
             backtest_max_date=self.backtest_max_date,
         )
-        all_tools = factory.create_tools()
+        all_tools = self.tool_factory.create_tools()
 
         if self.tools_filter:
             self.tools = [t for t in all_tools if t.name in self.tools_filter]
@@ -100,6 +100,14 @@ class BaseAgent:
 
         # 系统提示词
         self.system_prompt = self._load_prompt()
+        if self.backtest_max_date:
+            self.system_prompt += (
+                f"\n\n## 回测模式约束\n"
+                f"当前处于回测模式，模拟日期为 {self.backtest_max_date}。\n"
+                f"你只能使用 {self.backtest_max_date} 及之前的数据进行分析。\n"
+                f"所有工具调用中的日期参数不得超过 {self.backtest_max_date}。\n"
+                f"不要尝试获取该日期之后的任何信息。"
+            )
 
     @staticmethod
     def _create_llm(provider: dict):

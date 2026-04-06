@@ -56,6 +56,113 @@ class BacktestResult:
     error: str = ""
 
 
+class BacktestPortfolioTracker:
+    """回测持仓追踪器 — 跟踪 Agent 推荐标的的模拟持仓状态。
+
+    规则：
+    - Agent 在 Day D 推荐买入的标的，假定在 Day D+1 开盘价买入
+    - 持仓持有 1 天（T+1），在 Day D+2 开盘价卖出
+    - 每只标的固定 3 成仓位
+    - 追踪器在每日回测循环中维护，把状态传给 Agent
+    """
+
+    def __init__(self, initial_capital: float = 1_000_000.0):
+        self.initial_capital = initial_capital
+        self.cash = initial_capital
+        self.positions: list[dict] = []  # [{name, code, buy_date, buy_price, shares, cost}]
+
+    @property
+    def total_value(self) -> float:
+        return self.cash + sum(p["cost"] for p in self.positions)
+
+    def sell_all(self, sell_date: str, data_dir: str):
+        """在 sell_date 开盘价卖出所有可卖持仓（买入日 < sell_date 的持仓）。"""
+        from ..adapter import CSVStockDataProvider
+        loader = CSVStockDataProvider()
+        remaining = []
+        for p in self.positions:
+            if p["buy_date"] >= sell_date:
+                remaining.append(p)
+                continue
+            daily = loader.load_stock_daily(data_dir, sell_date, p["name"])
+            if daily and daily.get("open", 0) > 0:
+                sell_price = daily["open"]
+                proceeds = p["shares"] * sell_price
+                self.cash += proceeds
+            else:
+                # 无行情数据，按成本价返还
+                self.cash += p["cost"]
+        self.positions = remaining
+
+    def buy_from_recommendations(
+        self, recs: list, buy_date: str, data_dir: str,
+    ):
+        """根据推荐标的在 buy_date 开盘价买入。"""
+        from ..adapter import CSVStockDataProvider
+        loader = CSVStockDataProvider()
+
+        buy_recs = [r for r in recs if r.action == "买入" and r.next_open > 0]
+        if not buy_recs:
+            return
+
+        position_pct = 0.3  # 固定 3 成
+        for rec in buy_recs:
+            # 跳过已持仓标的
+            if any(p["name"] == rec.stock for p in self.positions):
+                continue
+            target_amount = self.total_value * position_pct
+            available = self.cash
+            amount = min(target_amount, available)
+            if amount < 1000:
+                continue
+
+            buy_price = rec.next_open
+            shares = int(amount / (buy_price * 100)) * 100
+            if shares <= 0:
+                continue
+
+            cost = shares * buy_price
+            self.cash -= cost
+            self.positions.append({
+                "name": rec.stock,
+                "code": "",
+                "buy_date": buy_date,
+                "buy_price": buy_price,
+                "shares": shares,
+                "cost": cost,
+            })
+
+    def get_state(self, current_date: str, data_dir: str) -> dict:
+        """生成当前持仓状态快照，供传递给 Agent。"""
+        from ..adapter import CSVStockDataProvider
+        loader = CSVStockDataProvider()
+
+        positions_info = []
+        for p in self.positions:
+            # 尝试获取当日收盘价作为"当前价"
+            daily = loader.load_stock_daily(data_dir, current_date, p["name"])
+            current_price = daily["close"] if daily and daily.get("close", 0) > 0 else p["buy_price"]
+            pnl_pct = (current_price - p["buy_price"]) / p["buy_price"] * 100
+
+            positions_info.append({
+                "name": p["name"],
+                "code": p.get("code", ""),
+                "shares": p["shares"],
+                "buy_price": p["buy_price"],
+                "current_price": round(current_price, 2),
+                "pnl_pct": round(pnl_pct, 2),
+                "buy_date": p["buy_date"],
+            })
+
+        total = self.total_value
+        return {
+            "total_value": round(total, 2),
+            "cash": round(self.cash, 2),
+            "cash_pct": round(self.cash / total * 100, 1) if total > 0 else 100,
+            "positions": positions_info,
+        }
+
+
 class BacktestEngine:
     """收益率驱动的回测引擎
 
@@ -112,6 +219,7 @@ class BacktestEngine:
             )
 
         prev_report = ""
+        portfolio = BacktestPortfolioTracker()
 
         for idx, (day_d, day_d1) in enumerate(pairs):
             if on_progress:
@@ -185,7 +293,17 @@ class BacktestEngine:
 
             result.injected_lessons = len(injected_ids)
 
-            # ── Step 2: 用 Day D 跑 Agent（带教训注入）──
+            # ── Step 1.5: 卖出前日持仓（T+1，用 Day D 开盘价）──
+            portfolio.sell_all(day_d, data_dir)
+            portfolio_state = portfolio.get_state(day_d, data_dir)
+            if portfolio.positions:
+                print("  [持仓] {} 只持仓, 现金 {:.0f} ({:.0f}%)".format(
+                    len(portfolio.positions), portfolio_state["cash"],
+                    portfolio_state["cash_pct"]))
+            else:
+                print("  [持仓] 空仓, 总资产 {:.0f}".format(portfolio_state["total_value"]))
+
+            # ── Step 2: 用 Day D 跑 Agent（带教训注入 + 持仓状态）──
             if on_progress:
                 on_progress(idx + 1, len(pairs), day_d, "analyzing")
 
@@ -201,6 +319,7 @@ class BacktestEngine:
                         date=day_d,
                         config=run_config,
                         prev_report=prev_report,
+                        portfolio_state=portfolio_state,
                     )
                     with open(report_path, "w", encoding="utf-8") as f:
                         f.write(report)
@@ -253,7 +372,15 @@ class BacktestEngine:
             else:
                 print("  [验证] 未发现推荐标的")
 
+            # ── Step 4.5: 模拟 Day D+1 买入（更新持仓追踪）──
+            if recs:
+                portfolio.buy_from_recommendations(recs, day_d1, data_dir)
+                bought = [p["name"] for p in portfolio.positions if p["buy_date"] == day_d1]
+                if bought:
+                    print("  [模拟买入] {}".format(", ".join(bought)))
+
             # 保存验证结果
+            audit = getattr(self.agent_runner, '_last_audit', None)
             verify_path = os.path.join(output_dir, "{}_verify.json".format(day_d))
             verify_data = {
                 "day_d": day_d,
@@ -273,6 +400,11 @@ class BacktestEngine:
                 ],
                 "avg_pnl_pct": result.avg_pnl_pct,
                 "hit_rate": result.hit_rate,
+                "data_leak_audit": {
+                    "clean": audit["clean"] if audit else True,
+                    "blocked_count": audit["blocked_count"] if audit else 0,
+                    "blocked_details": audit["blocked_details"] if audit else [],
+                },
             }
             with open(verify_path, "w", encoding="utf-8") as f:
                 json.dump(verify_data, f, ensure_ascii=False, indent=2)
@@ -524,7 +656,7 @@ class BacktestEngine:
         seen_names: set[str] = set()
 
         # ── Priority: JSON structured output ──
-        # Method 1: JSON ```json``` block with focus_stocks
+        # Method 1: JSON ```json``` block with focus_stocks（闭合的代码块）
         json_match = re.search(r'```json\s*\n(.*?)\n```', report, re.DOTALL)
         if json_match:
             try:
@@ -533,10 +665,18 @@ class BacktestEngine:
                 if stocks:
                     valid = [s for s in stocks if isinstance(s, dict) and s.get("name") and len(s["name"]) >= 2]
                     if valid:
-                        # JSON 模式下直接带完整信息，不再需要 _extract_buy_plans
                         return valid
             except json.JSONDecodeError:
                 pass
+
+        # Method 1.5: 不闭合的 JSON 代码块（LLM 输出被截断，如 max_tokens 不够）
+        # 从 ```json 开始提取，尝试逐字符找到有效 JSON
+        json_start = re.search(r'```json\s*\n', report)
+        if json_start and not json_match:
+            json_text = report[json_start.end():]
+            valid = self._try_parse_truncated_json(json_text)
+            if valid:
+                return valid
 
         # Method 2: Bare JSON "focus_stocks": [...]
         json_match = re.search(r'"focus_stocks"\s*:\s*\[(.*?)\]', report)
@@ -611,6 +751,33 @@ class BacktestEngine:
                     stocks_found.append({"name": name, "code": code})
 
         return stocks_found
+
+    def _try_parse_truncated_json(self, json_text: str) -> list[dict]:
+        """尝试从被截断的 JSON 文本中提取 focus_stocks。
+
+        策略：从文本中逐个提取完整的 {"name": ..., "code": ...} 对象，
+        不依赖整体 JSON 合法性。
+        """
+        # 尝试找到 focus_stocks 数组中的每个完整对象
+        # 匹配 {"name": "股票名", "code": "代码", ...} 格式
+        stock_objects = re.findall(
+            r'\{\s*"name"\s*:\s*"([^"]+)"\s*,\s*"code"\s*:\s*"(\d{6})"',
+            json_text,
+        )
+        if not stock_objects:
+            # 尝试宽松匹配：name 在前或 code 在前
+            stock_objects = re.findall(
+                r'\{[^{}]*?"name"\s*:\s*"([^"]+)"[^{}]*?"code"\s*:\s*"(\d{6})"[^{}]*?\}',
+                json_text,
+            )
+
+        valid = []
+        for name, code in stock_objects:
+            name = name.strip()
+            if len(name) >= 2 and re.match(r'^[\u4e00-\u9fa5A-Za-z]{2,8}$', name):
+                valid.append({"name": name, "code": code})
+
+        return valid
 
     def _extract_buy_plans(self, report: str) -> dict[str, dict]:
         """从"买入计划"章节提取各标的的详细操作信息"""

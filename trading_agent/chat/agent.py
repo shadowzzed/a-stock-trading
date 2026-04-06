@@ -46,3 +46,28 @@ class TradingChatAgent:
             Agent 回复文本
         """
         return self.coordinator.chat(user_message, history=history)
+
+    def get_audit_summary(self) -> dict:
+        """汇总所有 Agent（含 Sub-Agent）的工具调用审计。"""
+        summaries = {}
+        all_agents = [self.coordinator] + list(
+            self.coordinator._agent_map.values()
+        )
+        total_blocked = 0
+        total_checks = 0
+        all_blocked_details = []
+
+        for agent in all_agents:
+            s = agent.tool_factory.get_audit_summary()
+            summaries[agent.name] = s
+            total_blocked += s["blocked_count"]
+            total_checks += s["total_date_checks"]
+            all_blocked_details.extend(s["blocked_details"])
+
+        return {
+            "total_date_checks": total_checks,
+            "blocked_count": total_blocked,
+            "blocked_details": all_blocked_details,
+            "clean": total_blocked == 0,
+            "per_agent": summaries,
+        }

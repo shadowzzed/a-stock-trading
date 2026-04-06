@@ -63,6 +63,10 @@ def generate_summary(
             "results": [_result_to_dict(r) for r in results],
         }
 
+    # 汇总数据泄露审计
+    leak_audit = _aggregate_leak_audit(output_dir)
+    summary["data_leak_audit"] = leak_audit
+
     # 保存 JSON
     summary_path = os.path.join(output_dir, "summary_v6.json")
     with open(summary_path, "w", encoding="utf-8") as f:
@@ -106,6 +110,18 @@ def format_report(summary: dict, exp_store=None) -> str:
             "- 平均置信度：{}".format(ess.get("avg_confidence", 0)),
         ])
 
+    # 数据泄露审计
+    leak = summary.get("data_leak_audit", {})
+    if leak.get("clean", True):
+        lines.extend(["", "## 数据泄露审计", "", "✅ 回测期间无越界数据访问，结果可信。"])
+    else:
+        lines.extend([
+            "", "## 数据泄露审计",
+            "", "⚠️ 回测期间检测到 {} 次越界数据访问（已被拦截）：".format(leak["total_blocked"]),
+        ])
+        for v in leak.get("violated_days", []):
+            lines.append("- {} — {} 次拦截".format(v["date"], v["blocked_count"]))
+
     # 逐日统计
     lines.extend([
         "",
@@ -126,6 +142,35 @@ def format_report(summary: dict, exp_store=None) -> str:
         ))
 
     return "\n".join(lines)
+
+
+def _aggregate_leak_audit(output_dir: str) -> dict:
+    """从各日 verify.json 汇总数据泄露审计结果。"""
+    import glob
+    total_blocked = 0
+    violated_days = []
+
+    for vf in sorted(glob.glob(os.path.join(output_dir, "*_verify.json"))):
+        try:
+            with open(vf, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            audit = data.get("data_leak_audit", {})
+            blocked = audit.get("blocked_count", 0)
+            if blocked > 0:
+                total_blocked += blocked
+                violated_days.append({
+                    "date": data.get("day_d", ""),
+                    "blocked_count": blocked,
+                    "details": audit.get("blocked_details", []),
+                })
+        except (json.JSONDecodeError, IOError):
+            continue
+
+    return {
+        "clean": total_blocked == 0,
+        "total_blocked": total_blocked,
+        "violated_days": violated_days,
+    }
 
 
 def _result_to_dict(r) -> dict:

@@ -120,8 +120,13 @@ def load_daily_data(data_dir: str, date: str, history_days: int = 7,
     )
 
 
-def _load_history(data_dir: str, current_date: str, days: int = 5) -> list:
-    """加载前 N 个交易日的涨跌停概要数据（含板块分布、连板梯队、龙头信息）"""
+def _load_history(data_dir: str, current_date: str, days: int = 5,
+                  backtest_mode: bool = False) -> list:
+    """加载前 N 个交易日的涨跌停概要数据（含板块分布、连板梯队、龙头信息）
+
+    Args:
+        backtest_mode: 回测模式下跳过网络 API fallback，保证数据一致性
+    """
     history = []
     daily_root = os.path.join(data_dir, "daily")
     if not os.path.isdir(daily_root):
@@ -1502,7 +1507,7 @@ def load_stock_daily_ohlcv_by_code(
     date: str,
     stock_code: str,
 ) -> Optional[dict]:
-    """按股票代码加载日线 OHLCV 数据（CSV 优先，mootdx fallback）。
+    """按股票代码加载日线 OHLCV 数据（CSV 优先，intraday.db fallback，mootdx fallback）。
 
     Args:
         data_dir: trading 数据根目录
@@ -1517,7 +1522,12 @@ def load_stock_daily_ohlcv_by_code(
     if result:
         return result
 
-    # Step 2: mootdx fallback（直接用代码查询，无需名称映射）
+    # Step 2: intraday.db fallback（全市场快照，可靠的历史数据源）
+    result = _load_stock_from_intraday_db_by_code(data_dir, date, stock_code)
+    if result:
+        return result
+
+    # Step 3: mootdx fallback（直接用代码查询，无需名称映射）
     return _load_stock_from_mootdx_by_code(data_dir, date, stock_code)
 
 
@@ -1725,6 +1735,62 @@ def _load_stock_from_intraday_db(
         }
     except Exception as e:
         logger.debug("[intraday_db] fallback 失败 %s %s: %s", date, stock_name, e)
+
+    return None
+
+
+def _load_stock_from_intraday_db_by_code(
+    data_dir: str, date: str, stock_code: str,
+) -> Optional[dict]:
+    """从 intraday.db snapshots 表按代码加载日线数据（全市场覆盖）"""
+    normalized = stock_code.strip()
+    if "." in normalized:
+        normalized = normalized.split(".", 1)[1]
+
+    db_path = _get_db_path(data_dir)
+    if not os.path.exists(db_path):
+        return None
+
+    try:
+        conn = sqlite3.connect(db_path)
+        row = conn.execute(
+            "SELECT name, open, high, low, price, last_close, pctChg, volume, amount "
+            "FROM snapshots WHERE code = ? AND date = ? ORDER BY ts DESC LIMIT 1",
+            (normalized, date),
+        ).fetchone()
+        conn.close()
+
+        if not row:
+            return None
+
+        name, open_price, high, low, close, last_close, pct_chg, volume, amount = row
+
+        def _safe_float(v, default=0.0):
+            try:
+                return float(v) if v is not None else default
+            except (TypeError, ValueError):
+                return default
+
+        open_price = _safe_float(open_price)
+        if open_price <= 0:
+            return None
+
+        return {
+            "date": date,
+            "code": normalized,
+            "name": name or "",
+            "open": open_price,
+            "high": _safe_float(high, open_price),
+            "low": _safe_float(low, open_price),
+            "close": _safe_float(close, open_price),
+            "pct_chg": _safe_float(pct_chg),
+            "volume": _safe_float(volume),
+            "amount": _safe_float(amount),
+            "last_close": _safe_float(last_close),
+            "_source": "intraday_db",
+        }
+    except Exception as e:
+        logger.debug("[intraday_db] by_code fallback 失败 %s %s: %s", date, stock_code, e)
 
     return None
 

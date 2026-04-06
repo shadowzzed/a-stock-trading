@@ -138,8 +138,8 @@ def parse_trade_signals(
 
 
 def _extract_json_block(report: str) -> Optional[dict]:
-    """提取报告开头的 JSON 前置块"""
-    # 匹配 ```json ... ``` 或行首 { ... }
+    """提取报告中的 JSON 块（支持截断的 JSON 代码块）"""
+    # Method 1: 完整闭合的 ```json ... ``` 代码块
     json_match = re.search(r'```json\s*\n(.*?)\n```', report, re.DOTALL)
     if json_match:
         try:
@@ -147,8 +147,19 @@ def _extract_json_block(report: str) -> Optional[dict]:
         except json.JSONDecodeError:
             pass
 
-    # 尝试匹配裸 JSON（在文件开头的 JSON 块）
-    # 支持 ```json 包裹和裸 JSON 两种
+    # Method 2: 不闭合的 ```json 代码块（LLM 输出被 max_tokens 戋截断）
+    json_start = re.search(r'```json\s*\n', report)
+    if json_start:
+        # 检查是否有闭合标记
+        close_pos = report.find('\n```', json_start.end())
+        if close_pos < 0:
+            # 没有闭合标记 → 截断的 JSON
+            json_text = report[json_start.end():]
+            result = _try_extract_from_truncated_json(json_text)
+            if result:
+                return result
+
+    # Method 3: 裸 JSON（在文件开头）
     json_match = re.search(r'^\s*(\{[^{}]*"focus_stocks"[^{}]*\})', report, re.MULTILINE)
     if json_match:
         try:
@@ -156,7 +167,7 @@ def _extract_json_block(report: str) -> Optional[dict]:
         except json.JSONDecodeError:
             pass
 
-    # 尝试匹配报告中间的 JSON 块（有些报告在正文中间插入 JSON）
+    # Method 4: 报告中间的完整 JSON 块
     json_match = re.search(r'\{\s*"market_bias".*?"focus_stocks".*?\}', report, re.DOTALL)
     if json_match:
         try:
@@ -164,6 +175,28 @@ def _extract_json_block(report: str) -> Optional[dict]:
         except json.JSONDecodeError:
             pass
 
+    return None
+
+
+def _try_extract_from_truncated_json(json_text: str) -> Optional[dict]:
+    """从被截断的 JSON 文本中提取完整的 stock 对象"""
+    stock_objects = re.findall(
+        r'\{\s*"name"\s*:\s*"([^"]+)"\s*,\s*"code"\s*:\s*"(\d{6})"',
+        json_text,
+    )
+    if not stock_objects:
+        stock_objects = re.findall(
+            r'\{[^{}]*?"name"\s*:\s*"([^"]+)"[^{}]*?"code"\s*:\s*"(\d{6})"[^{}]*?\}',
+            json_text,
+        )
+    if stock_objects:
+        focus_stocks = []
+        for name, code in stock_objects:
+            name = name.strip()
+            if len(name) >= 2 and re.match(r'^[\u4e00-\u9fa5A-Za-z]{2,8}$', name):
+                focus_stocks.append({"name": name, "code": code})
+        if focus_stocks:
+            return {"focus_stocks": focus_stocks}
     return None
 
 

@@ -97,16 +97,39 @@ class ChatAgentRunner:
         date: str,
         config: Optional[dict] = None,
         prev_report: str = "",
+        portfolio_state: Optional[dict] = None,
     ) -> str:
         from trading_agent.chat.agent import TradingChatAgent
 
         # 构造和实盘一样的自然语言消息
-        message = self._build_backtest_message(date, prev_report)
+        message = self._build_backtest_message(date, prev_report, portfolio_state)
         agent = TradingChatAgent(backtest_max_date=date)
-        return agent.chat(message)
+        result = agent.chat(message)
+
+        # 审计：检查是否有越界数据访问
+        audit = agent.get_audit_summary()
+        if not audit["clean"]:
+            import logging
+            logger = logging.getLogger(__name__)
+            logger.warning(
+                "[BACKTEST AUDIT] %s 存在 %d 次越界数据访问（已拦截）: %s",
+                date, audit["blocked_count"], audit["blocked_details"],
+            )
+        self._last_audit = audit
+
+        return result
+
+    @property
+    def last_audit(self) -> Optional[dict]:
+        """获取最近一次 run() 的审计结果。"""
+        return getattr(self, '_last_audit', None)
 
     @staticmethod
-    def _build_backtest_message(date: str, prev_report: str = "") -> str:
+    def _build_backtest_message(
+        date: str,
+        prev_report: str = "",
+        portfolio_state: Optional[dict] = None,
+    ) -> str:
         """构造回测模式的用户消息"""
         parts = [
             "请对 {} 的 A 股短线行情进行全面复盘分析。".format(date),
@@ -123,6 +146,37 @@ class ChatAgentRunner:
             "- 板块资金流向和主线持续性",
             "- 事件催化对次日的影响",
         ]
+
+        # 注入当前持仓状态
+        if portfolio_state:
+            parts.extend(["", "---", "## 当前持仓状态"])
+            parts.append("- 总资产：{:.0f} 元".format(
+                portfolio_state.get("total_value", 0)))
+            parts.append("- 可用现金：{:.0f} 元（占比 {:.0f}%）".format(
+                portfolio_state.get("cash", 0),
+                portfolio_state.get("cash_pct", 100),
+            ))
+            positions = portfolio_state.get("positions", [])
+            if positions:
+                parts.append("- 当前持仓：")
+                for p in positions:
+                    parts.append(
+                        "  - **{name}**（{code}）：{shares}股，"
+                        "买入价 {buy_price:.2f}，"
+                        "当前价 {current_price:.2f}，"
+                        "浮盈 {pnl_pct:+.2f}%，"
+                        "买入日期 {buy_date}".format(**p)
+                    )
+                parts.append("")
+                parts.append(
+                    "请根据当前持仓状态制定次日操盘计划：\n"
+                    "- 对已持仓标的，给出持有/卖出判断及卖出条件\n"
+                    "- 新买入标的不得与持仓重复\n"
+                    "- 买入仓位不得超过可用现金"
+                )
+            else:
+                parts.append("- 当前持仓：空仓")
+
         if prev_report:
             parts.extend([
                 "",

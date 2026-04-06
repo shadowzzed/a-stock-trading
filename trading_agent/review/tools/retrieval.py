@@ -8,12 +8,15 @@ from __future__ import annotations
 
 import glob
 import json
+import logging
 import os
 from typing import Optional
 
 from langchain_core.tools import tool
 
 from config import get_config
+
+logger = logging.getLogger(__name__)
 
 
 def _str_result(result) -> str:
@@ -41,6 +44,47 @@ class RetrievalToolFactory:
         self.memory_dir = memory_dir or get_config()["memory_dir"]
         self.backtest_max_date = backtest_max_date
         self._cache: dict = {}
+        self._audit_log: list[dict] = []
+
+    def _check_date_boundary(self, target_date: str, tool_name: str) -> Optional[str]:
+        """检查日期是否超出回测边界。超出则返回错误信息，否则返回 None。"""
+        max_date = self.backtest_max_date or self.date
+        if target_date > max_date:
+            self._record_audit(tool_name, target_date, blocked=True)
+            return f"日期 {target_date} 超出可查询范围（上限: {max_date}），{tool_name} 只能查询 {max_date} 及之前的数据"
+        self._record_audit(tool_name, target_date, blocked=False)
+        return None
+
+    def _record_audit(self, tool_name: str, requested_date: str, blocked: bool):
+        """记录工具调用审计条目。"""
+        max_date = self.backtest_max_date or self.date
+        entry = {
+            "tool": tool_name,
+            "requested_date": requested_date,
+            "max_date": max_date,
+            "blocked": blocked,
+        }
+        self._audit_log.append(entry)
+        if blocked:
+            logger.warning(
+                "[BACKTEST AUDIT] 拦截越界请求: %s(date=%s), 上限=%s",
+                tool_name, requested_date, max_date,
+            )
+
+    def get_audit_log(self) -> list[dict]:
+        """返回本次运行的审计日志副本。"""
+        return list(self._audit_log)
+
+    def get_audit_summary(self) -> dict:
+        """返回审计摘要：总调用数、拦截数、越界工具列表。"""
+        total = len(self._audit_log)
+        blocked = [e for e in self._audit_log if e["blocked"]]
+        return {
+            "total_date_checks": total,
+            "blocked_count": len(blocked),
+            "blocked_details": blocked,
+            "clean": len(blocked) == 0,
+        }
 
     def _cached(self, key: tuple, loader):
         """简单的字典缓存，避免同一次运行重复读文件"""
@@ -88,7 +132,8 @@ class RetrievalToolFactory:
             def _load():
                 from trading_agent.review.data.loader import _load_history, summarize_history
 
-                history = _load_history(factory.data_dir, factory.date, days_back)
+                history = _load_history(factory.data_dir, factory.date, days_back,
+                                    backtest_mode=bool(factory.backtest_max_date))
 
                 if metrics:
                     filtered = []
@@ -131,6 +176,9 @@ class RetrievalToolFactory:
                 reviewer: 按文件名筛选（子串匹配），如 "北京炒家"
             """
             target_date = date or factory.date
+            boundary_err = factory._check_date_boundary(target_date, "get_review_docs")
+            if boundary_err:
+                return boundary_err
             cache_key = ("review_docs", target_date, reviewer)
 
             def _load():
@@ -193,6 +241,9 @@ class RetrievalToolFactory:
             days_back = min(days_back, 10)
 
             if date:
+                boundary_err = factory._check_date_boundary(date, "get_memory")
+                if boundary_err:
+                    return boundary_err
                 cache_key = ("memory", date)
             else:
                 cache_key = ("memory_days", days_back)
@@ -316,6 +367,9 @@ class RetrievalToolFactory:
                 date: 日期，默认为分析日
             """
             target_date = date or factory.date
+            boundary_err = factory._check_date_boundary(target_date, "get_index_data")
+            if boundary_err:
+                return boundary_err
             cache_key = ("index_data", target_date)
 
             def _load():
@@ -342,6 +396,9 @@ class RetrievalToolFactory:
                 date: 日期，默认为分析日
             """
             target_date = date or factory.date
+            boundary_err = factory._check_date_boundary(target_date, "get_capital_flow")
+            if boundary_err:
+                return boundary_err
             cache_key = ("capital_flow", target_date)
 
             def _load():
@@ -418,6 +475,9 @@ class RetrievalToolFactory:
                 return "请提供 name 或 code 参数"
 
             target_date = date or factory.date
+            boundary_err = factory._check_date_boundary(target_date, "get_stock_detail")
+            if boundary_err:
+                return boundary_err
             cache_key = ("stock_detail", name, code, target_date)
 
             def _load():
@@ -445,6 +505,9 @@ class RetrievalToolFactory:
             """
             if date >= factory.date:
                 return "只能查询分析日之前的历史报告"
+            boundary_err = factory._check_date_boundary(date, "get_past_report")
+            if boundary_err:
+                return boundary_err
 
             cache_key = ("past_report", date)
 
@@ -496,6 +559,10 @@ class RetrievalToolFactory:
                 sort_by: "pctChg"、"amount"、"volume"，默认 pctChg
                 top_n: 返回数量（个股模式默认5，概览模式默认10）
             """
+            if date:
+                boundary_err = factory._check_date_boundary(date, "get_market_data")
+                if boundary_err:
+                    return boundary_err
             cache_key = ("market_data", date, time, name, code, mode, sort_by, top_n)
 
             def _load():
