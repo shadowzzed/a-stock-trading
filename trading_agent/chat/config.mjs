@@ -53,7 +53,7 @@ export function getFeishuConfig() {
 
 export function getDataDir() {
   const cfg = loadConfig();
-  return cfg.data_root || path.join(process.env.HOME, 'src/happyclaw/data/groups/main/trading');
+  return cfg.data_root || path.join(process.env.HOME, 'shared/trading');
 }
 
 export function getAIProviders() {

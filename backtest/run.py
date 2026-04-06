@@ -22,7 +22,7 @@ import json
 import os
 
 from .engine.core import BacktestEngine
-from .adapter import ReviewDataProvider, ReviewAgentRunner, LangChainLLMCaller
+from .adapter import ReviewDataProvider, ChatAgentRunner
 from .trade.executor import TradeSimulator
 from .trade.evaluator import evaluate, save_evaluation
 
@@ -67,13 +67,11 @@ def main():
         return
 
     # ── 完整回测 ──
-    agent_runner = ReviewAgentRunner()
-    llm_caller = LangChainLLMCaller()
+    agent_runner = ChatAgentRunner()
 
     engine = BacktestEngine(
         data_provider=data_provider,
         agent_runner=agent_runner,
-        llm_caller=llm_caller,
     )
 
     engine.run(
@@ -205,7 +203,23 @@ def _run_simple_pnl(
         day_pnl = 0.0
         day_trades = 0
 
-        for stock_name in stocks:
+        for stock_name_raw in stocks:
+            # 清理名称前缀和标记
+            stock_name = re.sub(
+                r'^[\d\.\s]*'
+                r'|'
+                r'^(核心|补涨|备选|观察|试探|补涨)\s*标的\s*[：:**]*\s*'
+                r'|'
+                r'^\*+'
+                r'|'
+                r'^[（(）)\s]'
+                r'|'
+                r'^[-–—\s]+',
+                '', stock_name_raw,
+            ).strip()
+            stock_name = re.sub(r'[，,].*$', '', stock_name).strip()
+            if not stock_name or len(stock_name) < 2:
+                continue
             # D+1 开盘价买入
             buy_data = loader.load_stock_daily(data_dir, day_d1, stock_name)
             if not buy_data or buy_data.get("open", 0) <= 0:
@@ -272,31 +286,166 @@ def _run_simple_pnl(
 
 
 def _extract_focus_stocks(report: str) -> list[str]:
-    """从报告 JSON 前置块中提取 focus_stocks"""
+    """从报告中提取推荐标的（支持 JSON 和 Markdown 多种格式）
+
+    v2 改进：
+    - 支持报告中间的 JSON 块（如 {market_bias, focus_stocks, ...}）
+    - 支持"关注标的"节中的 N. **股票名（板块）** 格式
+    - 支持"五、明日策略"中的编号列表格式
+    - 更精确的板块区域定位
+    """
     import json
     import re
 
-    # 匹配 ```json ... ``` 块
+    seen = set()
+
+    # Pattern 1: JSON ```json``` block
     json_match = re.search(r'```json\s*\n(.*?)\n```', report, re.DOTALL)
     if json_match:
         try:
             data = json.loads(json_match.group(1))
             stocks = data.get("focus_stocks", [])
             if stocks:
-                return [s for s in stocks if s and len(s) >= 2]
+                result = []
+                for s in stocks:
+                    name = s if isinstance(s, str) else s.get("name", "")
+                    if name and len(name) >= 2 and name not in seen:
+                        seen.add(name)
+                        result.append(name)
+                if result:
+                    return result
         except json.JSONDecodeError:
             pass
 
-    # Fallback: 匹配裸 JSON
+    # Pattern 2: Bare JSON "focus_stocks": [...] (string list)
     json_match = re.search(r'"focus_stocks"\s*:\s*\[(.*?)\]', report)
     if json_match:
         try:
             stocks = json.loads("[" + json_match.group(1) + "]")
-            return [s for s in stocks if s and len(s) >= 2]
+            result = []
+            for s in stocks:
+                name = s if isinstance(s, str) else s.get("name", "")
+                if name and len(name) >= 2 and name not in seen:
+                    seen.add(name)
+                    result.append(name)
+            if result:
+                return result
         except json.JSONDecodeError:
             pass
 
-    return []
+    # Pattern 2b: Full JSON block in report body (with market_bias etc.)
+    json_match = re.search(r'\{\s*"market_bias".*?"focus_stocks".*?\}', report, re.DOTALL)
+    if json_match:
+        try:
+            data = json.loads(json_match.group(0))
+            stocks = data.get("focus_stocks", [])
+            if stocks:
+                result = []
+                for s in stocks:
+                    name = s if isinstance(s, str) else s.get("name", "")
+                    if name and len(name) >= 2 and name not in seen:
+                        seen.add(name)
+                        result.append(name)
+                if result:
+                    return result
+        except json.JSONDecodeError:
+            pass
+
+    # Pattern 3: 定位策略/操盘计划/关注标的 节
+    section = _extract_strategy_section_for_focus(report)
+    if section:
+        _extract_stocks_from_section(section, seen)
+        if seen:
+            return list(seen)
+
+    # Pattern 4: Full text fallback — "关注标的" 节
+    # 匹配 "- **关注标的**：" 后面的内容
+    focus_match = re.search(
+        r'关注标的[\s：:]*\n(.*?)(?=\n#{1,3}\s|\n- \*\*仓位|\n- \*\*风险|\Z)',
+        report, re.DOTALL,
+    )
+    if focus_match:
+        _extract_stocks_from_section(focus_match.group(1), seen)
+        if seen:
+            return list(seen)
+
+    # Pattern 5: Full text fallback — pure Chinese name before (code) in buy-related sections
+    buy_sections = re.findall(
+        r'(?:买入|标的|操盘|推荐|关注|策略)(.*?)(?=\n\n|\Z)',
+        report, re.DOTALL,
+    )
+    text = "\n".join(buy_sections) if buy_sections else report
+    for m in re.finditer(r'([\u4e00-\u9fff]{2,6})\s*[（(]\s*(\d{6})', text):
+        name = m.group(1).strip()
+        if name not in seen:
+            seen.add(name)
+
+    return list(seen) if seen else []
+
+
+def _extract_strategy_section_for_focus(report: str) -> str:
+    """定位操盘计划/买入标的节的文本内容"""
+    import re
+
+    section_patterns = [
+        # 结构化标题
+        r'(?:买入标的及操作策略|买入标的及条件|买入标的与操作规则|操盘计划|买入计划)(.*?)(?=\n####[^#]|\n---|\n- \*\*风险|\Z)',
+        # 次日操盘计划
+        r'(?:次日操盘计划)(.*?)(?=\n---|\n- \*\*风险|\Z)',
+        # ## 五、明日策略 后面的内容（到下一个 ## 或文末）
+        r'(?:^|\n)#{1,6}\s*(?:五.{0,5}|四.{0,3})?明日策略\s*\n(.*?)(?=\n#{1,3}\s|\Z)',
+    ]
+
+    for pat in section_patterns:
+        match = re.search(pat, report, re.DOTALL)
+        if match:
+            return match.group(1)
+    return ""
+
+
+def _extract_stocks_from_section(section: str, seen: set):
+    """从节文本中提取股票名（多种格式）"""
+    import re
+
+    # 3a: Numbered structured items with 标的 keyword
+    for m in re.finditer(
+        r'\d+\.\s*\*{1,2}\s*(?:核心|补涨|备选|观察|试探)?\s*标的\s*[：:*]+\s*([\u4e00-\u9fffA-Za-z]{2,8})\s*[（(]\s*(\d{6})',
+        section,
+    ):
+        name = m.group(1).strip()
+        if name not in seen:
+            seen.add(name)
+    if seen:
+        return
+
+    # 3b: Sub-heading format "#### N. 股票名（代码）"
+    for m in re.finditer(
+        r'#{2,4}\s*\d+\.\s*([\u4e00-\u9fff]{2,6})\s*[（(]\s*(\d{6})',
+        section,
+    ):
+        name = m.group(1).strip()
+        if name not in seen:
+            seen.add(name)
+    if seen:
+        return
+
+    # 3c: N. **股票名（板块说明）**：操作描述 — 股票名(代码) 在描述中
+    # 典型格式：1. **华电辽能**：竞价高开... 或 1. **美诺华（5板，创新药）**：
+    for m in re.finditer(
+        r'\d+\.\s*\*{1,2}\s*([\u4e00-\u9fff]{2,6})\s*(?:[（(][^）)]*[）)])?\s*\*{1,2}\s*[：:]',
+        section,
+    ):
+        name = m.group(1).strip()
+        if name not in seen and re.match(r'^[\u4e00-\u9fff]{2,6}$', name):
+            seen.add(name)
+    if seen:
+        return
+
+    # 3d: Fallback — pure Chinese name (2-6 chars) before (6-digit code)
+    for m in re.finditer(r'([\u4e00-\u9fff]{2,6})\s*[（(]\s*(\d{6})', section):
+        name = m.group(1).strip()
+        if name not in seen:
+            seen.add(name)
 
 
 def _save_simple_pnl_report(

@@ -1,4 +1,7 @@
-"""加载每日行情数据（涨停板、跌停板、个股行情CSV）"""
+"""加载每日行情数据（涨停板、跌停板、个股行情CSV）
+
+数据源优先级：本地 CSV > 东方财富 API > 返回空 DataFrame
+"""
 
 from __future__ import annotations
 
@@ -11,6 +14,7 @@ import sqlite3
 from datetime import datetime, timedelta
 from typing import Optional
 import pandas as pd
+import requests
 from dataclasses import dataclass, field
 
 logger = logging.getLogger(__name__)
@@ -63,25 +67,37 @@ def load_daily_data(data_dir: str, date: str, history_days: int = 7,
         backtest_mode: 回测模式下，review_docs 只加载 D-1 及之前（避免前瞻偏差）
     """
     daily_dir = os.path.join(data_dir, "daily", date)
-    if not os.path.isdir(daily_dir):
-        raise FileNotFoundError(f"找不到 {date} 的数据目录: {daily_dir}")
 
-    # 涨停板
+    # 涨停板（CSV 优先，东方财富 API fallback）
     limit_up = _load_csv(daily_dir, f"涨停板_{date.replace('-', '')}.csv")
+    if limit_up.empty:
+        limit_up = fetch_limit_up_from_eastmoney(date)
+        if not limit_up.empty:
+            os.makedirs(daily_dir, exist_ok=True)
+            csv_path = os.path.join(daily_dir, f"涨停板_{date.replace('-', '')}.csv")
+            limit_up.to_csv(csv_path, index=False, encoding="utf-8-sig")
+            logger.info("已通过东方财富 API 获取涨停板数据并缓存到 %s", csv_path)
 
-    # 跌停板
+    # 跌停板（CSV 优先，东方财富 API fallback）
     limit_down = _load_csv(daily_dir, f"跌停板_{date.replace('-', '')}.csv")
+    if limit_down.empty:
+        limit_down = fetch_limit_down_from_eastmoney(date)
+        if not limit_down.empty:
+            os.makedirs(daily_dir, exist_ok=True)
+            csv_path = os.path.join(daily_dir, f"跌停板_{date.replace('-', '')}.csv")
+            limit_down.to_csv(csv_path, index=False, encoding="utf-8-sig")
+            logger.info("已通过东方财富 API 获取跌停板数据并缓存到 %s", csv_path)
 
     # 个股行情
     stock_data = _load_csv(daily_dir, f"行情_{date.replace('-', '')}.csv")
 
     # 复盘文档
-    # 回测模式下禁止加载当天的 review_docs（前瞻偏差），只加载 D-1 及之前
     reviews = {}
-    if backtest_mode:
-        reviews = _load_prev_reviews(data_dir, date)
-    else:
-        reviews = _load_current_reviews(daily_dir)
+    if os.path.isdir(daily_dir):
+        if backtest_mode:
+            reviews = _load_prev_reviews(data_dir, date)
+        else:
+            reviews = _load_current_reviews(daily_dir)
 
     # 事件催化
     events = ""
@@ -122,7 +138,19 @@ def _load_history(data_dir: str, current_date: str, days: int = 5) -> list:
         date_compact = hist_date.replace("-", "")
 
         lu = _load_csv(hist_dir, "涨停板_{}.csv".format(date_compact))
+        if lu.empty:
+            lu = fetch_limit_up_from_eastmoney(hist_date)
+            if not lu.empty:
+                os.makedirs(hist_dir, exist_ok=True)
+                lu.to_csv(os.path.join(hist_dir, "涨停板_{}.csv".format(date_compact)),
+                          index=False, encoding="utf-8-sig")
         ld = _load_csv(hist_dir, "跌停板_{}.csv".format(date_compact))
+        if ld.empty:
+            ld = fetch_limit_down_from_eastmoney(hist_date)
+            if not ld.empty:
+                os.makedirs(hist_dir, exist_ok=True)
+                ld.to_csv(os.path.join(hist_dir, "跌停板_{}.csv".format(date_compact)),
+                          index=False, encoding="utf-8-sig")
 
         lu_count = len(lu)
         ld_count = len(ld)
@@ -226,6 +254,163 @@ def summarize_history(history: list) -> str:
     return "\n".join(lines)
 
 
+# ── 东方财富 API 数据获取 ──────────────────────────────────────
+
+
+def fetch_limit_up_from_eastmoney(date: str) -> pd.DataFrame:
+    """从东方财富 API 获取涨停板数据（含连板数）。
+
+    API 地址：push2ex.eastmoney.com/getTopicZTPool
+    数据保留约 2 周，盘中实时可用。
+
+    Args:
+        date: 日期字符串，如 "2026-04-03" 或 "20260403"
+    """
+    date_compact = date.replace("-", "")
+    url = "https://push2ex.eastmoney.com/getTopicZTPool"
+    params = {
+        "ut": "7eea3edcaed734bea9cbfc24409ed989",
+        "dpt": "wz.ztzt",
+        "Pageindex": "0",
+        "pagesize": "10000",
+        "sort": "fbt:asc",
+        "date": date_compact,
+    }
+    try:
+        r = requests.get(url, params=params, timeout=10)
+        data = r.json()
+        if data.get("data") is None or not data["data"].get("pool"):
+            return pd.DataFrame()
+
+        pool = data["data"]["pool"]
+        df = pd.DataFrame(pool)
+        df = df.rename(columns={
+            "c": "代码", "n": "名称", "p": "最新价", "zdp": "涨跌幅",
+            "amount": "成交额", "ltsz": "流通市值", "tshare": "总市值",
+            "hs": "换手率", "lbc": "连板数", "fbt": "首次封板时间",
+            "lbt": "最后封板时间", "fund": "封板资金", "zbc": "炸板次数",
+            "hybk": "所属行业",
+        })
+
+        # 涨停统计字段是嵌套 dict {days, ct}
+        if "zttj" in df.columns:
+            df["涨停统计"] = (
+                df["zttj"].apply(lambda x: f"{x['days']}/{x['ct']}" if isinstance(x, dict) and x.get("days") else "")
+            )
+        else:
+            df["涨停统计"] = ""
+
+        # 格式化封板时间（补零到 6 位 HHMMSS）
+        for col in ("首次封板时间", "最后封板时间"):
+            if col in df.columns:
+                df[col] = df[col].astype(str).str.zfill(6)
+
+        # 价格/金额单位转换
+        if "最新价" in df.columns:
+            df["最新价"] = pd.to_numeric(df["最新价"], errors="coerce") / 1000
+        for col in ("成交额", "流通市值", "总市值", "封板资金"):
+            if col in df.columns:
+                df[col] = pd.to_numeric(df[col], errors="coerce")
+        for col in ("涨跌幅", "换手率"):
+            if col in df.columns:
+                df[col] = pd.to_numeric(df[col], errors="coerce")
+        if "连板数" in df.columns:
+            df["连板数"] = pd.to_numeric(df["连板数"], errors="coerce").astype(int)
+        if "炸板次数" in df.columns:
+            df["炸板次数"] = pd.to_numeric(df["炸板次数"], errors="coerce").astype(int)
+
+        # 序号
+        df.insert(0, "序号", range(1, len(df) + 1))
+
+        # 只保留标准列
+        keep = ["序号", "代码", "名称", "涨跌幅", "最新价", "成交额",
+                "流通市值", "总市值", "换手率", "封板资金",
+                "首次封板时间", "最后封板时间", "炸板次数",
+                "涨停统计", "连板数", "所属行业"]
+        df = df[[c for c in keep if c in df.columns]]
+
+        logger.info("东方财富 API 获取涨停板 %s: %d 只", date_compact, len(df))
+        return df
+
+    except Exception as e:
+        logger.warning("东方财富涨停板 API 请求失败 %s: %s", date_compact, e)
+        return pd.DataFrame()
+
+
+def fetch_limit_down_from_eastmoney(date: str) -> pd.DataFrame:
+    """从东方财富 API 获取跌停板数据。
+
+    API 地址：push2ex.eastmoney.com/getTopicDTPool
+    数据保留约 30 个交易日。
+
+    Args:
+        date: 日期字符串，如 "2026-04-03" 或 "20260403"
+    """
+    date_compact = date.replace("-", "")
+    url = "https://push2ex.eastmoney.com/getTopicDTPool"
+    params = {
+        "ut": "7eea3edcaed734bea9cbfc24409ed989",
+        "dpt": "wz.ztzt",
+        "Pageindex": "0",
+        "pagesize": "10000",
+        "sort": "fund:asc",
+        "date": date_compact,
+    }
+    try:
+        r = requests.get(url, params=params, timeout=10)
+        data = r.json()
+        if data.get("data") is None or not data["data"].get("pool"):
+            return pd.DataFrame()
+
+        pool = data["data"]["pool"]
+        df = pd.DataFrame(pool)
+        df = df.rename(columns={
+            "c": "代码", "n": "名称", "p": "最新价", "zdp": "涨跌幅",
+            "amount": "成交额", "ltsz": "流通市值", "tshare": "总市值",
+            "hs": "换手率", "fund": "封单资金",
+            "lbt": "最后封板时间", "amt": "板上成交额",
+            "hybk": "所属行业",
+        })
+
+        if "zbc" in df.columns:
+            df = df.rename(columns={"zbc": "开板次数"})
+        if "lbc" in df.columns:
+            df = df.rename(columns={"lbc": "连续跌停"})
+
+        # 格式化封板时间
+        if "最后封板时间" in df.columns:
+            df["最后封板时间"] = df["最后封板时间"].astype(str).str.zfill(6)
+
+        # 价格/金额单位转换
+        if "最新价" in df.columns:
+            df["最新价"] = pd.to_numeric(df["最新价"], errors="coerce") / 1000
+        for col in ("成交额", "流通市值", "总市值", "封单资金", "板上成交额"):
+            if col in df.columns:
+                df[col] = pd.to_numeric(df[col], errors="coerce")
+        for col in ("涨跌幅", "换手率"):
+            if col in df.columns:
+                df[col] = pd.to_numeric(df[col], errors="coerce")
+        for col in ("连续跌停", "开板次数"):
+            if col in df.columns:
+                df[col] = pd.to_numeric(df[col], errors="coerce").astype(int)
+
+        # 序号
+        df.insert(0, "序号", range(1, len(df) + 1))
+
+        # 只保留标准列
+        keep = ["序号", "代码", "名称", "涨跌幅", "最新价", "成交额",
+                "流通市值", "总市值", "换手率", "封单资金",
+                "最后封板时间", "板上成交额", "连续跌停", "开板次数", "所属行业"]
+        df = df[[c for c in keep if c in df.columns]]
+
+        logger.info("东方财富 API 获取跌停板 %s: %d 只", date_compact, len(df))
+        return df
+
+    except Exception as e:
+        logger.warning("东方财富跌停板 API 请求失败 %s: %s", date_compact, e)
+        return pd.DataFrame()
+
+
 def _load_csv(directory: str, filename: str) -> pd.DataFrame:
     path = os.path.join(directory, filename)
     if not os.path.exists(path):
@@ -305,11 +490,7 @@ def _load_prev_reviews(data_dir: str, current_date: str) -> dict:
 def summarize_limit_up(df: pd.DataFrame) -> str:
     """将涨停板 DataFrame 转为分析师可读的文本摘要"""
     if df.empty:
-        return DataResult(
-            content="无涨停板数据",
-            warnings=["涨停板数据为空，情绪分析（涨停数、连板高度、炸板率）将不可靠"],
-            data_sources_missing=["limit_up_csv"],
-        )
+        return "无涨停板数据（涨停板数据为空，情绪分析将不可靠）"
 
     total = len(df)
     # 按行业统计
@@ -379,11 +560,7 @@ def summarize_limit_up(df: pd.DataFrame) -> str:
 def summarize_limit_down(df: pd.DataFrame) -> str:
     """跌停板摘要（含连续跌停信号和开板次数）"""
     if df.empty:
-        return DataResult(
-            content="无跌停板数据",
-            warnings=["跌停板数据缺失，退潮/冰点判断缺少依据"],
-            data_sources_missing=["limit_down_csv"],
-        )
+        return "无跌停板数据（跌停板数据缺失，退潮/冰点判断缺少依据）"
 
     total = len(df)
     industry_counts = df["所属行业"].value_counts().head(5)
@@ -1311,7 +1488,12 @@ def load_stock_daily_ohlcv(
     if result:
         return result
 
-    # Step 2: mootdx fallback
+    # Step 2: intraday.db fallback（全市场快照，可靠的历史数据源）
+    result = _load_stock_from_intraday_db(data_dir, date, stock_name)
+    if result:
+        return result
+
+    # Step 3: mootdx fallback
     return _load_stock_from_mootdx(data_dir, date, stock_name)
 
 
@@ -1489,9 +1671,82 @@ def _load_stock_from_mootdx(
         return None
 
 
+def _load_stock_from_intraday_db(
+    data_dir: str, date: str, stock_name: str,
+) -> Optional[dict]:
+    """从 intraday.db snapshots 表加载个股日线数据（全市场覆盖）"""
+    code = _resolve_stock_code(data_dir, stock_name)
+    if not code:
+        return None
+
+    db_path = _get_db_path(data_dir)
+    if not os.path.exists(db_path):
+        return None
+
+    try:
+        conn = sqlite3.connect(db_path)
+        # 取当日最后一条快照作为日线数据
+        row = conn.execute(
+            "SELECT open, high, low, price, last_close, pctChg, volume, amount "
+            "FROM snapshots WHERE code = ? AND date = ? ORDER BY ts DESC LIMIT 1",
+            (code, date),
+        ).fetchone()
+        conn.close()
+
+        if not row:
+            return None
+
+        open_price, high, low, close, last_close, pct_chg, volume, amount = row
+
+        # volume 字段可能包含二进制数据，安全转换
+        def _safe_float(v, default=0.0):
+            try:
+                return float(v) if v is not None else default
+            except (TypeError, ValueError):
+                return default
+
+        open_price = _safe_float(open_price)
+        if open_price <= 0:
+            return None
+
+        return {
+            "date": date,
+            "code": code,
+            "name": stock_name,
+            "open": open_price,
+            "high": _safe_float(high, open_price),
+            "low": _safe_float(low, open_price),
+            "close": _safe_float(close, open_price),
+            "pct_chg": _safe_float(pct_chg),
+            "volume": _safe_float(volume),
+            "amount": _safe_float(amount),
+            "last_close": _safe_float(last_close),
+            "_source": "intraday_db",
+        }
+    except Exception as e:
+        logger.debug("[intraday_db] fallback 失败 %s %s: %s", date, stock_name, e)
+
+    return None
+
+
 def _resolve_stock_code(data_dir: str, stock_name: str) -> Optional[str]:
-    """从行情 CSV 或 stocks.md 解析股票名称→代码"""
-    # 从最近的行情 CSV 查找
+    """解析股票名称→代码。优先行情 CSV，其次 intraday.db（全市场），再次涨跌停 CSV"""
+    import re
+
+    def _clean_code(raw: str) -> Optional[str]:
+        """提取 6 位纯数字代码"""
+        if not raw:
+            return None
+        m = re.search(r'(\d{6})', raw)
+        return m.group(1) if m else None
+
+    def _extract_code_from_row(row: dict) -> Optional[str]:
+        """从 CSV 行提取代码（兼容新旧格式列名）"""
+        return _clean_code(
+            row.get("代码", "") or row.get("code", "")
+        )
+
+    # 1. 从最近的行情 CSV 查找（股票池）
     daily_root = os.path.join(data_dir, "daily")
     if os.path.isdir(daily_root):
         dirs = sorted(os.listdir(daily_root), reverse=True)
@@ -1505,9 +1760,47 @@ def _resolve_stock_code(data_dir: str, stock_name: str) -> Optional[str]:
                         raw = f.read().replace("\x00", "")
                     for row in csv_mod.DictReader(io_mod.StringIO(raw)):
                         if row.get("名称", "").strip() == stock_name:
-                            return row.get("代码", "").strip()
+                            code = _extract_code_from_row(row)
+                            if code:
+                                return code
                 except Exception:
                     continue
+
+    # 2. 从 intraday.db 查找（全市场 ~5200 只）
+    db_path = _get_db_path(data_dir)
+    if os.path.exists(db_path):
+        try:
+            conn = sqlite3.connect(db_path)
+            row = conn.execute(
+                "SELECT DISTINCT code FROM snapshots WHERE name = ? LIMIT 1",
+                (stock_name,),
+            ).fetchone()
+            conn.close()
+            if row:
+                return row[0]
+        except Exception:
+            pass
+
+    # 3. 从涨跌停 CSV 查找（全市场）
+    if os.path.isdir(daily_root):
+        dirs = sorted(os.listdir(daily_root), reverse=True)
+        for d in dirs[:10]:
+            for csv_pattern in ["涨停板_*.csv", "跌停板_*.csv"]:
+                csv_files = glob.glob(os.path.join(daily_root, d, csv_pattern))
+                for csv_file in csv_files:
+                    try:
+                        import csv as csv_mod
+                        import io as io_mod
+                        with open(csv_file, "r", encoding="utf-8-sig") as f:
+                            raw = f.read().replace("\x00", "")
+                        for row in csv_mod.DictReader(io_mod.StringIO(raw)):
+                            if row.get("名称", "").strip() == stock_name:
+                                code = _extract_code_from_row(row)
+                                if code:
+                                    return code
+                    except Exception:
+                        continue
+
     return None
 
 
