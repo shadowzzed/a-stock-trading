@@ -62,9 +62,11 @@ class TradeSimulator:
 
         # Step 2: 解析信号
         signals = parse_trade_signals(report, signal_date, target_date)
+        watch_count = sum(1 for s in signals if s.action_type == "观望")
 
         # Step 3: 逐个信号尝试买入
         buy_count = 0
+        skip_reasons = []
         for signal in signals:
             if signal.action_type == "观望":
                 continue
@@ -76,6 +78,16 @@ class TradeSimulator:
                 self.trades.append(record)
                 if record.buy_executed:
                     buy_count += 1
+                else:
+                    skip_reasons.append("{}({}): {}".format(
+                        signal.stock_name, signal.action_type, record.buy_reason))
+
+        if signals:
+            print("  [信号] {} 个信号, {} 观望, {} 尝试买入, {} 成交{}".format(
+                len(signals), watch_count,
+                len(signals) - watch_count, buy_count,
+                " | 失败: " + "; ".join(skip_reasons[:3]) if skip_reasons else "",
+            ))
 
         self._record_snapshot(target_date, buy_count)
 

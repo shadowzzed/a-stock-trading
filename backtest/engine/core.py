@@ -228,14 +228,18 @@ class BacktestEngine:
             result.recommendations = recs
 
             if recs:
-                pnl_list = [r.pnl_pct for r in recs if r.action == "买入"]
-                if pnl_list:
+                # P1: 只统计有实际行情数据的推荐（排除无行情的垃圾解析）
+                valid_recs = [r for r in recs if r.action == "买入" and (r.next_pct_chg != 0 or r.pnl_pct != 0)]
+                if valid_recs:
+                    pnl_list = [r.pnl_pct for r in valid_recs]
                     result.avg_pnl_pct = round(sum(pnl_list) / len(pnl_list), 2)
                     result.hit_rate = round(
                         sum(1 for p in pnl_list if p > 0) / len(pnl_list) * 100, 1
                     )
-                print("  [验证] {} 只推荐标的, 平均收益 {:+.2f}%, 命中率 {:.0f}%".format(
-                    len(recs), result.avg_pnl_pct, result.hit_rate))
+                    print("  [验证] {} 只有效标的（过滤 {} 条无数据）, 平均收益 {:+.2f}%, 命中率 {:.0f}%".format(
+                        len(valid_recs), len(recs) - len(valid_recs), result.avg_pnl_pct, result.hit_rate))
+                else:
+                    print("  [验证] {} 只推荐标的, 但无有效行情数据".format(len(recs)))
             else:
                 print("  [验证] 未发现推荐标的")
 
@@ -366,27 +370,98 @@ class BacktestEngine:
         return recs
 
     def _extract_focus_stocks(self, report: str) -> list[dict]:
-        """从报告 JSON 前置块中提取 focus_stocks"""
+        """从报告中提取推荐标的（优先 JSON 结构化输出，fallback 到 Markdown 解析）"""
+        stocks_found: list[dict] = []
+        seen_names: set[str] = set()
+
+        # ── Priority: JSON structured output ──
+        # Method 1: JSON ```json``` block with focus_stocks
         json_match = re.search(r'```json\s*\n(.*?)\n```', report, re.DOTALL)
         if json_match:
             try:
                 data = json.loads(json_match.group(1))
                 stocks = data.get("focus_stocks", [])
                 if stocks:
-                    return [s for s in stocks if isinstance(s, dict) and s.get("name") and len(s["name"]) >= 2]
+                    valid = [s for s in stocks if isinstance(s, dict) and s.get("name") and len(s["name"]) >= 2]
+                    if valid:
+                        # JSON 模式下直接带完整信息，不再需要 _extract_buy_plans
+                        return valid
             except json.JSONDecodeError:
                 pass
 
-        # Fallback: 匹配裸 JSON
+        # Method 2: Bare JSON "focus_stocks": [...]
         json_match = re.search(r'"focus_stocks"\s*:\s*\[(.*?)\]', report)
         if json_match:
             try:
                 stocks = json.loads("[" + json_match.group(1) + "]")
-                return [s for s in stocks if isinstance(s, dict) and s.get("name") and len(s["name"]) >= 2]
+                valid = [s for s in stocks if isinstance(s, dict) and s.get("name") and len(s["name"]) >= 2]
+                if valid:
+                    return valid
             except json.JSONDecodeError:
                 pass
 
-        return []
+        # ── Method 2.5: Markdown TABLE 格式解析 ──
+        # 匹配 "| 股票名称 | 代码 | ..." 表格行
+        table_rows = re.findall(
+            r'\|\s*([\u4e00-\u9fa5A-Za-z]{2,6}[A-Za-z]?)\s*\|\s*(\d{6})\s*\|',
+            report,
+        )
+        for name, code in table_rows:
+            name = name.strip()
+            if name in ('股票名称', '----------', '------') or len(name) < 2:
+                continue
+            if name not in seen_names:
+                seen_names.add(name)
+                stocks_found.append({"name": name, "code": code})
+        if stocks_found:
+            return stocks_found
+
+        # ── Fallback: Markdown 正则解析（仅当无 JSON 时使用）──
+        # Method 3: Markdown 操盘计划 / 买入标的 section
+        section_patterns = [
+            r'(?:买入标的|次日操盘计划|操盘计划|买入标的).*?\n(.*?)(?=\n####|\n---|\Z)',
+            r'(?:核心标的|补涨标的).*?\n(.*?)(?=\n####|\n---|\n- \*\*核心|\Z)',
+        ]
+        for pat in section_patterns:
+            section_match = re.search(pat, report, re.DOTALL)
+            if not section_match:
+                continue
+            section = section_match.group(1)
+            stock_pattern = re.findall(
+                r'\*{0,2}([^\n*（(]+?)\s*[（(]\s*(\d{6})\s*[，,）)]',
+                section,
+            )
+            for name, code in stock_pattern:
+                name = name.strip().lstrip("*").strip()
+                name = re.sub(r'^[-、\s]+', '', name)
+                name = re.sub(r'^[\u4e00-\u9fa5]{2,4}[：:]\s*', '', name)
+                name = name.strip()
+                if len(name) >= 2 and name not in seen_names:
+                    seen_names.add(name)
+                    stocks_found.append({"name": name, "code": code})
+
+        # Method 4: Fallback — 全文搜索 股票名（6位代码） 模式
+        if not stocks_found:
+            buy_sections = re.findall(
+                r'(?:买入|标的|操盘|推荐|关注)(.*?)(?=\n\n|\Z)',
+                report, re.DOTALL,
+            )
+            text = "\n".join(buy_sections) if buy_sections else report
+            stock_pattern = re.findall(
+                r'([^\n*（(]{2,10}?)\s*[（(]\s*(\d{6})\s*[）)]',
+                text,
+            )
+            for name, code in stock_pattern:
+                name = name.strip().lstrip("*").strip()
+                # 清除前缀噪声："- 板块："、"、"、"-"等
+                name = re.sub(r'^[-、\s]+', '', name)
+                name = re.sub(r'^[\u4e00-\u9fa5]{2,4}[：:]\s*', '', name)
+                name = name.strip()
+                if len(name) >= 2 and name not in seen_names:
+                    seen_names.add(name)
+                    stocks_found.append({"name": name, "code": code})
+
+        return stocks_found
 
     def _extract_buy_plans(self, report: str) -> dict[str, dict]:
         """从"买入计划"章节提取各标的的详细操作信息"""
@@ -447,7 +522,7 @@ class BacktestEngine:
         for r in recs:
             if r.action == "买入" and r.pnl_pct < -2:
                 loss_details.append(
-                    "{}: 推荐{买入}, D+1实际{:+.2f}%{}".format(
+                    "{}: 推荐买入, D+1实际{:+.2f}%{}".format(
                         r.stock,
                         r.next_pct_chg,
                         "（涨停）" if r.is_limit_up else "（跌停）" if r.is_limit_down else "",
