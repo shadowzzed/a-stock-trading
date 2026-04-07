@@ -4,10 +4,56 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from .core import BacktestResult
+
+
+def _load_daily_actions(output_dir: str) -> dict[str, list[dict]]:
+    """从回测报告中提取每日的 position_actions（持仓决策）。
+
+    Returns:
+        {日期: [{"name": "xxx", "action": "持有/卖出", "reason": "xxx"}, ...]}
+    """
+    daily: dict[str, list[dict]] = {}
+    if not os.path.isdir(output_dir):
+        return daily
+
+    for fname in os.listdir(output_dir):
+        if not fname.endswith("_report.md"):
+            continue
+        date = fname.replace("_report.md", "")
+        path = os.path.join(output_dir, fname)
+        with open(path, "r", encoding="utf-8") as f:
+            report = f.read()
+
+        actions = []
+        # 方法1: JSON 代码块
+        json_match = re.search(r"```json\s*\n(.*?)\n```", report, re.DOTALL)
+        if json_match:
+            try:
+                data = json.loads(json_match.group(1))
+                actions = data.get("position_actions", [])
+            except (json.JSONDecodeError, AttributeError):
+                pass
+
+        # 方法2: 裸 JSON
+        if not actions:
+            pa_match = re.search(
+                r'"position_actions"\s*:\s*\[(.*?)\]', report, re.DOTALL,
+            )
+            if pa_match:
+                try:
+                    actions = json.loads("[" + pa_match.group(1) + "]")
+                except (json.JSONDecodeError, AttributeError):
+                    pass
+
+        if actions:
+            daily[date] = actions
+
+    return daily
     from ..experience.store import ExperienceStore
 
 
@@ -68,12 +114,12 @@ def generate_summary(
     summary["data_leak_audit"] = leak_audit
 
     # 保存 JSON
-    summary_path = os.path.join(output_dir, "summary_v6.json")
+    summary_path = os.path.join(output_dir, "summary.json")
     with open(summary_path, "w", encoding="utf-8") as f:
         json.dump(summary, f, ensure_ascii=False, indent=2)
 
     # 生成人可读报告
-    report_path = os.path.join(output_dir, "回测报告_v6.md")
+    report_path = os.path.join(output_dir, "回测报告.md")
     with open(report_path, "w", encoding="utf-8") as f:
         f.write(format_report(summary, exp_store))
 
@@ -220,6 +266,9 @@ def generate_settlement_report(
     closed = tracker.closed_trades
     open_positions = tracker.positions
 
+    # 加载逐日持仓决策
+    daily_actions = _load_daily_actions(output_dir)
+
     # ── 用展示资金计算复利交割单 ──
     equity = display_capital
     trade_records = []
@@ -238,7 +287,7 @@ def generate_settlement_report(
             "pnl_amount": round(pnl_amount),
             "equity": round(equity),
             "buy_reason": t.get("buy_reason", ""),
-            "sell_reason": t.get("reason", ""),
+            "sell_reason": t.get("reason", "") or t.get("sell_reason", ""),
             "hold_days": t.get("hold_days", 0),
         })
 
@@ -279,6 +328,9 @@ def generate_settlement_report(
             "- 持仓标的：{}".format("、".join(p["name"] for p in open_positions)),
         ])
 
+    # ── 加载逐日持仓决策（从每日报告中提取 position_actions）──
+    daily_actions = _load_daily_actions(output_dir)
+
     # ── 逐笔交割单 ──
     lines.extend([
         "",
@@ -289,16 +341,39 @@ def generate_settlement_report(
     for i, t in enumerate(trade_records, 1):
         buy_reason = t.get("buy_reason", "")
         sell_reason = t.get("sell_reason", "")
+        name = t["name"]
         lines.extend([
-            "### {}. {}（{}→{}）".format(i, t["name"], t["buy_date"], t["sell_date"]),
+            "### {}. {}（{}→{}）".format(i, name, t["buy_date"], t["sell_date"]),
             "",
             "- 仓位金额：{:,}（本金×30%）".format(t["position"]),
             "- 盈亏：{:+,}（{:+.2f}%）".format(t["pnl_amount"], t["pnl_pct"]),
             "- 持仓天数：{}天".format(t.get("hold_days", 0)),
-            "- **买入原因**：{}".format(buy_reason or "未记录"),
-            "- **卖出原因**：{}".format(sell_reason or "未记录"),
             "",
         ])
+
+        # 逐日操作日志
+        lines.append("| 日期 | 操作 | 理由 |")
+        lines.append("|------|------|------|")
+        # 买入日
+        lines.append("| {} | **买入** | {} |".format(t["buy_date"], buy_reason or "未记录"))
+        # 持有期间逐日决策
+        buy_d = t["buy_date"]
+        sell_d = t["sell_date"]
+        for date_key in sorted(daily_actions.keys()):
+            if date_key <= buy_d or date_key >= sell_d:
+                continue
+            for act in daily_actions[date_key]:
+                if act.get("name") == name:
+                    action = act.get("action", "")
+                    reason = act.get("reason", "")
+                    if action == "持有":
+                        action = "持有"
+                    elif action == "卖出":
+                        action = "计划卖出"
+                    lines.append("| {} | {} | {} |".format(date_key, action, reason or "—"))
+        # 卖出日
+        lines.append("| {} | **卖出** | {} |".format(t["sell_date"], sell_reason or "未记录"))
+        lines.append("")
 
     # 未平仓
     if open_positions:
@@ -309,13 +384,29 @@ def generate_settlement_report(
         ])
         for p in open_positions:
             pos_amount = equity * 0.3
+            name = p["name"]
+            buy_reason = p.get("buy_reason", "") or "未记录"
             lines.extend([
-                "### {}（买入日:{}）".format(p["name"], p["buy_date"]),
+                "### {}（买入日:{}）".format(name, p["buy_date"]),
                 "",
                 "- 仓位金额：{:,}".format(round(pos_amount)),
-                "- **买入原因**：{}".format(p.get("buy_reason", "") or "未记录"),
+                "- **买入原因**：{}".format(buy_reason),
                 "",
             ])
+            # 逐日操作日志（持有到现在的）
+            lines.append("| 日期 | 操作 | 理由 |")
+            lines.append("|------|------|------|")
+            lines.append("| {} | **买入** | {} |".format(p["buy_date"], buy_reason))
+            buy_d = p["buy_date"]
+            for date_key in sorted(daily_actions.keys()):
+                if date_key <= buy_d:
+                    continue
+                for act in daily_actions[date_key]:
+                    if act.get("name") == name:
+                        action = act.get("action", "")
+                        reason = act.get("reason", "")
+                        lines.append("| {} | {} | {} |".format(date_key, action, reason or "—"))
+            lines.append("")
 
     # 保存文件
     report_path = os.path.join(output_dir, "交割单.md")

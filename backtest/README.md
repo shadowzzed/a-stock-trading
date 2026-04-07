@@ -12,6 +12,10 @@
                                               经验提炼 & 存储
                                                     ↓
                                          注入到下一轮复盘的 Prompt
+
+日常对话 → 报告归档 → D+1 验证 ─────────────→ 合并蒸馏 → 新规则
+                                                    ↑
+回测 → 经验提取 → 自动导入 → ExpeL 蒸馏 ──────────┘
 ```
 
 **review/** 是 Trading Agent 本体，每天盘后跑多 Agent 复盘（情绪分析师、板块分析师、龙头辨识师、多空辩手、裁决官），产出当日分析报告。
@@ -26,10 +30,18 @@
 - **效果追踪**：追踪每条教训注入后的实际改善，自动降权无效教训、升级高效教训
 - **D→D+1 回测引擎**：用 Day D 跑 Agent → 用 Day D+1 实际行情验证 → 四维打分（情绪/板块/龙头/策略，满分 20）
 
+### v1.0.0 新增（2026-04-07）
+- **版本号机制**：每次能力变更有版本号（`trading_agent/version.py`），回测输出目录带版本号，日常报告带版本号
+- **Reflect 反思节点**：Agent 输出操作建议前，自动对照历史失败教训审查修正
+- **数据纪律**：所有 prompt 加入"行情数据必须来自工具查询"红线 + LLM 数据溯源审查节点
+- **经验自动导入**：`python -m backtest.import_experience` 一键导入，告别手动审阅
+- **日常报告归档**：实盘分析报告自动保存到 `~/shared/trading/daily_reports/{日期}/`，含 D+1 验证
+- **ExpeL 批量蒸馏**：对比成功 vs 失败交易组，LLM 自动归纳系统性规则
+
 ### 建设方向
-1. **自动化流水线**：定时拉取最新数据，自动跑回测，无需人工触发
-2. **Prompt 自优化**：根据效果追踪数据自动调整 Prompt 模板（而非手工迭代 v1→v2→v3）
-3. **量化规则提炼**：将反复验证有效的教训自动转化为可执行的量化规则（写入 knowledge/quantitative_rules.json）
+1. **Prompt 自优化**：根据效果追踪数据自动调整 Prompt 模板（OPRO/DSPy）
+2. **多 Agent 对抗辩论**：Bull/Bear 辩论 + Risk Manager 裁决
+3. **LoRA 微调**：积累 500+ 回测样本后，微调交易专用模型
 4. **趋势看板**：回测得分的时序趋势、各维度雷达图、教训覆盖率等可视化
 
 ## 架构设计
@@ -41,6 +53,8 @@ backtest/
 │   ├── classifier.py    # 市场数据 → 离散场景标签（7 个维度）
 │   ├── tracker.py       # 教训效果追踪 + 自动升降权（active/deprecated/promoted）
 │   ├── prompt_engine.py # 场景感知的动态 Prompt 注入（按 Agent 分配不同类型教训）
+│   ├── auto_import.py   # 经验自动导入器（过滤 + 批量导入）
+│   ├── distill.py       # ExpeL 批量经验蒸馏（对比成功/失败组归纳规则）
 │   └── migrate.py       # 从旧 agent_lessons.json 格式迁移
 ├── engine/              # 回测引擎（接口驱动，依赖注入）
 │   ├── protocols.py     # 数据/Agent/LLM 三个接口协议
@@ -52,7 +66,15 @@ backtest/
 │   ├── signal_parser.py # 报告 → 交易信号解析
 │   └── evaluator.py     # 交易模拟结果评估
 ├── adapter.py           # 唯一桥接 review/ 的适配器（持仓状态注入 + 审计）
-└── run.py               # CLI 入口
+├── run.py               # CLI 入口
+├── import_experience.py # 经验导入 CLI
+└── distill.py           # 蒸馏 CLI
+
+trading_agent/
+├── version.py           # Agent 版本号 + CHANGELOG
+└── chat/
+    ├── graph.py         # LangGraph 图（含 reflect + validate_output 节点）
+    └── report_archiver.py # 日常报告归档器
 
 tests/
 └── test_backtest_no_future_leak.py  # 数据泄露防护测试（17 个用例）
@@ -266,16 +288,82 @@ python -m pytest tests/test_backtest_no_future_leak.py -v
 ### 集成测试（需要数据 + LLM）
 
 ```bash
-# 完整回测
+# 完整回测（输出目录自动带版本号，如 20260407_120000_v1.0.0/）
 python -m backtest.run --data-dir ~/shared/trading --start 2026-03-24 --end 2026-03-31
+
+# 回测 + 自动导入经验 + ExpeL 蒸馏（一条命令全闭环）
+python -m backtest.run --data-dir ~/shared/trading --start 2026-03-01 --end 2026-03-31 \
+    --auto-import --distill
 
 # 并行模式（注意：无持仓状态传递）
 python -m backtest.run --data-dir ~/shared/trading --start 2026-03-24 --workers 4
 
 # 仅交易模拟（复用已有报告，零 LLM 消耗）
 python -m backtest.run --data-dir ~/shared/trading --start 2026-03-24 --trade-sim-only
+```
 
-# 干跑（检查数据加载和场景分类，不消耗 LLM）
+### 经验导入
+
+```bash
+# 预览将导入哪些经验
+python -m backtest.import_experience ~/shared/backtest/20260405_v1.0.0/ --dry-run
+
+# 交互式导入（逐条确认）
+python -m backtest.import_experience ~/shared/backtest/20260405_v1.0.0/
+
+# 全自动导入（流水线中使用）
+python -m backtest.import_experience ~/shared/backtest/20260405_v1.0.0/ --auto
+```
+
+### ExpeL 蒸馏
+
+```bash
+# 对单次回测蒸馏
+python -m backtest.distill ~/shared/backtest/20260405_v1.0.0/
+
+# 合并多次回测蒸馏（跨时间窗口找规律）
+python -m backtest.distill ~/shared/backtest/202604*/
+
+# 合并回测 + 日常报告蒸馏
+python -m backtest.distill ~/shared/backtest/202604*/ ~/shared/trading/daily_reports/
+
+# 蒸馏并自动导入新规则
+python -m backtest.distill ~/shared/backtest/202604*/ --auto-import
+```
+
+### 版本对比
+
+当 Agent 能力升级后（prompt 修改、新增规则等），用同一批历史数据重新回测，对比前后版本的表现：
+
+```bash
+# 修改 trading_agent/version.py 中的 AGENT_VERSION（如 v1.0.0 → v1.1.0）
+# 然后用同一批数据重新回测
+python -m backtest.run --data-dir ~/shared/trading --start 2026-03-01 --end 2026-03-31
+
+# 对比两个版本的输出目录（手动对比 summary JSON 或 distill_report）
+# 输出目录名中已包含版本号，便于区分：
+#   ~/shared/backtest/20260407_100000_v1.0.0/
+#   ~/shared/backtest/20260407_150000_v1.1.0/
+```
+
+### 日常报告归档
+
+日常报告归档是**自动的**——每次 tradeAgent 输出含操盘计划的报告，会自动保存到：
+
+```
+~/shared/trading/daily_reports/
+  2026-04-07/
+    report.md              # 完整分析报告
+    focus_stocks.json      # 结构化推荐标的
+    metadata.json          # 元数据（版本号、时间戳）
+    verify.json            # D+1 验证结果（次日自动生成）
+```
+
+这些归档数据可以直接被 ExpeL 蒸馏模块消费。
+
+### 干跑（检查数据，不消耗 LLM）
+
+```bash
 python -c "
 from backtest.adapter import ReviewDataProvider
 dp = ReviewDataProvider()
@@ -285,3 +373,20 @@ for d in dates:
     print(d, md.limit_up_count, md.limit_down_count, md.blown_rate)
 "
 ```
+
+## Agent 对话图拓扑
+
+```
+START → manage_context → dispatch → [fan_out] → run_analyst → synthesize
+                                         ↘                         ↓
+                                      direct_reply → reflect → validate_output → END
+                                                       ↑              ↑
+                                                  对照历史教训    LLM 数据审查
+                                                  修正策略错误    + 报告归档
+```
+
+| 节点 | 用途 |
+|------|------|
+| `reflect` | 对照 ExperienceStore 中的失败教训审查操作建议，发现重复犯错时自动修正 |
+| `validate_output` | LLM 审查数据溯源（行情数据是否标注了工具来源），未通过则拦截 |
+| 报告归档 | 在 validate_output 中自动触发，将含操盘计划的报告保存为结构化文件 |

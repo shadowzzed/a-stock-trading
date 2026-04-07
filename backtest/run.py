@@ -43,6 +43,10 @@ def main():
                         help="简化盈亏模式：提到即买入（D+1开盘买，D+2开盘卖），纯测选股")
     parser.add_argument("--workers", type=int, default=1,
                         help="并行 worker 数（加速 LLM 调用，默认1=顺序）")
+    parser.add_argument("--auto-import", action="store_true",
+                        help="回测完成后自动导入经验到 ExperienceStore")
+    parser.add_argument("--distill", action="store_true",
+                        help="回测完成后运行 ExpeL 批量经验蒸馏")
     args = parser.parse_args()
 
     data_provider = ReviewDataProvider()
@@ -55,8 +59,23 @@ def main():
 
     print("发现 {} 个交易日: {} ~ {}".format(len(dates), dates[0], dates[-1]))
 
-    output_dir = args.output or os.path.join(args.data_dir, "backtest_v6")
+    # 获取 Agent 版本号
+    try:
+        from trading_agent.version import get_version
+        agent_version = get_version()
+    except ImportError:
+        agent_version = "unknown"
+
+    if args.output:
+        output_dir = args.output
+    else:
+        # 每次回测新建带时间戳+版本号的目录
+        from datetime import datetime
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        output_dir = os.path.join(os.path.expanduser("~/shared/backtest"),
+                                  f"{ts}_{agent_version}")
     os.makedirs(output_dir, exist_ok=True)
+    print("输出目录: {}".format(output_dir))
 
     # ── 简化盈亏模式 ──
     if args.simple_pnl:
@@ -82,6 +101,44 @@ def main():
         output_dir=output_dir,
         workers=args.workers,
     )
+
+    # ── 回测后自动导入经验 ──
+    if args.auto_import:
+        try:
+            from .experience.store import ExperienceStore
+            from .experience.auto_import import ExperienceAutoImporter
+
+            store_path = os.path.expanduser("~/shared/trading/backtest/experience_store.json")
+            store = ExperienceStore(store_path)
+            importer = ExperienceAutoImporter(store)
+            stats = importer.import_from_backtest_dir(
+                output_dir,
+                auto_approve=True,
+                agent_version=agent_version,
+            )
+            print(f"\n经验自动导入: {stats}")
+        except Exception as e:
+            print(f"\n经验自动导入失败: {e}")
+
+    # ── 回测后 ExpeL 蒸馏 ──
+    if args.distill:
+        try:
+            from .experience.store import ExperienceStore
+            from .experience.distill import ExperienceDistiller
+
+            store_path = os.path.expanduser("~/shared/trading/backtest/experience_store.json")
+            store = ExperienceStore(store_path)
+            distiller = ExperienceDistiller(store)
+            report = distiller.distill(
+                data_dirs=[output_dir],
+                agent_version=agent_version,
+                auto_import=True,
+            )
+            distiller.save_report(report, output_dir)
+            print(f"\nExpeL 蒸馏完成: {len(report.new_rules)} 条新规则, "
+                  f"{len(report.reinforced)} 条被强化")
+        except Exception as e:
+            print(f"\nExpeL 蒸馏失败: {e}")
 
     # ── 回测后追加交易模拟 ──
     if args.trade_sim:

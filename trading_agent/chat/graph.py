@@ -1,7 +1,7 @@
 """LangGraph StateGraph — Trade Agent 对话图。
 
 图拓扑：
-  START → manage_context → dispatch → [fan_out] → run_analyst → synthesize → END
+  START → manage_context → dispatch → [fan_out] → run_analyst → synthesize → reflect → validate_output → END
 
 上下文管理策略（三层模型）：
   - 摘要层：超过 SUMMARY_THRESHOLD 条消息时，LLM 摘要旧消息，写入 state.summary
@@ -14,6 +14,7 @@ from __future__ import annotations
 import json
 import logging
 import operator
+import os
 import sqlite3
 from pathlib import Path
 from typing import Annotated, Any, Dict, List, Optional, Sequence, TypedDict
@@ -289,6 +290,204 @@ def synthesize(state: TradingState) -> dict:
     return {"messages": [AIMessage(content=reply)]}
 
 
+def reflect(state: TradingState) -> dict:
+    """反思节点：对照历史失败教训审视输出，发现重复犯错时自动修正。
+
+    只在回复包含操作建议时触发（纯数据查询跳过）。
+    教训从 ExperienceStore 按当前场景动态检索。
+    """
+    messages = state.get("messages", [])
+    if not messages:
+        return {}
+
+    last_msg = messages[-1]
+    content = last_msg.content if hasattr(last_msg, "content") else ""
+    if not content or not isinstance(content, str):
+        return {}
+
+    # 短回复 / 纯数据查询跳过
+    if len(content) < 200:
+        return {}
+
+    # 检测是否包含操作建议（推荐标的、仓位、买入等关键词）
+    import re
+    recommendation_keywords = re.compile(
+        r"(买入|卖出|持有|仓位|focus_stocks|操盘计划|明日策略|推荐标的|关注标的)"
+    )
+    if not recommendation_keywords.search(content):
+        return {}
+
+    # 从 ExperienceStore 检索匹配的失败教训
+    try:
+        from backtest.experience.store import ExperienceStore
+        from config import get_config
+
+        cfg = get_config()
+        store_path = os.path.join(cfg.get("data_root", ""), "backtest", "experience_store.json")
+        if not os.path.exists(store_path):
+            # 尝试备用路径
+            store_path = os.path.expanduser("~/shared/trading/backtest/experience_store.json")
+        if not os.path.exists(store_path):
+            logger.debug("经验库不存在，跳过反思: %s", store_path)
+            return {}
+
+        store = ExperienceStore(store_path)
+        lessons = store.search(max_results=5, min_confidence=0.3)
+
+        if not lessons:
+            return {}
+
+        # 格式化教训
+        lesson_parts = []
+        for i, exp in enumerate(lessons, 1):
+            lesson_parts.append(
+                f"{i}. **{exp.error_type}**（置信度 {exp.confidence:.0%}，出现 {exp.occurrence_count} 次）\n"
+                f"   教训：{exp.lesson}\n"
+                f"   修正规则：{exp.correction_rule}"
+            )
+        lessons_text = "\n".join(lesson_parts)
+
+    except Exception as e:
+        logger.warning("加载经验库失败，跳过反思: %s", e)
+        return {}
+
+    reflect_prompt = f"""你是交易策略审查员。请对照历史失败教训，审查以下分析报告。
+
+## 历史失败教训（在类似市场场景中验证过的）
+{lessons_text}
+
+## 待审查的分析报告
+{content}
+
+## 审查要求
+1. 逐条对照教训，检查报告中的推荐是否重复了已知的失败模式
+2. 如果发现问题：
+   - 直接在原文基础上修正
+   - 在修正处标注 [反思修正：原因]
+   - 修正可以是：删除有问题的推荐、调整仓位建议、补充风险提示
+3. 如果没有问题：原样输出报告内容，不加任何标注
+4. 保持原文的格式和结构，只修正有问题的部分
+
+直接输出最终版本的报告（不要输出分析过程）："""
+
+    try:
+        llm = _get_llm()
+        resp = llm.invoke([HumanMessage(content=reflect_prompt)])
+        revised = resp.content if hasattr(resp, "content") else ""
+
+        if isinstance(revised, list):
+            revised = "\n".join(
+                block.text if hasattr(block, "text") else str(block)
+                for block in revised
+            )
+
+        if revised and revised.strip():
+            logger.info("反思节点完成，输出长度: %d → %d", len(content), len(revised))
+            return {"messages": [AIMessage(content=revised)]}
+    except Exception as e:
+        logger.warning("反思节点异常，跳过: %s", e)
+
+    return {}
+
+
+def validate_output(state: TradingState) -> dict:
+    """数据校验节点：用 LLM 审查最终输出中是否存在未经工具验证的行情数据。
+
+    审查策略：
+    1. 将最终回复交给 LLM 审查员
+    2. 审查员识别所有行情数据声明（连板数、涨停状态、价格、成交量等）
+    3. 检查每个数据声明是否有 [工具名] 溯源标注
+    4. 未溯源的数据 → 追加警告提示
+    """
+    messages = state.get("messages", [])
+    if not messages:
+        return {}
+
+    last_msg = messages[-1]
+    content = last_msg.content if hasattr(last_msg, "content") else ""
+    if not content or not isinstance(content, str):
+        return {}
+
+    # 短回复（闲聊等）跳过审查，节省 token
+    if len(content) < 50:
+        return {}
+
+    review_prompt = """你是一个数据溯源审查员。请审查以下 A 股交易分析回复，找出所有**未标注工具来源**的行情数据。
+
+行情数据包括但不限于：
+- 个股的连板数（如"3连板"、"首板"、"5板"）
+- 涨停/跌停/炸板状态
+- 具体价格、涨跌幅
+- 封单量、成交量、成交额
+- 板块涨跌停家数
+- 资金流入流出金额
+
+合规的数据标注格式为：数据后紧跟 `[工具名]`，如"首板 [get_market_data]"。
+
+请检查回复中的每一条行情数据是否有 `[工具名]` 标注。
+
+如果所有行情数据都已标注，或回复中不包含行情数据，输出：
+PASS
+
+如果存在未标注的行情数据，输出：
+FAIL
+- 未标注数据1（如"金牛化工3连板"缺少工具来源标注）
+- 未标注数据2
+...
+最多列出5条。
+
+---
+待审查的回复：
+{content}"""
+
+    try:
+        llm = _get_llm()
+        resp = llm.invoke([HumanMessage(content=review_prompt.format(content=content))])
+        review_result = resp.content.strip() if hasattr(resp, "content") else ""
+
+        if isinstance(review_result, list):
+            review_result = "\n".join(
+                block.text if hasattr(block, "text") else str(block)
+                for block in review_result
+            )
+
+        if review_result.startswith("PASS"):
+            logger.info("数据溯源审查通过")
+            return {}
+
+        if review_result.startswith("FAIL"):
+            # 审查未通过：拦截原始回复，替换为错误提示
+            issues = review_result[4:].strip()
+            blocked_reply = (
+                "⚠️ **数据审查未通过，回复已拦截**\n\n"
+                "以下行情数据未经工具验证，为避免提供错误信息，原始回复不予展示：\n"
+                + issues
+                + "\n\n请重新提问，我会通过工具查询获取准确数据后再回复。"
+            )
+            logger.warning("数据溯源审查未通过，已拦截回复: %s", issues[:200])
+            return {"messages": [AIMessage(content=blocked_reply)]}
+
+    except Exception as e:
+        logger.warning("数据溯源审查异常，跳过: %s", e)
+
+    # ── 报告归档（审查通过后，异步归档，不阻塞回复）──
+    try:
+        final_content = content  # 可能被审查替换过
+        if messages:
+            last = messages[-1]
+            final_content = last.content if hasattr(last, "content") else content
+
+        from .report_archiver import ReportArchiver
+        from trading_agent.version import get_version
+
+        archiver = ReportArchiver()
+        archiver.archive(final_content, version=get_version())
+    except Exception as e:
+        logger.debug("报告归档跳过: %s", e)
+
+    return {}
+
+
 # ── 路由函数 ───────────────────────────────────────────
 
 
@@ -508,6 +707,8 @@ def build_graph():
     builder.add_node("run_analyst", run_analyst)
     builder.add_node("synthesize", synthesize)
     builder.add_node("direct_reply", direct_reply)
+    builder.add_node("reflect", reflect)
+    builder.add_node("validate_output", validate_output)
 
     # 边
     builder.add_edge(START, "manage_context")
@@ -523,9 +724,11 @@ def build_graph():
     # run_analyst 完成 → synthesize
     builder.add_edge("run_analyst", "synthesize")
 
-    # synthesize 和 direct_reply → END
-    builder.add_edge("synthesize", END)
-    builder.add_edge("direct_reply", END)
+    # synthesize / direct_reply → reflect → validate_output → END
+    builder.add_edge("synthesize", "reflect")
+    builder.add_edge("direct_reply", "reflect")
+    builder.add_edge("reflect", "validate_output")
+    builder.add_edge("validate_output", END)
 
     return builder
 

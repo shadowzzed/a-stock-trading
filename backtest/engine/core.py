@@ -315,7 +315,9 @@ class BacktestEngine:
             workers: 并行 worker 数（加速 LLM 调用）
         """
         if not output_dir:
-            output_dir = os.path.join(data_dir, "backtest_v6")
+            from datetime import datetime
+            ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+            output_dir = os.path.join(os.path.expanduser("~/shared/backtest"), ts)
         os.makedirs(output_dir, exist_ok=True)
 
         # 初始化经验系统
@@ -502,9 +504,8 @@ class BacktestEngine:
 
             # ── Step 4.5: 模拟 Day D+1 买入（更新持仓追踪）──
             if recs:
-                # 从报告提取买入原因
-                buy_plans = self._extract_buy_plans(report)
-                plan_reasons = {name: p.get("reason", "") for name, p in buy_plans.items()}
+                # 从报告提取买入原因（多来源合并）
+                plan_reasons = self._extract_all_buy_reasons(report)
                 portfolio.buy_from_recommendations(recs, day_d1, data_dir, buy_reasons=plan_reasons)
                 bought = [p["name"] for p in portfolio.positions if p["buy_date"] == day_d1]
                 if bought:
@@ -975,56 +976,169 @@ class BacktestEngine:
         return valid
 
     def _extract_buy_plans(self, report: str) -> dict[str, dict]:
-        """从"买入计划"章节提取各标的的详细操作信息"""
+        """从"新买入标的"章节提取各标的的详细操作信息"""
         plans = {}
-        # 匹配 "买入计划" 后的各标的段落
-        # 典型格式：
-        # **标的**：兰石重装
-        # **买入条件**：竞价高开3%以上
-        # **仓位**：3成
+        # 匹配 "新买入标的" 或 "买入计划" 章节内容
         buy_section = re.search(
-            r'###?\s*买入计划(.*?)(?=###?\s*(?:卖出|空仓|持仓)|$)',
+            r'#{2,4}\s*(?:新买入标的|买入计划|买入建议)(.*?)(?=#{2,4}\s*(?:卖出|空仓|持仓|风险|总结|七|八|九)|$)',
             report, re.DOTALL,
         )
         if not buy_section:
             return plans
 
         section_text = buy_section.group(1)
-        # 按标的分段（**标的**：xxx 或 | 标的 | ...）
-        stock_blocks = re.split(r'(?=\*\*标的\*\*[：:]|^\|\s*.*?\s*\|)', section_text, flags=re.MULTILINE)
 
-        for block in stock_blocks:
-            name_match = re.search(r'\*\*标的\*\*[：:]\s*(.+?)(?:\n|$)', block)
+        # ── 格式1: 子标题 #### 标的N：股票名（代码） + 嵌套表格 ──
+        # 典型：#### 标的1：华电能源（600726）\n| **逻辑** | ... | **买入条件** | ... |
+        sub_blocks = re.split(r'(?=####\s*标的\d*[：:])', section_text)
+        for block in sub_blocks:
+            if '####' not in block:
+                continue
+            name_match = re.search(r'####\s*标的\d*[：:]\s*(.+?)(?:\n|$)', block)
             if not name_match:
                 continue
-            stock_name = name_match.group(1).strip()
-            if len(stock_name) < 2:
-                continue
+            # 提取股票名（可能含代码，如"华电能源（600726）"）
+            raw_name = name_match.group(1).strip()
+            stock_name = re.sub(r'[（(].*?[）)]', '', raw_name).strip()
 
             condition = ""
-            cond_match = re.search(r'\*\*买入条件\*\*[：:]\s*(.+?)(?:\n|$)', block)
+            cond_match = re.search(r'\|\s*\*?\*?买入条件\*?\*?\s*\|\s*(.+?)\s*\|', block)
             if cond_match:
                 condition = cond_match.group(1).strip()
+            if not condition:
+                cond_match = re.search(r'\*\*买入条件\*\*[：:]\s*(.+?)(?:\n|$)', block)
+                if cond_match:
+                    condition = cond_match.group(1).strip()
 
             position = ""
-            pos_match = re.search(r'\*\*仓位\*\*[：:]\s*(.+?)(?:\n|$)', block)
+            pos_match = re.search(r'\|\s*\*?\*?仓位\*?\*?\s*\|\s*(.+?)\s*\|', block)
             if pos_match:
                 position = pos_match.group(1).strip()
+            if not position:
+                pos_match = re.search(r'\*\*仓位\*\*[：:]\s*(.+?)(?:\n|$)', block)
+                if pos_match:
+                    position = pos_match.group(1).strip()
 
-            # 提取参与逻辑（Markdown 表格行）
+            # 逻辑：匹配 | **逻辑** | xxx | 或 | 参与逻辑 | xxx |
             logic = ""
-            logic_match = re.search(r'\|\s*参与逻辑\s*\|\s*(.+?)\s*\|', block)
+            logic_match = re.search(r'\|\s*\*?\*?(?:参与)?逻辑\*?\*?\s*\|\s*(.+?)\s*\|', block)
             if logic_match:
                 logic = logic_match.group(1).strip()
 
-            plans[stock_name] = {
-                "action": "买入",
-                "condition": condition,
-                "position": position,
-                "reason": logic,
-            }
+            if stock_name:
+                plans[stock_name] = {
+                    "action": "买入",
+                    "condition": condition,
+                    "position": position,
+                    "reason": logic,
+                }
+
+        # ── 格式2: 表格 | 标的 | 逻辑 | 买入条件 | 仓位 | ──
+        if not plans:
+            for line in section_text.split('\n'):
+                # 跳过分隔行和表头
+                if '|---' in line or '| 标的' in line:
+                    continue
+                cells = [c.strip() for c in line.strip('|').split('|')]
+                if len(cells) >= 4:
+                    raw_name = re.sub(r'\*+', '', cells[0]).strip()
+                    stock_name = re.sub(r'[（(].*?[）)]', '', raw_name).strip()
+                    if stock_name and stock_name not in ('无', '-', '') and len(stock_name) >= 2:
+                        logic = re.sub(r'\*+', '', cells[1]).strip() if len(cells) > 1 else ""
+                        condition = re.sub(r'\*+', '', cells[2]).strip() if len(cells) > 2 else ""
+                        position = re.sub(r'\*+', '', cells[3]).strip() if len(cells) > 3 else ""
+                        plans[stock_name] = {
+                            "action": "买入",
+                            "condition": condition,
+                            "position": position,
+                            "reason": logic,
+                        }
+
+        # ── 格式3: 列表 1. **股票名（代码）**——逻辑 ──
+        if not plans:
+            for line in section_text.split('\n'):
+                m = re.match(r'\d+\.\s*\*\*(.+?)\*\*[—\-]+\s*(.+)', line)
+                if m:
+                    raw_name = m.group(1).strip()
+                    stock_name = re.sub(r'[（(].*?[）)]', '', raw_name).strip()
+                    logic = m.group(2).strip()
+                    if stock_name and len(stock_name) >= 2:
+                        plans[stock_name] = {
+                            "action": "买入",
+                            "condition": "",
+                            "position": "",
+                            "reason": logic,
+                        }
 
         return plans
+
+    def _extract_all_buy_reasons(self, report: str) -> dict[str, str]:
+        """从报告的多个位置提取买入原因，合并为 {股票名: 原因} 映射。
+
+        来源优先级：
+        1. focus_stocks JSON 的 reason/direction 字段
+        2. _extract_buy_plans（覆盖"新买入标的"、"关注标的"等格式）
+        3. "关注标的"表格的"逻辑"列
+        """
+        reasons: dict[str, str] = {}
+
+        # ── 来源1: focus_stocks JSON ──
+        json_match = re.search(r'```json\s*\n(.*?)\n```', report, re.DOTALL)
+        if not json_match:
+            # 不闭合的 JSON
+            json_start = re.search(r'```json\s*\n', report)
+            if json_start:
+                self._try_parse_focus_reasons(report[json_start.end():], reasons)
+        if json_match:
+            try:
+                data = json.loads(json_match.group(1))
+                for s in data.get("focus_stocks", []):
+                    if isinstance(s, dict) and s.get("name"):
+                        r = s.get("reason", "") or s.get("direction", "")
+                        if r:
+                            reasons[s["name"]] = r
+            except json.JSONDecodeError:
+                pass
+
+        # ── 来源2: _extract_buy_plans（各种 Markdown 格式）──
+        plans = self._extract_buy_plans(report)
+        for name, p in plans.items():
+            r = p.get("reason", "")
+            if r and name not in reasons:
+                reasons[name] = r
+
+        # ── 来源3: "关注标的"表格 | 标的 | 代码 | 方向 | 逻辑 | 买入条件 | ──
+        # 匹配表格中包含"逻辑"列的行
+        for line in report.split('\n'):
+            if '|---' in line or '| 标的' in line.lower():
+                continue
+            cells = [c.strip() for c in line.strip('|').split('|')]
+            if len(cells) >= 4:
+                # 检测是否包含代码（6位数字）
+                has_code = any(re.match(r'\d{6}', c.strip()) for c in cells)
+                if has_code:
+                    raw_name = re.sub(r'\*+', '', cells[0]).strip()
+                    stock_name = re.sub(r'[（(].*?[）)]', '', raw_name).strip()
+                    if stock_name and len(stock_name) >= 2:
+                        # 找"逻辑"列（通常第3或第4列）
+                        for cell in cells[2:]:
+                            cell_clean = re.sub(r'\*+', '', cell).strip()
+                            if cell_clean and cell_clean not in ('-', '买入', '卖出', '观望') and len(cell_clean) > 1:
+                                if stock_name not in reasons:
+                                    reasons[stock_name] = cell_clean
+                                break
+
+        return reasons
+
+    def _try_parse_focus_reasons(self, json_text: str, reasons: dict):
+        """从截断的 JSON 中提取 focus_stocks 的 reason 字段"""
+        stock_objects = re.findall(
+            r'\{\s*"name"\s*:\s*"([^"]+)"[^}]*?"reason"\s*:\s*"([^"]*)"',
+            json_text,
+        )
+        for name, reason in stock_objects:
+            if reason and name not in reasons:
+                reasons[name] = reason
 
     def _extract_experience_from_outcome(
         self,

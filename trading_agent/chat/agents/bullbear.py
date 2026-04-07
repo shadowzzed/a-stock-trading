@@ -1,4 +1,4 @@
-"""多空分析师 — 主线判断、板块轮动、资金流向、交易策略。"""
+"""交易员 — 主线判断、板块轮动、资金流向、交易策略。"""
 
 from __future__ import annotations
 
@@ -11,7 +11,7 @@ logger = logging.getLogger(__name__)
 
 
 class BullBearAgent(BaseAgent):
-    """多空分析师。
+    """交易员。
 
     擅长：主线/支线判定、板块轮动节奏、资金流向、量价关系、交易策略。
     """
