@@ -121,9 +121,9 @@ class ExperienceAutoImporter:
 
         # 执行导入
         for exp in candidates:
-            before_count = len(self.store.experiences)
+            before_count = len(self.store.all_experiences)
             self.store.add(exp)
-            after_count = len(self.store.experiences)
+            after_count = len(self.store.all_experiences)
 
             if after_count > before_count:
                 stats.added += 1

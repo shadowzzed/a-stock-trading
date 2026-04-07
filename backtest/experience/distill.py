@@ -413,7 +413,7 @@ class ExperienceDistiller:
 
     def _find_existing_match(self, rule: DistilledRule) -> Optional[Experience]:
         """在已有经验库中查找语义匹配的教训。"""
-        for exp in self.store.experiences:
+        for exp in self.store.all_experiences:
             # 简单文本匹配
             overlap = len(set(rule.rule) & set(exp.correction_rule))
             max_len = max(len(set(rule.rule)), len(set(exp.correction_rule)), 1)

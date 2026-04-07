@@ -42,7 +42,7 @@ def main():
 
     # 加载经验库
     store = ExperienceStore(args.store)
-    print(f"经验库: {args.store} ({len(store.experiences)} 条已有经验)")
+    print(f"经验库: {args.store} ({len(store.all_experiences)} 条已有经验)")
 
     importer = ExperienceAutoImporter(store)
 
