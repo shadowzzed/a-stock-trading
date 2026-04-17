@@ -20,11 +20,11 @@ from .screener import screen_stocks, ScoredStock, format_screening_result
 
 # ── Layer 3 风控参数（可调优） ──────────────────────────
 
-STOP_LOSS_PCT = -7.0       # 浮亏超过此比例 → 次日卖出（v8: 回到-7%最优）
-TAKE_PROFIT_PCT = 30.0     # 浮盈超过此比例 → 次日卖出（v8: 15→30%，用户要求）
-MAX_HOLD_DAYS = 5           # 最大持仓天数（v9: 3→5天，配合30%止盈）
-MAX_POSITIONS = 2           # 最大同时持仓数（v6: 回滚到2）
-POSITION_PCT = 0.30         # 每只标的仓位比例
+STOP_LOSS_PCT = -7.0       # 网格搜索最优（144种组合验证）
+TAKE_PROFIT_PCT = 15.0     # 网格搜索验证：15%/20%/30%效果相同（5天超时先于止盈触发）
+MAX_HOLD_DAYS = 5           # 网格搜索最优（5天≈7天，3天太短）
+MAX_POSITIONS = 2           # 网格搜索最优（1只太少机会，3只分散过多）
+POSITION_PCT = 0.30         # 固定30%仓位
 
 
 @dataclass
