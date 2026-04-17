@@ -214,35 +214,20 @@ def get_db_path():
 
 def init_db(conn):
     conn.execute("PRAGMA journal_mode=WAL")
+    # stock_meta 元数据表（存 minute_bars 缺少的字段：name, limit_pct, last_close）
     conn.execute("""
-        CREATE TABLE IF NOT EXISTS snapshots (
-            date        TEXT NOT NULL,
-            ts          TEXT NOT NULL,
-            code        TEXT NOT NULL,
-            name        TEXT,
-            price       REAL,
-            pctChg      REAL,
-            open        REAL,
-            high        REAL,
-            low         REAL,
-            last_close  REAL,
-            volume      INTEGER,
-            amount      REAL,
-            amount_yi   REAL,
-            limit_pct   INTEGER DEFAULT 10,
-            is_limit_up INTEGER DEFAULT 0,
-            is_limit_down INTEGER DEFAULT 0,
-            sector      TEXT DEFAULT '',
-            star        INTEGER DEFAULT 0,
-            in_pool     INTEGER DEFAULT 0,
-            PRIMARY KEY (date, ts, code)
+        CREATE TABLE IF NOT EXISTS stock_meta (
+            date       TEXT NOT NULL,
+            code       TEXT NOT NULL,
+            name       TEXT,
+            limit_pct  INTEGER DEFAULT 10,
+            last_close REAL,
+            PRIMARY KEY (date, code)
         )
     """)
-    conn.execute("CREATE INDEX IF NOT EXISTS idx_snap_date_ts ON snapshots(date, ts)")
-    conn.execute("CREATE INDEX IF NOT EXISTS idx_snap_code_date ON snapshots(code, date)")
-    conn.execute("CREATE INDEX IF NOT EXISTS idx_snap_pool ON snapshots(in_pool, date, ts)")
-    conn.execute("CREATE INDEX IF NOT EXISTS idx_snap_pctChg ON snapshots(date, ts, pctChg)")
-    conn.execute("CREATE INDEX IF NOT EXISTS idx_snap_limit ON snapshots(date, is_limit_up)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_meta_code ON stock_meta(code)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_meta_name ON stock_meta(name)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_meta_date ON stock_meta(date)")
     conn.commit()
 
 
@@ -257,37 +242,35 @@ def save_to_db(df, pool, date_str=None, ts=None):
     conn = sqlite3.connect(db_path, timeout=10)
     init_db(conn)
 
-    rows = []
+    # 写入 stock_meta（每个 code 每天只需一条）
+    meta_rows = []
     for _, r in df.iterrows():
         code = r["code"]
-        pool_info = pool.get(code)
-        in_pool = 1 if pool_info else 0
-        sector = pool_info[2] if pool_info else ""
-        star = 1 if pool_info and pool_info[1] else 0
-
         price = float(r["price"])
         last_close = float(r["last_close"])
-        limit_pct, is_up, is_down = check_limit(code, price, last_close)
 
-        rows.append((
-            date_str, ts, code, r.get("name", ""),
-            price, float(r.get("pctChg", 0)),
-            float(r["open"]), float(r["high"]), float(r["low"]), last_close,
-            int(r["vol"]), float(r["amount"]), float(r.get("amount_yi", 0)),
-            limit_pct, is_up, is_down,
-            sector, star, in_pool,
+        # 跳过异常数据：price 和 last_close 偏差超过 ±30%
+        if last_close > 0 and abs(price - last_close) / last_close > 0.3:
+            continue
+
+        limit_pct, _, _ = check_limit(code, price, last_close)
+
+        meta_rows.append((
+            date_str, code, r.get("name", ""),
+            limit_pct, last_close,
         ))
 
-    conn.executemany("""
-        INSERT OR REPLACE INTO snapshots
-        (date, ts, code, name, price, pctChg, open, high, low, last_close, volume, amount, amount_yi,
-         limit_pct, is_limit_up, is_limit_down, sector, star, in_pool)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    """, rows)
+    if meta_rows:
+        conn.executemany("""
+            INSERT OR REPLACE INTO stock_meta
+            (date, code, name, limit_pct, last_close)
+            VALUES (?, ?, ?, ?, ?)
+        """, meta_rows)
+
     conn.commit()
     conn.close()
 
-    return db_path, ts, len(rows)
+    return db_path, ts, len(meta_rows)
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -507,16 +490,32 @@ def cmd_query(date_str, ts, pool_only=False):
     if len(ts) == 5:
         ts = ts + ":00"
 
-    where = "WHERE date = ? AND ts = ?" if not pool_only else "WHERE date = ? AND ts = ? AND in_pool = 1"
-    rows = conn.execute(
-        "SELECT * FROM snapshots %s ORDER BY pctChg DESC" % where, (date_str, ts)
-    ).fetchall()
-    conn.close()
+    # 从 minute_bars 取指定时间点（取 <= ts 的最新一条）JOIN stock_meta 取元数据
+    pool_where = "AND m.in_pool = 1" if pool_only else ""
+    rows = conn.execute(f"""
+        SELECT b.date, b.time as ts, b.code, m.name,
+               b.close as price,
+               CASE WHEN m.last_close > 0 THEN ROUND((b.close - m.last_close) / m.last_close * 100, 2) ELSE 0 END as pctChg,
+               b.open, b.high, b.low, m.last_close,
+               b.volume, b.amount,
+               CASE WHEN b.amount > 100000000 THEN ROUND(b.amount / 100000000, 2) ELSE ROUND(b.amount / 10000, 2) END as amount_yi,
+               m.limit_pct,
+               CASE WHEN m.last_close > 0 AND b.close >= m.last_close * (1 + m.limit_pct / 100.0) THEN 1 ELSE 0 END as is_limit_up,
+               CASE WHEN m.last_close > 0 AND b.close <= m.last_close * (1 - m.limit_pct / 100.0) THEN 1 ELSE 0 END as is_limit_down,
+               m.sector, m.star, m.in_pool
+        FROM minute_bars b
+        INNER JOIN stock_meta m ON b.code = m.code AND b.date = m.date
+        WHERE b.date = ? AND b.time <= ?
+          {pool_where}
+        GROUP BY b.code
+        HAVING b.time = MAX(b.time)
+        ORDER BY pctChg DESC
+    """, (date_str, ts)).fetchall()
 
     if not rows:
         conn2 = sqlite3.connect(db_path, timeout=5)
-        available = [{"date": r[0], "ts": r[1]} for r in conn2.execute(
-            "SELECT DISTINCT date, ts FROM snapshots ORDER BY date DESC, ts DESC LIMIT 20"
+        available = [{"date": r[0], "time": r[1]} for r in conn2.execute(
+            "SELECT DISTINCT date, time FROM minute_bars ORDER BY date DESC, time DESC LIMIT 20"
         ).fetchall()]
         conn2.close()
         print(json.dumps({"error": "未找到 %s %s" % (date_str, ts), "available": available}, ensure_ascii=False, indent=2))
@@ -551,16 +550,30 @@ def cmd_compare(date1, ts1, date2, ts2):
         ts2 += ":00"
 
     rows = conn.execute("""
-        SELECT a.code, a.name, a.sector, a.star, a.in_pool,
-               a.price AS price1, a.pctChg AS pct1, a.amount_yi AS amt1,
-               b.price AS price2, b.pctChg AS pct2, b.amount_yi AS amt2,
-               b.pctChg - a.pctChg AS pct_delta,
-               b.amount_yi - a.amount_yi AS amt_delta
-        FROM snapshots a
-        JOIN snapshots b ON a.code = b.code
-        WHERE a.date = ? AND a.ts = ? AND b.date = ? AND b.ts = ?
+        SELECT a.code, m1.name, m1.sector, m1.star, m1.in_pool,
+               a.close AS price1, a.pct AS pct1, a.amount AS amt1,
+               b.close AS price2, b.pct AS pct2, b.amount AS amt2,
+               b.pct - a.pct AS pct_delta,
+               b.amount - a.amount AS amt_delta
+        FROM (
+            SELECT mb.code, mb.close, mb.amount,
+                   CASE WHEN sm.last_close > 0 THEN ROUND((mb.close - sm.last_close) / sm.last_close * 100, 2) ELSE 0 END as pct
+            FROM minute_bars mb
+            INNER JOIN stock_meta sm ON mb.code = sm.code AND mb.date = sm.date
+            WHERE mb.date = ? AND mb.time <= ?
+            GROUP BY mb.code HAVING mb.time = MAX(mb.time)
+        ) a
+        JOIN (
+            SELECT mb.code, mb.close, mb.amount,
+                   CASE WHEN sm.last_close > 0 THEN ROUND((mb.close - sm.last_close) / sm.last_close * 100, 2) ELSE 0 END as pct
+            FROM minute_bars mb
+            INNER JOIN stock_meta sm ON mb.code = sm.code AND mb.date = sm.date
+            WHERE mb.date = ? AND mb.time <= ?
+            GROUP BY mb.code HAVING mb.time = MAX(mb.time)
+        ) b ON a.code = b.code
+        LEFT JOIN stock_meta m1 ON a.code = m1.code AND ? = m1.date
         ORDER BY pct_delta DESC
-    """, (date1, ts1, date2, ts2)).fetchall()
+    """, (date1, ts1, date2, ts2, date1)).fetchall()
     conn.close()
 
     if not rows:
@@ -603,10 +616,12 @@ def cmd_bid(code):
     for i in range(1, 6):
         asks.append({"level": i, "price": float(r["ask%d" % i]), "vol": int(r["ask_vol%d" % i])})
 
+    lc = float(r["last_close"])
+    pct = round((float(r["price"]) - lc) / lc * 100, 2) if lc > 0 else 0.0
     output = {
         "code": r["code"],
         "price": float(r["price"]),
-        "pctChg": round((r["price"] - r["last_close"]) / r["last_close"] * 100, 2),
+        "pctChg": pct,
         "bids": bids,
         "asks": asks,
     }
@@ -651,19 +666,21 @@ def cmd_times(date_str=None):
 
     conn = sqlite3.connect(db_path, timeout=5)
     rows = conn.execute("""
-        SELECT date, ts, COUNT(*) as count,
-               SUM(in_pool) as pool_count,
-               ROUND(AVG(pctChg), 2) as avg_pct
-        FROM snapshots WHERE date = ?
-        GROUP BY date, ts ORDER BY ts
+        SELECT b.date, b.time as ts, COUNT(*) as count,
+               SUM(m.in_pool) as pool_count,
+               ROUND(AVG(CASE WHEN m.last_close > 0 THEN (b.close - m.last_close) / m.last_close * 100 ELSE 0 END), 2) as avg_pct
+        FROM minute_bars b
+        INNER JOIN stock_meta m ON b.code = m.code AND b.date = m.date
+        WHERE b.date = ?
+        GROUP BY b.date, b.time ORDER BY b.time
     """, (date_str,)).fetchall()
 
-    # 也列出所有有数据的日期
-    dates = [r[0] for r in conn.execute("SELECT DISTINCT date FROM snapshots ORDER BY date DESC").fetchall()]
+    dates = [r[0] for r in conn.execute("SELECT DISTINCT date FROM minute_bars ORDER BY date DESC").fetchall()]
     conn.close()
 
     times = [{"ts": r[1], "stocks": r[2], "in_pool": r[3], "avg_pctChg": r[4]} for r in rows]
     print(json.dumps({"date": date_str, "available_dates": dates, "snapshots": times}, ensure_ascii=False, indent=2))
+    # Note: key renamed from "snapshots" to maintain API compat
 
 
 # ═══════════════════════════════════════════════════════════════
