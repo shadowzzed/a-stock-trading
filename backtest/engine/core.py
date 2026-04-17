@@ -38,6 +38,11 @@ class Recommendation:
     is_limit_up: bool = False
     is_limit_down: bool = False
     pnl_pct: float = 0.0     # 按开盘买入计算的收益率
+    code: str = ""           # 股票代码
+    # Agent 自评自信度：high / medium / low
+    # low 在回测中会被跳过（不买入），以过滤跟风水货
+    # 字段缺失时默认 high，保持向后兼容
+    confidence: str = "high"
 
 
 @dataclass
@@ -120,6 +125,7 @@ class BacktestPortfolioTracker:
             should_sell = False
             sell_reason = ""
 
+            forced_exit = False  # 标记强制卖出（便于统计区分）
             if action == "卖出":
                 should_sell = True
                 sell_reason = agent_action.get("reason", "Agent 决策卖出")
@@ -128,11 +134,13 @@ class BacktestPortfolioTracker:
                 p["sell_condition"] = agent_action.get("sell_condition", "")
                 if hold_days >= self.MAX_HOLD_DAYS:
                     should_sell = True
+                    forced_exit = True
                     sell_reason = "持仓超过{}天强制卖出".format(self.MAX_HOLD_DAYS)
             else:
                 # Agent 没有对此持仓做出决策（可能是遗漏）
                 if hold_days >= self.MAX_HOLD_DAYS:
                     should_sell = True
+                    forced_exit = True
                     sell_reason = "Agent 未决策 + 持仓超过{}天".format(self.MAX_HOLD_DAYS)
                 # 否则默认持有
 
@@ -158,6 +166,8 @@ class BacktestPortfolioTracker:
                         "hold_days": hold_days,
                         "reason": sell_reason,
                         "buy_reason": p.get("buy_reason", ""),
+                        "forced_exit": forced_exit,
+                        "confidence": p.get("confidence", "high"),
                     }
                     sold_records.append(trade)
                     self.closed_trades.append(trade)
@@ -177,6 +187,8 @@ class BacktestPortfolioTracker:
                         "hold_days": hold_days,
                         "reason": sell_reason + "（无行情，按成本价）",
                         "buy_reason": p.get("buy_reason", ""),
+                        "forced_exit": forced_exit,
+                        "confidence": p.get("confidence", "high"),
                     }
                     sold_records.append(trade)
                     self.closed_trades.append(trade)
@@ -199,21 +211,34 @@ class BacktestPortfolioTracker:
 
     def buy_from_recommendations(
         self, recs: list, buy_date: str, data_dir: str, buy_reasons: dict = None,
+        max_buys: int = 1, sentiment_phase: str = "",
     ):
         """根据推荐标的在 buy_date 开盘价买入。
 
         Args:
             buy_reasons: {股票名: 参与逻辑} 从报告提取的买入原因
+            max_buys: 每日最多买入标的数（默认1只，符合30%仓位纪律）
+            sentiment_phase: 当前情绪阶段（仅传递，不在此处做硬过滤——
+                冰点/退潮期的超跌反弹由 Agent 层决策）
         """
         from ..adapter import CSVStockDataProvider
         loader = CSVStockDataProvider()
 
         buy_recs = [r for r in recs if r.action == "买入" and r.next_open > 0]
+        # confidence=low 的标的跳过（Agent 自评低自信度，过滤跟风水货）
+        skipped_low = [r for r in buy_recs if getattr(r, "confidence", "high") == "low"]
+        buy_recs = [r for r in buy_recs if getattr(r, "confidence", "high") != "low"]
+        if skipped_low:
+            print("  [confidence 过滤] 跳过 {} 只低置信标的: {}".format(
+                len(skipped_low), ", ".join(r.stock for r in skipped_low)))
         if not buy_recs:
             return
 
         position_pct = 0.3  # 固定 3 成
+        bought_count = 0
         for rec in buy_recs:
+            if bought_count >= max_buys:
+                break
             # 跳过已持仓标的
             if any(p["name"] == rec.stock for p in self.positions):
                 continue
@@ -238,14 +263,16 @@ class BacktestPortfolioTracker:
                 reason = getattr(rec, 'buy_condition', '') or getattr(rec, 'reason', '')
             self.positions.append({
                 "name": rec.stock,
-                "code": "",
+                "code": getattr(rec, 'code', ''),
                 "buy_date": buy_date,
                 "buy_price": buy_price,
                 "shares": shares,
                 "cost": cost,
                 "sell_condition": "",
                 "buy_reason": reason,
+                "confidence": getattr(rec, "confidence", "high"),
             })
+            bought_count += 1
 
     def get_state(self, current_date: str, data_dir: str) -> dict:
         """生成当前持仓状态快照，供传递给 Agent。"""
@@ -304,6 +331,7 @@ class BacktestEngine:
         output_dir: Optional[str] = None,
         on_progress=None,
         workers: int = 1,
+        no_experience_injection: bool = False,
     ) -> dict:
         """运行收益率驱动的回测
 
@@ -313,7 +341,9 @@ class BacktestEngine:
             output_dir: 输出目录
             on_progress: 进度回调 fn(idx, total, date, stage)
             workers: 并行 worker 数（加速 LLM 调用）
+            no_experience_injection: True 时完全禁用教训注入（裸 Agent 对照组）
         """
+        self._no_experience_injection = no_experience_injection
         if not output_dir:
             from datetime import datetime
             ts = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -383,11 +413,15 @@ class BacktestEngine:
                 "volume_change_pct": market_data.volume_change_pct,
             }
 
-            injection = prompt_engine.build_injection(
-                market_dict,
-                agents=["sentiment_analyst", "sector_analyst", "judge"],
-                max_lessons_per_agent=3,
-            )
+            if getattr(self, "_no_experience_injection", False):
+                injection = {}
+                print("  [教训注入] 已禁用（--no-experience-injection）")
+            else:
+                injection = prompt_engine.build_injection(
+                    market_dict,
+                    agents=["sentiment_analyst", "sector_analyst", "judge"],
+                    max_lessons_per_agent=3,
+                )
             injected_ids = []
 
             run_config: dict = {"backtest_mode": True}
@@ -402,8 +436,11 @@ class BacktestEngine:
                 )
                 injected_ids = [e.id for e in relevant][:9]
 
-                print("  [教训注入] {} 条，涉及 {}".format(
-                    sum(len(v) for v in injection.values()),
+                # 修复前版本误用 len(v) 把字符数当条数
+                total_chars = sum(len(v) for v in injection.values())
+                total_agents = len(injection)
+                print("  [教训注入] {} 个 agent 收到注入 (共 {} 字符)，涉及 {}".format(
+                    total_agents, total_chars,
                     ", ".join(injection.keys()),
                 ))
             else:
@@ -412,8 +449,49 @@ class BacktestEngine:
             result.injected_lessons = len(injected_ids)
 
             # ── Step 1.5: 根据前一天报告的 position_actions 执行卖出 ──
+            action_parse_warning = ""
             if portfolio.positions and prev_report:
                 position_actions = self._extract_position_actions(prev_report)
+                if not position_actions and portfolio.positions:
+                    # ── Fallback：解析失败时按浮亏规则自动决策 ──
+                    # 这把 41% 的"被动持有"转化为"规则化决策"
+                    from ..adapter import CSVStockDataProvider
+                    fallback_loader = CSVStockDataProvider()
+                    fallback_actions = []
+                    for p in portfolio.positions:
+                        daily = fallback_loader.load_stock_daily(data_dir, day_d, p["name"])
+                        if daily and daily.get("open", 0) > 0:
+                            pnl = (daily["open"] - p["buy_price"]) / p["buy_price"] * 100
+                            if pnl <= -3.0:
+                                fallback_actions.append({
+                                    "name": p["name"],
+                                    "action": "卖出",
+                                    "reason": "解析失败 fallback：浮亏{:+.1f}%超-3%阈值".format(pnl),
+                                })
+                            elif pnl >= 10.0:
+                                fallback_actions.append({
+                                    "name": p["name"],
+                                    "action": "卖出",
+                                    "reason": "解析失败 fallback：浮盈{:+.1f}%达+10%止盈".format(pnl),
+                                })
+                            else:
+                                fallback_actions.append({
+                                    "name": p["name"],
+                                    "action": "持有",
+                                    "reason": "解析失败 fallback：浮亏{:+.1f}%在阈值内".format(pnl),
+                                })
+                        else:
+                            fallback_actions.append({
+                                "name": p["name"],
+                                "action": "持有",
+                                "reason": "解析失败 fallback：无行情数据",
+                            })
+                    position_actions = fallback_actions
+                    action_parse_warning = (
+                        "前日报告未提取到 position_actions（{}），"
+                        "已用 fallback 规则决策（浮亏>3%卖出/浮盈>10%止盈/否则持有）"
+                    ).format(", ".join(p["name"] for p in portfolio.positions))
+                    print("  [fallback 决策] {}".format(action_parse_warning))
                 sold = portfolio.apply_position_actions(position_actions, day_d, data_dir)
                 if sold:
                     for s in sold:
@@ -506,7 +584,11 @@ class BacktestEngine:
             if recs:
                 # 从报告提取买入原因（多来源合并）
                 plan_reasons = self._extract_all_buy_reasons(report)
-                portfolio.buy_from_recommendations(recs, day_d1, data_dir, buy_reasons=plan_reasons)
+                portfolio.buy_from_recommendations(
+                    recs, day_d1, data_dir, buy_reasons=plan_reasons,
+                    sentiment_phase=scenario.sentiment_phase,
+                    max_buys=3,
+                )
                 bought = [p["name"] for p in portfolio.positions if p["buy_date"] == day_d1]
                 if bought:
                     print("  [模拟买入] {}".format(", ".join(bought)))
@@ -532,6 +614,7 @@ class BacktestEngine:
                 ],
                 "avg_pnl_pct": result.avg_pnl_pct,
                 "hit_rate": result.hit_rate,
+                "action_parse_warning": action_parse_warning,
                 "data_leak_audit": {
                     "clean": audit["clean"] if audit else True,
                     "blocked_count": audit["blocked_count"] if audit else 0,
@@ -779,6 +862,10 @@ class BacktestEngine:
                 continue
 
             plan = buy_plans.get(stock_name, {})
+            # confidence: 字段缺失时默认 high（向后兼容旧报告）
+            conf = str(info.get("confidence", "high")).lower()
+            if conf not in ("high", "medium", "low"):
+                conf = "high"
 
             # 加载 D+1 实际行情
             daily = stock_provider.load_stock_daily(data_dir, day_d1, stock_name)
@@ -788,6 +875,8 @@ class BacktestEngine:
                     action=plan.get("action", "买入"),
                     buy_condition=plan.get("condition", ""),
                     position=plan.get("position", ""),
+                    code=info.get("code", ""),
+                    confidence=conf,
                 ))
                 continue
 
@@ -805,6 +894,8 @@ class BacktestEngine:
                 action=plan.get("action", "买入"),
                 buy_condition=plan.get("condition", ""),
                 position=plan.get("position", ""),
+                code=info.get("code", ""),
+                confidence=conf,
                 next_open=open_price,
                 next_close=close_price,
                 next_high=daily.get("high", close_price),
@@ -818,33 +909,100 @@ class BacktestEngine:
         return recs
 
     @staticmethod
+    def _normalize_action(a: dict) -> dict:
+        """标准化 position_action 字段名（Agent 输出变体兼容）。"""
+        # name 变体：stock_name / ticker_name / 标的 / name
+        name = a.get("name") or a.get("stock_name") or a.get("ticker_name") or a.get("标的") or ""
+        return {
+            "name": name,
+            "action": a.get("action", ""),
+            "reason": a.get("reason", ""),
+            "sell_condition": a.get("sell_condition", ""),
+        }
+
+    @staticmethod
+    def _find_pa_in_tree(data) -> list:
+        """递归搜索 JSON 树中的 position_actions。"""
+        if isinstance(data, dict):
+            pa = data.get("position_actions")
+            if isinstance(pa, list):
+                return pa
+            for v in data.values():
+                result = BacktestEngine._find_pa_in_tree(v)
+                if result is not None:
+                    return result
+        return None
+
+    @staticmethod
     def _extract_position_actions(report: str) -> list[dict]:
         """从报告 JSON 中提取 position_actions（持仓决策）。
+
+        3 层防线：
+        1. JSON 代码块解析 + 递归搜索 position_actions 键
+        2. 裸 JSON 正则提取
+        3. Markdown 表格 / 列表中的卖出/持有信号
 
         Returns:
             [{"name": "xxx", "action": "卖出"/"持有", "reason": "...", "sell_condition": "..."}]
         """
-        # 优先从 ```json``` 块解析
-        json_match = re.search(r'```json\s*\n(.*?)\n```', report, re.DOTALL)
-        if json_match:
+        # ── 层 1：JSON 代码块解析 ──
+        json_matches = list(re.finditer(r'```json\s*\n(.*?)\n```', report, re.DOTALL))
+        for m in reversed(json_matches):
             try:
-                data = json.loads(json_match.group(1))
-                actions = data.get("position_actions", [])
-                if isinstance(actions, list):
-                    return [a for a in actions if isinstance(a, dict) and a.get("name")]
+                raw = m.group(1)
+                lines = raw.split('\n')
+                non_empty = [l for l in lines if l.strip()]
+                if non_empty:
+                    min_indent = min(len(l) - len(l.lstrip()) for l in non_empty)
+                    if min_indent > 0:
+                        raw = '\n'.join(l[min_indent:] if len(l) >= min_indent else l for l in lines)
+                data = json.loads(raw)
+                # 直接 list（MiniMax 偶尔返回）
+                if isinstance(data, list):
+                    actions = [BacktestEngine._normalize_action(a)
+                               for a in data if isinstance(a, dict)]
+                    valid = [a for a in actions if a["name"]]
+                    if valid:
+                        return valid
+                # 递归搜索 position_actions 键（支持嵌套 JSON 结构）
+                pa = BacktestEngine._find_pa_in_tree(data)
+                if pa is not None:
+                    actions = [BacktestEngine._normalize_action(a)
+                               for a in pa if isinstance(a, dict)]
+                    valid = [a for a in actions if a["name"]]
+                    if valid:
+                        return valid
+                    # 明确的空 [] → Agent 无持仓决策（如空仓日），不是解析失败
+                    return []
             except json.JSONDecodeError:
-                pass
+                continue
 
-        # Fallback: 裸 JSON
+        # ── 层 2：裸 JSON 正则 ──
         json_match = re.search(r'"position_actions"\s*:\s*\[(.*?)\]', report, re.DOTALL)
         if json_match:
             try:
                 actions = json.loads("[" + json_match.group(1) + "]")
-                return [a for a in actions if isinstance(a, dict) and a.get("name")]
+                valid = [BacktestEngine._normalize_action(a)
+                         for a in actions if isinstance(a, dict)]
+                valid = [a for a in valid if a["name"]]
+                if valid:
+                    return valid
             except json.JSONDecodeError:
                 pass
 
-        return []
+        # ── 层 3：Markdown 信号提取 ──
+        # 从报告自然语言中提取"卖出 xxx"/"持有 xxx"信号
+        actions = []
+        # 匹配 "**卖出**xxx" / "建议卖出xxx" / "明日卖出xxx" 模式
+        sell_patterns = re.findall(
+            r'(?:\*\*)?卖出(?:\*\*)?\s*[：:]*\s*([\u4e00-\u9fa5A-Za-z]{2,6})',
+            report,
+        )
+        for name in sell_patterns:
+            if name not in ('标的', '持仓', '建议', '操作', '条件', '理由'):
+                actions.append({"name": name, "action": "卖出", "reason": "Markdown提取", "sell_condition": ""})
+
+        return actions
 
     def _extract_focus_stocks(self, report: str) -> list[dict]:
         """从报告中提取推荐标的（优先 JSON 结构化输出，fallback 到 Markdown 解析）"""
@@ -853,22 +1011,34 @@ class BacktestEngine:
 
         # ── Priority: JSON structured output ──
         # Method 1: JSON ```json``` block with focus_stocks（闭合的代码块）
-        json_match = re.search(r'```json\s*\n(.*?)\n```', report, re.DOTALL)
-        if json_match:
+        # 优先匹配**最后一个** json 块 — LLM 的 <think> / 示例块可能在前，最终决策在末尾
+        json_matches = list(re.finditer(r'```json\s*\n(.*?)\n```', report, re.DOTALL))
+        for m in reversed(json_matches):
             try:
-                data = json.loads(json_match.group(1))
+                # 清理可能的首行缩进（LLM 有时把 JSON 放在缩进的段落里）
+                raw = m.group(1)
+                # 如果所有非空行都以相同缩进开头，统一去掉
+                lines = raw.split('\n')
+                non_empty = [l for l in lines if l.strip()]
+                if non_empty:
+                    min_indent = min(len(l) - len(l.lstrip()) for l in non_empty)
+                    if min_indent > 0:
+                        raw = '\n'.join(l[min_indent:] if len(l) >= min_indent else l for l in lines)
+                data = json.loads(raw)
                 stocks = data.get("focus_stocks", [])
-                if stocks:
+                if stocks is not None:  # 即使是空 [] 也认为匹配成功
                     valid = [s for s in stocks if isinstance(s, dict) and s.get("name") and len(s["name"]) >= 2]
                     if valid:
                         return valid
+                    # 明确的空列表 → 返回空（Agent 主动空仓）
+                    return []
             except json.JSONDecodeError:
-                pass
+                continue
 
         # Method 1.5: 不闭合的 JSON 代码块（LLM 输出被截断，如 max_tokens 不够）
         # 从 ```json 开始提取，尝试逐字符找到有效 JSON
         json_start = re.search(r'```json\s*\n', report)
-        if json_start and not json_match:
+        if json_start and not json_matches:
             json_text = report[json_start.end():]
             valid = self._try_parse_truncated_json(json_text)
             if valid:

@@ -23,3 +23,14 @@ monitor-agent = "monitor.agent:main"
 trading-doctor = "tools.doctor:main"
 chat-agent = "chat.__main__:main"
 backtest-v6 = "review.experience_backtest:main"
+
+[tool.ruff]
+target-version = "py39"
+# 只检查致命错误 — 运行时必炸的那些
+lint.select = [
+    "F821",   # undefined-name — 未定义变量（缺 import、拼错变量名）
+    "F811",   # redefined-while-unused — 重复定义覆盖
+]
+# 忽略已知的存量问题文件
+lint.per-file-ignores."trading_agent/chat/feishu_bot.py" = ["F821"]
+lint.per-file-ignores."backtest/run.py" = ["F811"]

@@ -62,30 +62,249 @@ class ReviewDataProvider:
 
         return date, summary
 
+    def load_market_snapshot(self, data_dir: str, date: str) -> dict:
+        """加载 Layer 1 所需的完整市场快照（直接从 DB 读取）"""
+        import sqlite3
+
+        db_path = os.path.join(data_dir, "intraday", "intraday.db")
+        snapshot = {"date": date}
+
+        conn = sqlite3.connect(db_path, timeout=10)
+        try:
+            # 涨停统计
+            row = conn.execute(
+                "SELECT COUNT(*), "
+                "SUM(CASE WHEN blown_count > 0 THEN 1 ELSE 0 END), "
+                "MAX(board_count) "
+                "FROM limit_up WHERE date = ?", (date,)
+            ).fetchone()
+            total_lu = row[0] or 0
+            blown = row[1] or 0
+            snapshot["limit_up_count"] = total_lu
+            snapshot["blown_rate"] = (blown / total_lu * 100) if total_lu > 0 else 0
+            snapshot["max_board"] = row[2] or 0
+
+            # 跌停统计
+            row = conn.execute(
+                "SELECT COUNT(*) FROM limit_down WHERE date = ?", (date,)
+            ).fetchone()
+            snapshot["limit_down_count"] = row[0] or 0
+
+            # 板块分布
+            rows = conn.execute(
+                "SELECT industry, COUNT(*) as cnt FROM limit_up "
+                "WHERE date = ? AND industry IS NOT NULL AND industry != '' "
+                "GROUP BY industry ORDER BY cnt DESC",
+                (date,),
+            ).fetchall()
+            snapshot["sector_distribution"] = {r[0]: r[1] for r in rows}
+
+            # 连板梯队
+            rows = conn.execute(
+                "SELECT board_count, name FROM limit_up "
+                "WHERE date = ? AND board_count > 1 ORDER BY board_count DESC",
+                (date,),
+            ).fetchall()
+            ladder = {}
+            for board, name in rows:
+                key = str(board)
+                if key not in ladder:
+                    ladder[key] = []
+                ladder[key].append(name)
+            snapshot["board_ladder"] = ladder
+
+            # 前日涨停数
+            prev_row = conn.execute(
+                "SELECT COUNT(*) FROM limit_up WHERE date = ("
+                "  SELECT MAX(date) FROM limit_up WHERE date < ?"
+                ")", (date,)
+            ).fetchone()
+            snapshot["prev_limit_up_count"] = prev_row[0] or 0
+
+        finally:
+            conn.close()
+
+        return snapshot
+
     def discover_dates(
         self, data_dir: str, start: Optional[str] = None, end: Optional[str] = None
     ) -> list[str]:
-        import glob as glob_mod
-        daily_root = os.path.join(data_dir, "daily")
-        all_dates = sorted([
-            d for d in os.listdir(daily_root)
-            if os.path.isdir(os.path.join(daily_root, d))
-        ])
+        import sqlite3
+        db_path = os.path.join(data_dir, "intraday", "intraday.db")
+        if not os.path.exists(db_path):
+            return []
+        conn = sqlite3.connect(db_path)
+        dates = [r[0] for r in conn.execute(
+            "SELECT DISTINCT date FROM daily_bars ORDER BY date"
+        ).fetchall()]
+        conn.close()
         if start:
-            all_dates = [d for d in all_dates if d >= start]
+            dates = [d for d in dates if d >= start]
         if end:
-            all_dates = [d for d in all_dates if d <= end]
-        # 只返回有行情数据的交易日（过滤周末/非交易日）
-        trading_dates = []
-        for d in all_dates:
-            csv_pattern = os.path.join(daily_root, d, "行情_*.csv")
-            if glob_mod.glob(csv_pattern):
-                trading_dates.append(d)
-        return trading_dates
+            dates = [d for d in dates if d <= end]
+        return dates
+
+
+class MarketJudgmentRunner:
+    """Layer 1: 市场研判运行器 — 精简 LLM 调用，只输出结构化 JSON
+
+    LLM 只负责判断情绪阶段、识别最强板块、输出买入门控信号。
+    不做选股、不做买卖决策。
+    """
+
+    SYSTEM_PROMPT = """你是 A 股短线市场研判专家。你的任务是分析当日市场数据，判断情绪阶段和最强板块方向。
+
+## 情绪周期模型
+冰点 → 修复 → 升温 → 高潮 → 分歧 → 退潮 → 冰点
+
+判断依据：
+- 涨停数趋势（增/减）、跌停数、炸板率
+- 连板高度和梯队完整度
+- 全市场成交额（≥2.5万亿容错率高，<2万亿环境差）
+
+## 行情日类型
+- 回暖日：量能放大、涨停集中、板块持续性强
+- 变盘日：缩量、波动加剧、绿盘>4000家
+- 震荡日：轮动快、持续性差
+
+## 买入门控（action_gate）
+- "可买入"：修复/升温/高潮期，市场环境健康
+- "谨慎"：分歧期，可做最强品种低吸
+- "空仓"：退潮/冰点/变盘日，不开新仓
+
+## 输出要求
+只输出一个 JSON，不要输出其他任何文字：
+
+```json
+{
+  "sentiment_phase": "修复",
+  "market_type": "回暖日",
+  "top_sectors": ["电力", "AI算力"],
+  "sector_logic": "电力板块连续3日领涨，龙头3板带动梯队",
+  "action_gate": "可买入"
+}
+```
+
+注意：
+- top_sectors 最多2个板块，用行业名称（如"电力"、"通信设备"、"电网设备"、"通用设备"）
+- sector_logic 一句话说明为什么选这些板块
+- 如果没有明确主线，top_sectors 填当日涨停最集中的行业"""
+
+    def run(self, market_snapshot: dict) -> dict:
+        """执行市场研判
+
+        Args:
+            market_snapshot: 市场数据快照，包含涨跌停数据等
+
+        Returns:
+            dict with sentiment_phase, market_type, top_sectors, sector_logic, action_gate
+        """
+        import json as json_mod
+        from config import get_ai_providers
+        from langchain_openai import ChatOpenAI
+        from langchain_core.messages import SystemMessage, HumanMessage
+
+        providers = get_ai_providers()
+        if not providers:
+            raise ValueError("未配置 AI 提供商")
+        primary = providers[0]
+        llm = ChatOpenAI(
+            model=primary["model"],
+            base_url=primary["base"],
+            api_key=primary["key"],
+            temperature=0,
+        )
+
+        user_msg = self._build_market_message(market_snapshot)
+        response = llm.invoke([
+            SystemMessage(content=self.SYSTEM_PROMPT),
+            HumanMessage(content=user_msg),
+        ])
+
+        return self._parse_judgment(response.content)
+
+    @staticmethod
+    def _build_market_message(snapshot: dict) -> str:
+        """构造市场数据消息"""
+        date = snapshot.get("date", "未知")
+        parts = [f"## {date} A股市场数据\n"]
+
+        parts.append("| 指标 | 数值 |")
+        parts.append("|------|------|")
+        parts.append(f"| 涨停数 | {snapshot.get('limit_up_count', '?')} |")
+        parts.append(f"| 跌停数 | {snapshot.get('limit_down_count', '?')} |")
+        parts.append(f"| 炸板率 | {snapshot.get('blown_rate', '?'):.1f}% |")
+        parts.append(f"| 最高连板 | {snapshot.get('max_board', '?')}板 |")
+
+        if snapshot.get("prev_limit_up_count"):
+            parts.append(f"| 前日涨停数 | {snapshot['prev_limit_up_count']} |")
+
+        # 板块分布
+        sector_dist = snapshot.get("sector_distribution", {})
+        if sector_dist:
+            parts.append("\n### 涨停板块分布（Top 10）\n")
+            parts.append("| 行业 | 涨停数 |")
+            parts.append("|------|--------|")
+            for sector, count in sorted(sector_dist.items(), key=lambda x: -x[1])[:10]:
+                parts.append(f"| {sector} | {count} |")
+
+        # 连板梯队
+        board_ladder = snapshot.get("board_ladder", {})
+        if board_ladder:
+            parts.append("\n### 连板梯队\n")
+            for board, stocks in sorted(board_ladder.items(), key=lambda x: -int(x[0])):
+                parts.append(f"- {board}板: {', '.join(stocks[:5])}")
+
+        return "\n".join(parts)
+
+    @staticmethod
+    def _parse_judgment(text: str) -> dict:
+        """从 LLM 输出中解析 JSON"""
+        import json as json_mod
+        import re
+
+        # 尝试提取 JSON 块
+        json_match = re.search(r'```json\s*(.*?)\s*```', text, re.DOTALL)
+        if json_match:
+            text = json_match.group(1)
+        else:
+            # 尝试直接解析整个文本
+            text = text.strip()
+            # 去掉可能的 markdown 包装
+            if text.startswith("```"):
+                text = re.sub(r'^```\w*\n?', '', text)
+                text = re.sub(r'\n?```$', '', text)
+
+        try:
+            result = json_mod.loads(text)
+        except json_mod.JSONDecodeError:
+            # 最后的 fallback：搜索第一个 { ... }
+            brace_match = re.search(r'\{[^{}]*\}', text, re.DOTALL)
+            if brace_match:
+                try:
+                    result = json_mod.loads(brace_match.group())
+                except json_mod.JSONDecodeError:
+                    result = {}
+            else:
+                result = {}
+
+        # 确保必要字段存在
+        defaults = {
+            "sentiment_phase": "未知",
+            "market_type": "震荡日",
+            "top_sectors": [],
+            "sector_logic": "",
+            "action_gate": "谨慎",
+        }
+        for key, default in defaults.items():
+            if key not in result:
+                result[key] = default
+
+        return result
 
 
 class ChatAgentRunner:
-    """Agent 运行器 — 调用 Trade Agent (chat/) 执行分析
+    """Agent 运行器 — 调用 Trade Agent (chat/) 执行分析（旧架构，保留兼容）
 
     与实盘使用完全相同的提示词和决策逻辑，
     回测验证的就是真正的 Trade Agent 能力。
@@ -103,6 +322,21 @@ class ChatAgentRunner:
 
         # 构造和实盘一样的自然语言消息
         message = self._build_backtest_message(date, prev_report, portfolio_state)
+
+        # 将经验教训注入到用户消息前部，让所有 Agent 都能看到
+        overrides = (config or {}).get("prompt_overrides", {})
+        if overrides:
+            lessons_parts = []
+            for agent_name, text in overrides.items():
+                lessons_parts.append(text)
+            lessons_block = "\n\n".join(lessons_parts)
+            message = (
+                "---\n## ⚠️ 历史经验教训（在类似场景中验证过的失败/成功模式）\n\n"
+                f"{lessons_block}\n\n"
+                "请在分析和推荐时参考以上教训，避免重复已知的失败模式。\n---\n\n"
+                + message
+            )
+
         agent = TradingChatAgent(backtest_max_date=date)
         result = agent.chat(message)
 
@@ -145,6 +379,21 @@ class ChatAgentRunner:
             "- 连板梯队和龙头辨识",
             "- 板块资金流向和主线持续性",
             "- 事件催化对次日的影响",
+            "- **趋势票扫描**：委托趋势分析师使用 scan_trend_stocks 扫描全市场趋势股，"
+            "寻找沿5日线/10日线上方健康运行的标的（如德明利模式）",
+            "",
+            "**选股双轨制**：",
+            "- **龙头股**（30%仓位/只）：连板龙头/空间板/板块总龙头，辨识度最高，高风险高收益",
+            "- **趋势票**（30%仓位/只）：由趋势分析师 scan_trend_stocks 推荐，沿均线运行的中军/主线股",
+            "- 最多同时持有3只（每只30%=90%仓位），不同板块分散风险",
+            "- 龙头优先，趋势票补充；如果某类没有合适标的，空着即可",
+            "",
+            "**执行纪律**：",
+            "- 每只标的的买入原因必须包含：板块逻辑、辨识度说明、预期管理（竞价低于预期怎么处理）",
+            "- focus_stocks 中每只标的的 reason 字段不能只写几个字，必须写完整的参与逻辑（至少30字）",
+            "- 严禁推荐后排跟风股、补涨股、无辨识度的边缘品种",
+            "- 根据你的交易体系判断何时买入、何时空仓，不设硬性情绪阶段限制",
+            "- 无论什么情绪阶段，都必须输出 focus_stocks（空仓时标注 action 为「观望」）",
         ]
 
         # 注入当前持仓状态
@@ -208,7 +457,7 @@ class LangChainLLMCaller:
                 model=primary["model"],
                 base_url=primary["base"],
                 api_key=primary["key"],
-                temperature=0.3,
+                temperature=0,
             )
         return self._llm
 
@@ -253,29 +502,35 @@ class CSVStockDataProvider:
     def load_stock_daily_by_code(
         self, data_dir: str, date: str, stock_code: str,
     ) -> Optional[dict]:
-        """按股票代码加载日线数据（CSV 优先，mootdx fallback）"""
-        import glob as glob_mod
+        """按股票代码加载日线数据（DB 优先，mootdx fallback）"""
+        import sqlite3
 
         # 兼容代码格式：000788 或 sz.000788 都支持
         normalized = stock_code.strip()
         if "." in normalized:
             normalized = normalized.split(".", 1)[1]
 
-        d_dir = os.path.join(data_dir, "daily", date)
-        csv_files = glob_mod.glob(os.path.join(d_dir, "行情_*.csv"))
-
-        for csv_file in csv_files:
+        db_path = os.path.join(data_dir, "intraday", "intraday.db")
+        if os.path.exists(db_path):
+            conn = sqlite3.connect(db_path, timeout=10)
             try:
-                for row in self._read_csv_safe(csv_file):
-                    code = row.get("代码", "").strip()
-                    # CSV 中可能是 "sz.000788" 或 "000788"，都匹配
-                    code_short = code.split(".", 1)[1] if "." in code else code
-                    if code_short == normalized:
-                        return self._row_to_dict(row, date)
+                row = conn.execute(
+                    "SELECT date, code, name, open, high, low, close, volume, amount "
+                    "FROM daily_bars WHERE date = ? AND code = ?",
+                    (date, normalized),
+                ).fetchone()
+                if row:
+                    return {
+                        "date": row[0], "code": row[1], "name": row[2] or "",
+                        "open": row[3], "high": row[4], "low": row[5],
+                        "close": row[6], "volume": row[7], "amount": row[8],
+                    }
             except Exception:
-                continue
+                pass
+            finally:
+                conn.close()
 
-        # CSV 未命中 → mootdx fallback
+        # DB 未命中 → mootdx fallback
         from trading_agent.review.data.loader import load_stock_daily_ohlcv_by_code
         result = load_stock_daily_ohlcv_by_code(data_dir, date, normalized)
         if result:
@@ -285,71 +540,68 @@ class CSVStockDataProvider:
     def load_limit_up_info(
         self, data_dir: str, date: str, stock_name: str,
     ) -> Optional[dict]:
-        """从涨停板 CSV 加载炸板次数等信息"""
-        import csv as csv_mod
-        import glob as glob_mod
+        """从 limit_up 表加载炸板次数等信息"""
+        import sqlite3
 
-        d_dir = os.path.join(data_dir, "daily", date)
-        csv_files = glob_mod.glob(os.path.join(d_dir, "涨停板_*.csv"))
-        if not csv_files:
+        db_path = os.path.join(data_dir, "intraday", "intraday.db")
+        if not os.path.exists(db_path):
             return None
 
-        for csv_file in csv_files:
-            try:
-                with open(csv_file, "r", encoding="utf-8-sig") as f:
-                    reader = csv_mod.DictReader(f)
-                    for row in reader:
-                        name = row.get("名称", "").strip()
-                        if name == stock_name:
-                            return {
-                                "name": name,
-                                "code": row.get("代码", ""),
-                                "broken_count": int(row.get("炸板次数", 0)),
-                                "first_seal_time": row.get("首次封板时间", ""),
-                                "board_count": int(row.get("连板数", 1)),
-                            }
-            except Exception:
-                continue
-
+        conn = sqlite3.connect(db_path, timeout=10)
+        try:
+            row = conn.execute(
+                "SELECT code, name, blown_count, first_limit_time, board_count "
+                "FROM limit_up WHERE date = ? AND name = ?",
+                (date, stock_name),
+            ).fetchone()
+            if row:
+                return {
+                    "name": row[1],
+                    "code": row[0],
+                    "broken_count": row[2] or 0,
+                    "first_seal_time": row[3] or "",
+                    "board_count": row[4] or 1,
+                }
+        except Exception:
+            pass
+        finally:
+            conn.close()
         return None
 
     def resolve_stock_code(
         self, data_dir: str, stock_name: str, date: str = "",
     ) -> Optional[str]:
-        """股票名称 → 代码"""
+        """股票名称 → 代码（从 stock_meta 表查询）"""
         if stock_name in self._name_code_cache:
             return self._name_code_cache[stock_name]
 
-        # 从最近的行情 CSV 查找
-        import csv as csv_mod
-        import glob as glob_mod
+        import sqlite3
 
-        daily_root = os.path.join(data_dir, "daily")
-        if not os.path.isdir(daily_root):
+        db_path = os.path.join(data_dir, "intraday", "intraday.db")
+        if not os.path.exists(db_path):
             return None
 
-        # 优先查指定日期，再查最近的
-        search_dates = [date] if date else []
-        if not search_dates:
-            dirs = sorted(os.listdir(daily_root), reverse=True)
-            search_dates = dirs[:5]
-
-        for d in search_dates:
-            csv_files = glob_mod.glob(
-                os.path.join(daily_root, d, "行情_*.csv")
-            )
-            for csv_file in csv_files:
-                try:
-                    with open(csv_file, "r", encoding="utf-8-sig") as f:
-                        reader = csv_mod.DictReader(f)
-                        for row in reader:
-                            if row.get("名称", "").strip() == stock_name:
-                                code = row.get("代码", "").strip()
-                                self._name_code_cache[stock_name] = code
-                                return code
-                except Exception:
-                    continue
-
+        conn = sqlite3.connect(db_path, timeout=10)
+        try:
+            if date:
+                row = conn.execute(
+                    "SELECT code FROM stock_meta WHERE date = ? AND name = ?",
+                    (date, stock_name),
+                ).fetchone()
+            else:
+                # 查最近的记录
+                row = conn.execute(
+                    "SELECT code FROM stock_meta WHERE name = ? ORDER BY date DESC LIMIT 1",
+                    (stock_name,),
+                ).fetchone()
+            if row:
+                code = row[0]
+                self._name_code_cache[stock_name] = code
+                return code
+        except Exception:
+            pass
+        finally:
+            conn.close()
         return None
 
     @staticmethod

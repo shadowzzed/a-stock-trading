@@ -47,7 +47,31 @@ def main():
                         help="回测完成后自动导入经验到 ExperienceStore")
     parser.add_argument("--distill", action="store_true",
                         help="回测完成后运行 ExpeL 批量经验蒸馏")
+    parser.add_argument("--reproducible", action="store_true",
+                        help="可复现模式：冻结全局经验库（禁用 --auto-import/--distill），"
+                             "强制 workers=1，用于一致性验证（推荐做 bug 修复回归时使用）")
+    parser.add_argument("--no-experience-injection", action="store_true",
+                        help="完全禁用教训注入（裸 Agent 对照组），"
+                             "用于 A/B 验证经验库对 Agent 决策的实际影响")
+    parser.add_argument("--layered", action="store_true",
+                        help="使用三层架构回测（Layer1:LLM研判 → Layer2:量化选股 → Layer3:风控执行）")
     args = parser.parse_args()
+
+    # ── 可复现模式：强制禁用会污染经验库的参数 ──
+    if args.reproducible:
+        if args.auto_import or args.distill:
+            print("[reproducible] --auto-import / --distill 已被禁用（与可复现模式互斥）")
+        args.auto_import = False
+        args.distill = False
+        if args.workers != 1:
+            print("[reproducible] workers 强制设为 1（原值: {}）".format(args.workers))
+            args.workers = 1
+        print("=" * 60)
+        print("[可复现模式已开启]")
+        print("  - 全局经验库仅查询，不写入")
+        print("  - 并行禁用（workers=1）")
+        print("  - 本轮经验提取仅保存到回测目录的 经验总结.md")
+        print("=" * 60)
 
     data_provider = ReviewDataProvider()
 
@@ -77,6 +101,18 @@ def main():
     os.makedirs(output_dir, exist_ok=True)
     print("输出目录: {}".format(output_dir))
 
+    # ── 三层架构模式 ──
+    if args.layered:
+        from .layered_engine import run_layered_backtest
+        run_layered_backtest(
+            data_dir=args.data_dir,
+            start_date=args.start or dates[0],
+            end_date=args.end or dates[-1],
+            output_dir=output_dir,
+            initial_capital=args.capital,
+        )
+        return
+
     # ── 简化盈亏模式 ──
     if args.simple_pnl:
         _run_simple_pnl(dates, args.data_dir, output_dir, args.capital)
@@ -100,6 +136,7 @@ def main():
         dates=dates,
         output_dir=output_dir,
         workers=args.workers,
+        no_experience_injection=args.no_experience_injection,
     )
 
     # ── 回测后自动导入经验 ──
