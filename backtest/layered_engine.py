@@ -79,33 +79,52 @@ class LayeredBacktestResult:
 
 
 def _code_sentiment_fallback(snapshot: dict) -> str:
-    """纯代码的情绪阶段判断 fallback（当 LLM 返回"未知"时使用）
+    """纯代码的情绪阶段判断 fallback（v2：含边际变化）
 
-    基于涨跌停数据的简单规则：
-    - 涨停 < 20 且 跌停 > 15 → 冰点
-    - 涨停 < 30 且 跌停 > 10 → 退潮
-    - 涨停 > 70 且 炸板率 < 30% → 高潮
-    - 涨停 50-70 → 升温
-    - 涨停 30-50 → 修复
-    - 其他 → 分歧
+    核心改进：加入前日对比，解决旧版"大部分天都判升温"的问题。
+    MiniMax 的 alpha 主要来自退潮识别，这里重点强化退潮/冰点判断。
     """
     lu = snapshot.get("limit_up_count", 0)
     ld = snapshot.get("limit_down_count", 0)
     blown = snapshot.get("blown_rate", 0)
+    prev_lu = snapshot.get("prev_limit_up_count", 0)
 
-    if lu < 20 and ld > 15:
-        return "冰点"
-    if lu < 30 and ld > 10:
+    # 边际变化
+    lu_delta = lu - prev_lu if prev_lu > 0 else 0
+    lu_drop_pct = (lu_delta / prev_lu * 100) if prev_lu > 0 else 0
+
+    # ── 优先级1：极端信号 ──
+    if ld >= 15 and blown > 50:
+        return "冰点"  # 极端退潮
+    if ld >= 10 and lu < 30:
         return "退潮"
-    if lu > 70 and blown < 30:
+
+    # ── 优先级2：边际恶化（退潮/分歧） ──
+    if lu_drop_pct < -40 and blown > 45 and ld >= 5:
+        return "退潮"  # 涨停数骤降 40%+ 且炸板率高且有跌停
+    if lu_drop_pct < -30 and ld >= 10:
+        return "分歧"  # 涨停数下降 30%+ 且跌停多
+    if blown > 55 and ld >= 5:
+        return "退潮"  # 炸板率极高且有跌停
+
+    # ── 优先级3：正面信号 ──
+    if lu > 80 and blown < 30:
         return "高潮"
-    if lu >= 50:
+    if lu > 60 and blown < 35:
         return "升温"
-    if lu >= 30:
+    if lu >= 40 and lu_delta > 0:
+        return "修复"  # 涨停数回升
+
+    # ── 优先级4：中性 ──
+    if lu >= 40:
+        if lu_delta >= 0:
+            return "修复"
+        else:
+            return "分歧"
+    if lu >= 25:
         return "修复"
-    if blown > 50:
-        return "退潮"
-    return "分歧"
+
+    return "冰点"
 
 
 def _get_open_price(db_path: str, date: str, code: str) -> Optional[float]:

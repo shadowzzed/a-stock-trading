@@ -190,11 +190,12 @@ class MarketJudgmentRunner:
 - sector_logic 一句话说明为什么选这些板块
 - 如果没有明确主线，top_sectors 填当日涨停最集中的行业"""
 
-    def run(self, market_snapshot: dict) -> dict:
+    def run(self, market_snapshot: dict, provider_index: int = 0) -> dict:
         """执行市场研判
 
         Args:
             market_snapshot: 市场数据快照，包含涨跌停数据等
+            provider_index: AI 提供商索引（0=MiniMax, 1=GLM, 2=Grok, 3=DeepSeek）
 
         Returns:
             dict with sentiment_phase, market_type, top_sectors, sector_logic, action_gate
@@ -207,11 +208,12 @@ class MarketJudgmentRunner:
         providers = get_ai_providers()
         if not providers:
             raise ValueError("未配置 AI 提供商")
-        primary = providers[0]
+        idx = min(provider_index, len(providers) - 1)
+        provider = providers[idx]
         llm = ChatOpenAI(
-            model=primary["model"],
-            base_url=primary["base"],
-            api_key=primary["key"],
+            model=provider["model"],
+            base_url=provider["base"],
+            api_key=provider["key"],
             temperature=0,
         )
 

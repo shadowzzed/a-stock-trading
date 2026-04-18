@@ -36,15 +36,21 @@ def cache_layer1(
     start_date: str,
     end_date: str,
     cache_dir: str,
+    provider_index: int = 0,
+    force_regenerate: bool = False,
 ) -> dict:
     """生成或加载 Layer 1 缓存
+
+    Args:
+        provider_index: AI 提供商索引（0=MiniMax, 1=GLM, 2=Grok, 3=DeepSeek）
+        force_regenerate: 强制重新生成缓存（忽略已有缓存）
 
     Returns:
         dict: {date: {sentiment_phase, top_sectors, action_gate, snapshot}}
     """
     cache_file = os.path.join(cache_dir, "layer1_cache.json")
 
-    if os.path.exists(cache_file):
+    if os.path.exists(cache_file) and not force_regenerate:
         with open(cache_file, "r") as f:
             cache = json.load(f)
         print(f"[Layer 1 缓存] 已加载 {len(cache)} 天")
@@ -60,7 +66,7 @@ def cache_layer1(
         print(f"  [Layer 1] {i+1}/{len(dates)} {date}...", end=" ")
         try:
             snapshot = provider.load_market_snapshot(data_dir, date)
-            judgment = runner.run(snapshot)
+            judgment = runner.run(snapshot, provider_index=provider_index)
 
             # Fallback
             if not judgment.get("top_sectors"):
@@ -104,22 +110,35 @@ def cache_layer1(
 
 
 def _code_sentiment(snapshot: dict) -> str:
+    """纯代码情绪判断 v2（含边际变化）"""
     lu = snapshot.get("limit_up_count", 0)
     ld = snapshot.get("limit_down_count", 0)
     blown = snapshot.get("blown_rate", 0)
-    if lu < 20 and ld > 15:
+    prev_lu = snapshot.get("prev_limit_up_count", 0)
+    lu_delta = lu - prev_lu if prev_lu > 0 else 0
+    lu_drop_pct = (lu_delta / prev_lu * 100) if prev_lu > 0 else 0
+
+    if ld >= 15 and blown > 50:
         return "冰点"
-    if lu < 30 and ld > 10:
+    if ld >= 10 and lu < 30:
         return "退潮"
-    if lu > 70 and blown < 30:
+    if lu_drop_pct < -40 and blown > 45 and ld >= 5:
+        return "退潮"
+    if lu_drop_pct < -30 and ld >= 10:
+        return "分歧"
+    if blown > 55 and ld >= 5:
+        return "退潮"
+    if lu > 80 and blown < 30:
         return "高潮"
-    if lu >= 50:
+    if lu > 60 and blown < 35:
         return "升温"
-    if lu >= 30:
+    if lu >= 40 and lu_delta > 0:
         return "修复"
-    if blown > 50:
-        return "退潮"
-    return "分歧"
+    if lu >= 40:
+        return "分歧" if lu_delta < 0 else "修复"
+    if lu >= 25:
+        return "修复"
+    return "冰点"
 
 
 def simulate_with_params(
