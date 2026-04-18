@@ -427,6 +427,136 @@ def _quick_score(code, name, close, volume, last_close,
     return score
 
 
+def update_minute_fast(state: MonitorState, date: str, current_time: str,
+                       minute_rows: list) -> list[dict]:
+    """高速版 update_minute — 使用预加载到内存的数据
+
+    Args:
+        minute_rows: [(code, close, volume, high, low, name, last_close, limit_pct), ...]
+    """
+    signals = []
+    state.last_update_time = current_time
+
+    if not minute_rows:
+        return signals
+
+    limit_up_count = 0
+    sector_counts = {}
+
+    for code, close, volume, high, low, name, last_close, limit_pct in minute_rows:
+        if last_close <= 0 or close <= 0:
+            continue
+
+        limit_up_price = _calc_limit_price(last_close, code)
+        is_at_limit = close >= limit_up_price
+
+        if is_at_limit:
+            limit_up_count += 1
+
+        # ── 已跟踪标的 ──
+        if code in state.stocks:
+            s = state.stocks[code]
+            s["current_price"] = close
+            s["last_close"] = last_close
+            s["limit_up_price"] = limit_up_price
+            if close > s.get("high", 0):
+                s["high"] = close
+            if close < s.get("low", 999999):
+                s["low"] = close
+
+            # 竞价
+            if current_time == "09:25" and s["is_watchlist"]:
+                s["auction_price"] = close
+                pct = (close - last_close) / last_close * 100
+                sig_key = f"{code}:auction"
+                if sig_key not in state.sent_signals:
+                    if pct >= AUCTION_STRONG_PCT:
+                        signals.append({"type": "auction_strong", "code": code,
+                                       "name": name, "message": f"竞价超预期：高开{pct:+.1f}%",
+                                       "time": current_time})
+                        state.sent_signals.append(sig_key)
+                    elif pct <= AUCTION_WEAK_PCT:
+                        signals.append({"type": "auction_weak", "code": code,
+                                       "name": name, "message": f"竞价低于预期：低开{pct:+.1f}%",
+                                       "time": current_time})
+                        state.sent_signals.append(sig_key)
+
+            # 封板/炸板
+            was_sealed = s.get("is_sealed", False)
+            if is_at_limit and not was_sealed:
+                s["is_sealed"] = True
+                if not s.get("first_seal_time"):
+                    s["first_seal_time"] = current_time
+                    s["seal_volume"] = volume
+                else:
+                    s["resealed"] = True
+                sig_key = f"{code}:seal:{current_time}"
+                if sig_key not in state.sent_signals:
+                    label = "回封" if s.get("resealed") else "封板"
+                    signals.append({"type": "sealed", "code": code, "name": name,
+                                   "message": f"{label}（{current_time}）", "time": current_time})
+                    state.sent_signals.append(sig_key)
+            elif not is_at_limit and was_sealed:
+                s["is_sealed"] = False
+                s["blown_count"] = s.get("blown_count", 0) + 1
+                sig_key = f"{code}:blown:{current_time}"
+                if sig_key not in state.sent_signals:
+                    signals.append({"type": "blown", "code": code, "name": name,
+                                   "message": f"炸板（第{s['blown_count']}次，{current_time}）",
+                                   "time": current_time})
+                    state.sent_signals.append(sig_key)
+
+            # 止损/止盈
+            buy_price = s.get("buy_price", 0)
+            if buy_price > 0 and current_time >= "09:30":
+                float_pnl = (close - buy_price) / buy_price * 100
+                if float_pnl <= STOP_LOSS_PCT:
+                    sig_key = f"{code}:stop_loss"
+                    if sig_key not in state.sent_signals:
+                        signals.append({"type": "stop_loss", "code": code, "name": name,
+                                       "message": f"止损触发：浮亏{float_pnl:.1f}%", "time": current_time})
+                        state.sent_signals.append(sig_key)
+                elif float_pnl >= TAKE_PROFIT_PCT:
+                    sig_key = f"{code}:take_profit"
+                    if sig_key not in state.sent_signals:
+                        signals.append({"type": "take_profit", "code": code, "name": name,
+                                       "message": f"止盈触发：浮盈{float_pnl:.1f}%", "time": current_time})
+                        state.sent_signals.append(sig_key)
+
+        # ── 全市场新封板（简化版，不查行业） ──
+        elif is_at_limit and current_time >= "09:30":
+            sig_key = f"{code}:opportunity"
+            if sig_key not in state.sent_signals:
+                watched = set(state.sector_heat.keys())
+                if watched:  # 只有在有关注板块时才检测新机会
+                    # 简单评分（不查 DB）
+                    try:
+                        t_int = int(current_time.replace(":", "")) * 100
+                    except (ValueError, TypeError):
+                        t_int = 150000
+                    score = 0
+                    if t_int <= 93500: score += 5
+                    elif t_int <= 100000: score += 4
+                    elif t_int <= 103000: score += 3
+                    else: score += 2
+                    amount = volume * close
+                    if amount >= 5e8: score += 2
+                    if score >= MIN_SCORE_FOR_OPPORTUNITY:
+                        state.stocks[code] = asdict(StockState(
+                            code=code, name=name or "", is_sealed=True,
+                            first_seal_time=current_time, seal_volume=volume,
+                            current_price=close, last_close=last_close,
+                            limit_up_price=limit_up_price,
+                        ))
+                        signals.append({"type": "opportunity", "code": code, "name": name or code,
+                                       "message": f"新封板（{current_time}）评分{score}",
+                                       "time": current_time})
+                        state.sent_signals.append(sig_key)
+
+    state.total_limit_up = limit_up_count
+    return signals
+
+
 def format_signals(signals: list[dict]) -> str:
     """格式化信号为飞书推送文本"""
     if not signals:

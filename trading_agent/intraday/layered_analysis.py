@@ -105,22 +105,24 @@ def run_analysis(date: str = "", dry_run: bool = False) -> dict:
         print(f"  [Layer 1 LLM 失败] {e}")
         judgment = {}
 
-    # Fallback
-    if not judgment.get("top_sectors"):
-        sector_dist = snapshot.get("sector_distribution", {})
-        if sector_dist:
-            top2 = sorted(sector_dist.items(), key=lambda x: -x[1])[:2]
-            judgment["top_sectors"] = [s[0] for s in top2]
+    # 板块方向：始终用涨停分布（确定性），不依赖 LLM 的 top_sectors
+    sector_dist = snapshot.get("sector_distribution", {})
+    if sector_dist:
+        top2 = sorted(sector_dist.items(), key=lambda x: -x[1])[:2]
+        judgment["top_sectors"] = [s[0] for s in top2]
 
+    # 情绪判断：LLM 为主，代码 fallback
     if judgment.get("sentiment_phase") in ("未知", None, ""):
         judgment["sentiment_phase"] = _code_sentiment_fallback(snapshot)
-        phase = judgment["sentiment_phase"]
-        if phase in ("退潮", "冰点"):
-            judgment["action_gate"] = "空仓"
-        elif phase in ("修复", "升温", "高潮"):
-            judgment["action_gate"] = "可买入"
-        else:
-            judgment["action_gate"] = "谨慎"
+
+    # action_gate：基于情绪阶段（确定性映射）
+    phase = judgment["sentiment_phase"]
+    if phase in ("退潮", "冰点"):
+        judgment["action_gate"] = "空仓"
+    elif phase in ("修复", "升温", "高潮"):
+        judgment["action_gate"] = "可买入"
+    else:
+        judgment["action_gate"] = "谨慎"
 
     elapsed = time.time() - t0
     print(f"  [Layer 1] {judgment['sentiment_phase']} | {judgment.get('action_gate')} | "
@@ -131,11 +133,15 @@ def run_analysis(date: str = "", dry_run: bool = False) -> dict:
     sell_actions = []
 
     for pos in portfolio.get("positions", []):
+        buy_price = pos.get("buy_price", 0)
+        if not buy_price or buy_price <= 0:
+            continue  # 跳过 pending_buy（还没有实际买入价）
+
         current_price = get_current_price(pos["code"], date)
         if current_price is None:
             continue
 
-        float_pnl = (current_price - pos["buy_price"]) / pos["buy_price"] * 100
+        float_pnl = (current_price - buy_price) / buy_price * 100
         pos["current_price"] = current_price
         pos["float_pnl"] = round(float_pnl, 2)
 
@@ -170,12 +176,17 @@ def run_analysis(date: str = "", dry_run: bool = False) -> dict:
             })
 
     # ── Layer 2: 量化选股 ──
-    remaining_positions = [p for p in portfolio.get("positions", [])
+    # 只计算已实际买入的持仓（排除 pending_buy）
+    actual_positions = [p for p in portfolio.get("positions", [])
+                       if p.get("buy_price", 0) > 0 and p.get("status") != "pending_buy"]
+    remaining_positions = [p for p in actual_positions
                           if not any(s["code"] == p["code"] for s in sell_actions)]
     available_slots = MAX_POSITIONS - len(remaining_positions)
 
+    print(f"  [Layer 2 前置] slots={available_slots} gate={judgment.get('action_gate')} sectors={judgment.get('top_sectors')}")
     if available_slots <= 0 or judgment.get("action_gate") == "空仓":
         candidates = []
+        print(f"  [Layer 2] 跳过（slots={available_slots} gate={judgment.get('action_gate')}）")
     else:
         try:
             candidates = screen_stocks(
@@ -186,11 +197,15 @@ def run_analysis(date: str = "", dry_run: bool = False) -> dict:
                 concept_db=CONCEPT_DB,
                 max_picks=available_slots,
             )
+            print(f"  [Layer 2 原始] {len(candidates)} 只")
             # 排除已持仓
             held_codes = {p["code"] for p in remaining_positions}
             candidates = [c for c in candidates if c.code not in held_codes]
+            print(f"  [Layer 2 去重后] {len(candidates)} 只")
         except Exception as e:
+            import traceback
             print(f"  [Layer 2 失败] {e}")
+            traceback.print_exc()
             candidates = []
 
     if candidates:
