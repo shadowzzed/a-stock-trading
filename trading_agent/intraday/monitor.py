@@ -37,7 +37,8 @@ AUCTION_STRONG_PCT = 3.0     # 竞价高开超过此比例 = 超预期
 AUCTION_WEAK_PCT = -2.0      # 竞价低开超过此比例 = 低于预期
 STOP_LOSS_PCT = -7.0          # 盘中浮亏止损
 TAKE_PROFIT_PCT = 15.0        # 盘中浮盈止盈
-MIN_SCORE_FOR_OPPORTUNITY = 8  # 新机会最低评分
+MIN_SCORE_FOR_OPPORTUNITY = 6  # 新机会最低评分（从 8 降到 6，让盘中扫描更敏感）
+TREND_BREAKOUT_PCT = 5.0      # 趋势股盘中涨幅突破阈值 → 触发 trend_breakout 买入
 
 
 @dataclass
@@ -46,6 +47,7 @@ class StockState:
     code: str
     name: str
     is_watchlist: bool = False     # 是否盘后推荐标的
+    kind: str = "limit_up"          # limit_up / trend（趋势股走不同买入信号）
     buy_price: float = 0.0         # 买入价（已持仓时）
     # 封板追踪
     is_sealed: bool = False        # 当前是否封板
@@ -54,6 +56,7 @@ class StockState:
     last_blown_time: str = ""      # 最后一次炸板时间
     resealed: bool = False         # 是否回封过
     seal_volume: float = 0.0       # 封板时成交量
+    trend_triggered: bool = False   # 趋势突破信号是否已触发（避免重复）
     # 价格追踪
     auction_price: float = 0.0     # 竞价价格（09:25）
     current_price: float = 0.0
@@ -505,6 +508,23 @@ def update_minute_fast(state: MonitorState, date: str, current_time: str,
                                    "message": f"炸板（第{s['blown_count']}次，{current_time}）",
                                    "time": current_time})
                     state.sent_signals.append(sig_key)
+
+            # 趋势股盘中突破信号（非涨停 watchlist）
+            if (s.get("kind") == "trend" and s.get("is_watchlist")
+                    and not s.get("trend_triggered") and current_time >= "09:30"
+                    and not is_at_limit):
+                today_pct = (close - last_close) / last_close * 100
+                if today_pct >= TREND_BREAKOUT_PCT:
+                    s["trend_triggered"] = True
+                    sig_key = f"{code}:trend_breakout"
+                    if sig_key not in state.sent_signals:
+                        signals.append({
+                            "type": "trend_breakout",
+                            "code": code, "name": name,
+                            "message": f"趋势突破：今日+{today_pct:.1f}%（未涨停）",
+                            "time": current_time,
+                        })
+                        state.sent_signals.append(sig_key)
 
             # 止损/止盈
             buy_price = s.get("buy_price", 0)

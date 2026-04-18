@@ -72,7 +72,7 @@ def _call_ai(system_prompt: str, user_prompt: str) -> str:
                         {"role": "system", "content": system_prompt},
                         {"role": "user", "content": user_prompt},
                     ],
-                    "temperature": 0.3,
+                    "temperature": 0,  # 确定性输出（回测一致性）
                     "max_tokens": 4096,
                 },
                 timeout=120,

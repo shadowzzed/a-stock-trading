@@ -33,7 +33,7 @@ PORTFOLIO_FILE = os.path.join(TRADING_DIR, "portfolio_state.json")
 STOP_LOSS_PCT = -7.0
 TAKE_PROFIT_PCT = 15.0
 MAX_HOLD_DAYS = 5
-MAX_POSITIONS = 2
+MAX_POSITIONS = 2  # watchlist 只看最核心的 4 只（= MAX_POSITIONS × 2）
 POSITION_PCT = 0.30
 
 
@@ -93,27 +93,23 @@ def run_analysis(date: str = "", dry_run: bool = False) -> dict:
 
     print(f"[盘后分析] {date}")
 
-    # ── Layer 1: LLM 市场研判 ──
+    # ── Layer 1: 市场研判（代码确定性优先，LLM 仅做参考） ──
     provider = ReviewDataProvider()
-    runner = MarketJudgmentRunner()
-
     snapshot = provider.load_market_snapshot(TRADING_DIR, date)
     t0 = time.time()
-    try:
-        judgment = runner.run(snapshot)
-    except Exception as e:
-        print(f"  [Layer 1 LLM 失败] {e}")
-        judgment = {}
 
-    # 板块方向：始终用涨停分布（确定性），不依赖 LLM 的 top_sectors
+    # 情绪判断：代码确定性逻辑为主（保证回测可重现）
+    judgment = {"sentiment_phase": _code_sentiment_fallback(snapshot)}
+
+    # 板块方向：始终用涨停分布（确定性）
+    # 排除 ST板块 + 无意义的概念板块（噪音）
+    SECTOR_BLACKLIST = {"ST板块", "退市整理", "2025年报预增", "2026年报预增",
+                         "融资融券", "央企国企改革", "国企改革", "深股通", "沪股通"}
     sector_dist = snapshot.get("sector_distribution", {})
     if sector_dist:
-        top2 = sorted(sector_dist.items(), key=lambda x: -x[1])[:2]
+        filtered = [(s, c) for s, c in sector_dist.items() if s not in SECTOR_BLACKLIST]
+        top2 = sorted(filtered, key=lambda x: -x[1])[:2]
         judgment["top_sectors"] = [s[0] for s in top2]
-
-    # 情绪判断：LLM 为主，代码 fallback
-    if judgment.get("sentiment_phase") in ("未知", None, ""):
-        judgment["sentiment_phase"] = _code_sentiment_fallback(snapshot)
 
     # action_gate：基于情绪阶段（确定性映射）
     phase = judgment["sentiment_phase"]
@@ -195,7 +191,7 @@ def run_analysis(date: str = "", dry_run: bool = False) -> dict:
                 action_gate=judgment.get("action_gate", "谨慎"),
                 intraday_db=INTRADAY_DB,
                 concept_db=CONCEPT_DB,
-                max_picks=available_slots,
+                max_picks=max(available_slots * 2, 4),
             )
             print(f"  [Layer 2 原始] {len(candidates)} 只")
             # 排除已持仓
