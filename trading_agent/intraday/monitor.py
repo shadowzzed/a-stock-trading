@@ -447,6 +447,9 @@ def update_minute_fast(state: MonitorState, date: str, current_time: str,
     sector_counts = {}
 
     for code, close, volume, high, low, name, last_close, limit_pct in minute_rows:
+        # 防御 NULL 值（03-30 附近 stock_meta 偶有空 last_close）
+        if last_close is None or close is None:
+            continue
         if last_close <= 0 or close <= 0:
             continue
 
