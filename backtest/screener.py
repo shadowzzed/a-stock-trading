@@ -59,6 +59,25 @@ BOARD_TOP_SCORE = 3    # 板块内连板最高
 BOARD_SECOND_SCORE = 1  # 板块内连板次高
 BOARD_DEFAULT_SCORE = 0  # 首板或低位
 
+# ── 新因子（Phase 2） ──────────────────────────
+
+# 板块连续性加分（该板块连续 N 天有涨停）
+SECTOR_CONTINUITY_SCORES = {
+    1: 0,   # 仅今天有涨停
+    2: 1,   # 连续2天
+    3: 2,   # 连续3天
+}
+SECTOR_CONTINUITY_MAX = 3  # 连续4天+
+
+# 龙头带路加分（板块内最高连板数 >= 3）
+LEADER_PRESENT_SCORE = 2    # 板块有3板+龙头带路
+LEADER_ABSENT_SCORE = 0     # 无明显龙头
+
+# 前日涨停表现（该板块昨日涨停股今日平均涨跌幅）
+PREV_PERFORMANCE_GOOD = 2   # 昨日涨停股今日平均 > 3%
+PREV_PERFORMANCE_OK = 0     # 昨日涨停股今日平均 0~3%
+PREV_PERFORMANCE_BAD = -2   # 昨日涨停股今日平均 < 0%
+
 
 def _classify_seal_time(first_limit_time: str) -> str:
     """将首封时间(HHMMSS)分级为 S/A/B/C/D/F"""
@@ -99,8 +118,79 @@ def _estimate_market_cap(price: float, amount: float) -> str:
         return "small"
 
 
-def _score_stock(stock: dict, max_board_in_sector: int, second_board_in_sector: int) -> ScoredStock:
-    """对单只涨停股评分"""
+def _query_sector_context(
+    intraday_db: str, date: str, industries: List[str],
+) -> dict:
+    """查询板块上下文信息（连续性、前日表现、龙头高度）
+
+    Returns:
+        {industry: {continuity_days, prev_avg_pct, max_board}}
+    """
+    if not industries:
+        return {}
+
+    conn = sqlite3.connect(intraday_db, timeout=10)
+    result = {}
+
+    try:
+        for industry in industries:
+            ctx = {"continuity_days": 1, "prev_avg_pct": 0.0, "max_board": 0}
+
+            # 1. 板块连续性：往前数连续有涨停的天数
+            dates_with_lu = conn.execute(
+                "SELECT DISTINCT date FROM limit_up "
+                "WHERE industry = ? AND date <= ? ORDER BY date DESC LIMIT 10",
+                (industry, date),
+            ).fetchall()
+            if dates_with_lu:
+                # 从今天往前数连续天数
+                all_trading_dates = [r[0] for r in conn.execute(
+                    "SELECT DISTINCT date FROM limit_up WHERE date <= ? ORDER BY date DESC LIMIT 15",
+                    (date,),
+                ).fetchall()]
+                lu_dates = {r[0] for r in dates_with_lu}
+                cont = 0
+                for d in all_trading_dates:
+                    if d in lu_dates:
+                        cont += 1
+                    else:
+                        break
+                ctx["continuity_days"] = cont
+
+            # 2. 前日涨停表现：昨日该板块涨停股今日平均涨跌幅
+            prev_date_row = conn.execute(
+                "SELECT MAX(date) FROM limit_up WHERE date < ?", (date,)
+            ).fetchone()
+            if prev_date_row and prev_date_row[0]:
+                prev_date = prev_date_row[0]
+                rows = conn.execute(
+                    "SELECT l.code, d.pct_chg "
+                    "FROM limit_up l "
+                    "JOIN daily_bars d ON l.code = d.code AND d.date = ? "
+                    "WHERE l.date = ? AND l.industry = ?",
+                    (date, prev_date, industry),
+                ).fetchall()
+                if rows:
+                    avg_pct = sum(r[1] for r in rows if r[1] is not None) / len(rows)
+                    ctx["prev_avg_pct"] = avg_pct
+
+            # 3. 板块当日最高连板
+            max_board_row = conn.execute(
+                "SELECT MAX(board_count) FROM limit_up WHERE date = ? AND industry = ?",
+                (date, industry),
+            ).fetchone()
+            ctx["max_board"] = (max_board_row[0] or 0) if max_board_row else 0
+
+            result[industry] = ctx
+    finally:
+        conn.close()
+
+    return result
+
+
+def _score_stock(stock: dict, max_board_in_sector: int, second_board_in_sector: int,
+                 sector_ctx: Optional[dict] = None) -> ScoredStock:
+    """对单只涨停股评分（含 Phase 2 新因子）"""
     breakdown = {}
 
     # 1. 首封时间评分
@@ -133,6 +223,42 @@ def _score_stock(stock: dict, max_board_in_sector: int, second_board_in_sector: 
         breakdown["board"] = f"{board}板={board_score}"
 
     total = seal_score + blown_score + vol_score + board_score
+
+    # ── Phase 2 新因子 ──
+
+    industry = stock.get("industry", "")
+    ctx = (sector_ctx or {}).get(industry, {})
+
+    # 5. 板块连续性（连续 N 天有涨停）
+    cont_days = ctx.get("continuity_days", 1)
+    cont_score = SECTOR_CONTINUITY_SCORES.get(
+        cont_days, SECTOR_CONTINUITY_MAX
+    )
+    breakdown["continuity"] = f"{cont_days}天连续={cont_score}"
+    total += cont_score
+
+    # 6. 龙头带路（板块内有 3板+ 龙头）
+    sector_max_board = ctx.get("max_board", 0)
+    if sector_max_board >= 3:
+        leader_score = LEADER_PRESENT_SCORE
+        breakdown["leader"] = f"有{sector_max_board}板龙头={leader_score}"
+    else:
+        leader_score = LEADER_ABSENT_SCORE
+        breakdown["leader"] = f"无龙头={leader_score}"
+    total += leader_score
+
+    # 7. 前日涨停表现（昨日该板块涨停股今日平均涨幅）
+    prev_pct = ctx.get("prev_avg_pct", 0)
+    if prev_pct > 3:
+        prev_score = PREV_PERFORMANCE_GOOD
+        breakdown["prev_perf"] = f"昨涨停今+{prev_pct:.1f}%={prev_score}"
+    elif prev_pct >= 0:
+        prev_score = PREV_PERFORMANCE_OK
+        breakdown["prev_perf"] = f"昨涨停今+{prev_pct:.1f}%={prev_score}"
+    else:
+        prev_score = PREV_PERFORMANCE_BAD
+        breakdown["prev_perf"] = f"昨涨停今{prev_pct:.1f}%={prev_score}"
+    total += prev_score
 
     return ScoredStock(
         code=stock["code"],
@@ -234,8 +360,12 @@ def screen_stocks(
     max_board = board_counts[0] if board_counts else 1
     second_board = board_counts[1] if len(board_counts) > 1 else 0
 
-    # 5. 逐只评分
-    scored = [_score_stock(s, max_board, second_board) for s in candidates]
+    # 4.5. 查询板块上下文（连续性、前日表现、龙头高度）
+    industries = list({s.get("industry", "") for s in candidates if s.get("industry")})
+    sector_ctx = _query_sector_context(intraday_db, date, industries)
+
+    # 5. 逐只评分（含 Phase 2 新因子）
+    scored = [_score_stock(s, max_board, second_board, sector_ctx) for s in candidates]
 
     # 6. 排序（分数降序，同分按连板高度降序）
     scored.sort(key=lambda x: (x.score, x.board_count), reverse=True)
