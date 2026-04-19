@@ -261,3 +261,53 @@ python data/export_daily_summary.py
 2. **DeepSeek (火山引擎 Ark)** — 备用（`ARK_API_KEY` + `ARK_MODEL`）
 
 两个系统共用同一套 provider 配置（`config.py` 中的 `get_ai_providers()`）。
+
+## 数据治理与策略迭代（2026-04-19 引入）
+
+### 数据质量治理（`data/`）
+
+| 脚本 | 职责 |
+|------|------|
+| `data_quality_fix.py` | 批量修补 NULL pct_chg、\x00 字符、空 industry、错误 last_close（幂等）|
+| `data_quality_audit.py` | 每日体检；退出码 0=健康 / 1=警告 / 2=严重 |
+| `rebuild_limit_up.py` | 全量重建 limit_up：按板块规则（10%/20%/30%/5% ST）从 daily_bars 识别 |
+| `backfill_minute_bars_sina.py` | 新浪 1min API 回填（~9 天窗口），minute_bars 损坏备用 |
+
+**为什么**：东方财富涨停 API 实测漏抓率高达 46%（如 04-08 228 只 vs 表内 123 只）。必须基于日K精确重建。
+
+### 策略版本生命周期（`tools/`）
+
+```
+开发 → registry.register → health 监控 → compare 对比 → retired 淘汰
+```
+
+| 脚本 | 职责 |
+|------|------|
+| `strategy_registry.py` | 版本库（`~/shared/trading/strategy_registry.db`）：策略元数据 + 回测历史 |
+| `strategy_health.py` | 每日滚动回测（5/20/60 日）+ 阈值告警 |
+| `strategy_compare.py` | 多版本对比 |
+
+**告警阈值**（`strategy_health.py:THRESHOLDS`）：
+- 胜率 < 40%
+- 最大回撤 > 15%
+- 近 5 日收益 < -5%
+- 近 20 日收益 < 0%
+
+触发 → `/tmp/strategy_health_alert.txt` 写入 → Agent pickup 可发飞书。
+
+### 每日自动化（LaunchAgent）
+
+`tools/daily_maintenance.sh` 整合全部维护逻辑，调度：
+
+```
+文件：~/Library/LaunchAgents/com.luoxin.astocktrading.daily.plist
+调度：周一至周五 17:00
+日志：~/shared/trading/logs/
+禁用：launchctl unload ~/Library/LaunchAgents/com.luoxin.astocktrading.daily.plist
+```
+
+**为什么不 crontab**：Claude 受限 shell 里 macOS 会挂起要求 Full Disk Access 授权。LaunchAgent 在用户空间无此问题。Linux 服务器部署直接用 crontab。
+
+### Layer 1 为什么不用 LLM
+
+实测 temperature=0 仍无法消除随机性（同一输入多次调用给出不同情绪判断），导致回测不可重现。改用 `backtest/layered_engine._code_sentiment_fallback` 纯代码规则（涨停数/跌停数/炸板率/边际变化）。板块方向用 `sector_distribution` 排序 + 排除 ST板块/年报预增等噪音概念。

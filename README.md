@@ -166,7 +166,11 @@ python -m news_monitor briefing
 | `intraday_data.py` | 盘中快照采集，全市场 ~5000 只写入 `intraday.db` |
 | `export_daily_summary.py` | 收盘后导出行情数据、涨跌停 CSV |
 | `backfill_stock_data.py` | 历史 K 线数据回填 |
+| `backfill_minute_bars_sina.py` | 新浪 1min API 回填（~9 天窗口，备用） |
 | `import_history.py` | 外部数据导入 |
+| `rebuild_limit_up.py` | 重建 limit_up 表（按板块规则从 daily_bars 精确识别） |
+| `data_quality_fix.py` | 批量修补数据缺陷（NULL pct_chg、\x00 字符、空 industry 等） |
+| `data_quality_audit.py` | 每日数据体检，发现异常告警（退出码分级） |
 
 ### tools/ — 独立脚本
 
@@ -177,6 +181,47 @@ python -m news_monitor briefing
 | `opening_analysis.py` | 开盘分析独立脚本 |
 | `backtest_gap_up.py` | 涨停回测工具 |
 | `doctor.py` | 环境诊断工具 |
+| `strategy_registry.py` | 策略版本库（SQLite 持久化，管理策略元数据+回测历史） |
+| `strategy_health.py` | 每日滚动回测（5/20/60 日窗口）+ 阈值告警 |
+| `strategy_compare.py` | 策略版本间对比分析 |
+| `daily_maintenance.sh` | 每日盘后自动维护脚本（LaunchAgent/cron 调度） |
+
+#### 策略迭代机制使用
+
+```bash
+# 1. 初始化策略库 + 登记新版本
+python3 tools/strategy_registry.py init
+python3 tools/strategy_registry.py register \
+    --name "方向二_v16" --params '{"STALE_HOLD_DAYS": 2}' \
+    --note "自主迭代版 2026-04-19"
+
+# 2. 运行健康度监控（写入滚动回测结果）
+python3 tools/strategy_health.py --windows 5 20 60
+
+# 3. 查看对比
+python3 tools/strategy_compare.py --window 20
+
+# 4. 淘汰失效版本
+python3 tools/strategy_registry.py status <id> --status retired --note "被 v17 替代"
+```
+
+#### 每日自动维护
+
+推荐用 macOS LaunchAgent 或 Linux crontab：
+
+```bash
+# macOS LaunchAgent 位置：~/Library/LaunchAgents/com.luoxin.astocktrading.daily.plist
+# Linux crontab：
+# 0 17 * * 1-5 /path/to/a-stock-trading/tools/daily_maintenance.sh
+```
+
+每日 17:00 自动执行：
+1. 数据修复（`data/data_quality_fix.py`）
+2. 7 天数据体检（`data/data_quality_audit.py`）
+3. 策略健康度监控（`tools/strategy_health.py`）
+4. 周一额外跑 limit_up 重建（`data/rebuild_limit_up.py`）
+
+日志输出到 `~/shared/trading/logs/daily_maintenance_YYYY-MM-DD.log`。
 
 ### knowledge/ — 交易知识库
 
