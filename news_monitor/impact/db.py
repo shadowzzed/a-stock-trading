@@ -290,7 +290,7 @@ def get_news_with_stocks(limit=1000):
 
 
 def get_snapshot_for_stock(code, date_str, ts=None):
-    """从 intraday.db 获取某只股票的快照数据"""
+    """从 intraday.db 获取某只股票的行情数据（minute_bars 优先，fallback daily_bars）"""
     import os
     if not os.path.exists(INTRADAY_DB_PATH):
         return None
@@ -300,23 +300,46 @@ def get_snapshot_for_stock(code, date_str, ts=None):
     try:
         if ts:
             row = conn.execute("""
-                SELECT * FROM snapshots
-                WHERE code = ? AND date = ? AND ts <= ?
-                ORDER BY ts DESC LIMIT 1
+                SELECT date, time AS ts, code, close AS price, open, high, low,
+                       volume, amount
+                FROM minute_bars
+                WHERE code = ? AND date = ? AND time <= ?
+                ORDER BY time DESC LIMIT 1
             """, (code, date_str, ts)).fetchone()
         else:
             row = conn.execute("""
-                SELECT * FROM snapshots
+                SELECT date, time AS ts, code, close AS price, open, high, low,
+                       volume, amount
+                FROM minute_bars
                 WHERE code = ? AND date = ?
-                ORDER BY ts ASC LIMIT 1
+                ORDER BY time ASC LIMIT 1
             """, (code, date_str)).fetchone()
+        if row:
+            d = dict(row)
+            # 补充 name 和 last_close
+            meta = conn.execute(
+                "SELECT name, last_close FROM stock_meta WHERE code = ? AND date = ?",
+                (code, date_str),
+            ).fetchone()
+            if meta:
+                d["name"] = meta[0]
+                d["last_close"] = meta[1]
+                if d["last_close"] and d["last_close"] > 0:
+                    d["pctChg"] = round((d["price"] / d["last_close"] - 1) * 100, 2)
+            return d
+        # fallback to daily_bars
+        row = conn.execute("""
+            SELECT date, '15:00' AS ts, code, name, close AS price, open, high, low,
+                   pct_chg AS pctChg, volume, amount
+            FROM daily_bars WHERE code = ? AND date = ?
+        """, (code, date_str)).fetchone()
         return dict(row) if row else None
     finally:
         conn.close()
 
 
 def get_snapshots_range(code, date_str, ts_start, ts_end):
-    """获取某只股票在指定时间范围内的所有快照"""
+    """获取某只股票在指定时间范围内的所有分钟K线"""
     import os
     if not os.path.exists(INTRADAY_DB_PATH):
         return []
@@ -325,9 +348,11 @@ def get_snapshots_range(code, date_str, ts_start, ts_end):
     conn.row_factory = sqlite3.Row
     try:
         rows = conn.execute("""
-            SELECT * FROM snapshots
-            WHERE code = ? AND date = ? AND ts >= ? AND ts <= ?
-            ORDER BY ts ASC
+            SELECT date, time AS ts, code, close AS price, open, high, low,
+                   volume, amount
+            FROM minute_bars
+            WHERE code = ? AND date = ? AND time >= ? AND time <= ?
+            ORDER BY time ASC
         """, (code, date_str, ts_start, ts_end)).fetchall()
         return [dict(r) for r in rows]
     finally:
@@ -343,7 +368,7 @@ def get_available_snapshot_dates():
     conn = sqlite3.connect(INTRADAY_DB_PATH, timeout=5)
     try:
         rows = conn.execute(
-            "SELECT DISTINCT date FROM snapshots ORDER BY date DESC"
+            "SELECT DISTINCT date FROM daily_bars ORDER BY date DESC"
         ).fetchall()
         return [r[0] for r in rows]
     finally:
@@ -351,7 +376,7 @@ def get_available_snapshot_dates():
 
 
 def get_next_trading_day_snapshot(code, date_str):
-    """获取某只股票在下一个交易日的收盘快照"""
+    """获取某只股票在下一个交易日的收盘数据"""
     import os
     if not os.path.exists(INTRADAY_DB_PATH):
         return None
@@ -360,9 +385,11 @@ def get_next_trading_day_snapshot(code, date_str):
     conn.row_factory = sqlite3.Row
     try:
         row = conn.execute("""
-            SELECT * FROM snapshots
+            SELECT date, '15:00' AS ts, code, name, close AS price, open, high, low,
+                   pct_chg AS pctChg, volume, amount
+            FROM daily_bars
             WHERE code = ? AND date > ?
-            ORDER BY date ASC, ts DESC LIMIT 1
+            ORDER BY date ASC LIMIT 1
         """, (code, date_str)).fetchone()
         return dict(row) if row else None
     finally:
@@ -370,7 +397,7 @@ def get_next_trading_day_snapshot(code, date_str):
 
 
 def get_snapshot_at_or_after(code, date_str, ts_start):
-    """获取某只股票在指定时间点或之后的最早快照"""
+    """获取某只股票在指定时间点或之后的最早分钟K线"""
     import os
     if not os.path.exists(INTRADAY_DB_PATH):
         return None
@@ -379,9 +406,11 @@ def get_snapshot_at_or_after(code, date_str, ts_start):
     conn.row_factory = sqlite3.Row
     try:
         row = conn.execute("""
-            SELECT * FROM snapshots
-            WHERE code = ? AND date = ? AND ts >= ?
-            ORDER BY ts ASC LIMIT 1
+            SELECT date, time AS ts, code, close AS price, open, high, low,
+                   volume, amount
+            FROM minute_bars
+            WHERE code = ? AND date = ? AND time >= ?
+            ORDER BY time ASC LIMIT 1
         """, (code, date_str, ts_start)).fetchone()
         return dict(row) if row else None
     finally:

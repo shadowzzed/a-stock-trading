@@ -53,23 +53,38 @@ def get_conn():
     return sqlite3.connect(DB_PATH, timeout=10)
 
 
+def _ensure_stock_meta(conn):
+    """确保 stock_meta 表存在。"""
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS stock_meta (
+            date       TEXT NOT NULL,
+            code       TEXT NOT NULL,
+            name       TEXT,
+            limit_pct  INTEGER DEFAULT 10,
+            last_close REAL,
+            PRIMARY KEY (date, code)
+        )
+    """)
+    conn.commit()
+
+
 def get_trading_days(conn, n=10):
-    """获取数据库中最近 n 个交易日（按日线 ts=15:00:00 去重）"""
+    """获取数据库中最近 n 个交易日"""
     rows = conn.execute("""
-        SELECT DISTINCT date FROM snapshots
-        WHERE ts = '15:00:00'
+        SELECT DISTINCT date FROM daily_bars
         ORDER BY date DESC LIMIT ?
     """, (n,)).fetchall()
     return [r[0] for r in rows]  # 最近的在前
 
 
 def get_today_opening(conn, today):
-    """获取今日 9:25 快照（开盘价数据）"""
-    # 找今天最早的时间戳（应该是 09:25 左右）
+    """获取今日 9:25 分钟K线数据（开盘价数据）"""
+    _ensure_stock_meta(conn)
+    # 找今天最早的分钟K（应该是 09:25）
     ts_row = conn.execute("""
-        SELECT ts FROM snapshots
-        WHERE date = ? AND ts != '15:00:00'
-        ORDER BY ts ASC LIMIT 1
+        SELECT time FROM minute_bars
+        WHERE date = ? AND time <= '09:30'
+        ORDER BY time ASC LIMIT 1
     """, (today,)).fetchone()
 
     if not ts_row:
@@ -77,33 +92,52 @@ def get_today_opening(conn, today):
 
     ts = ts_row[0]
     rows = conn.execute("""
-        SELECT code, name, price as open_price, pctChg, last_close,
-               sector, star, in_pool, limit_pct
-        FROM snapshots WHERE date = ? AND ts = ?
+        SELECT m.code,
+               COALESCE(meta.name, '') AS name,
+               m.close AS open_price,
+               COALESCE(meta.last_close, 0) AS last_close,
+               COALESCE(meta.limit_pct, 10) AS limit_pct
+        FROM minute_bars m
+        LEFT JOIN stock_meta meta ON m.date = meta.date AND m.code = meta.code
+        WHERE m.date = ? AND m.time = ?
     """, (today, ts)).fetchall()
 
-    cols = ["code", "name", "open_price", "pctChg", "last_close",
-            "sector", "star", "in_pool", "limit_pct"]
+    cols = ["code", "name", "open_price", "last_close", "limit_pct"]
     result = {}
     for row in rows:
         d = dict(zip(cols, row))
+        # 计算涨跌幅
+        if d["last_close"] and d["last_close"] > 0:
+            d["pctChg"] = round((d["open_price"] / d["last_close"] - 1) * 100, 2)
+        else:
+            d["pctChg"] = 0
         result[d["code"]] = d
     return result, ts
 
 
 def get_daily_close(conn, date_str):
     """获取某天的收盘数据"""
+    _ensure_stock_meta(conn)
     rows = conn.execute("""
-        SELECT code, name, price, pctChg, last_close, high, low, open,
-               is_limit_up, is_limit_down, sector, star, in_pool, limit_pct
-        FROM snapshots WHERE date = ? AND ts = '15:00:00'
+        SELECT d.code, d.name, d.close AS price, d.pct_chg AS pctChg,
+               d.high, d.low, d.open,
+               COALESCE(m.last_close, 0) AS last_close,
+               COALESCE(m.limit_pct, 10) AS limit_pct
+        FROM daily_bars d
+        LEFT JOIN stock_meta m ON d.date = m.date AND d.code = m.code
+        WHERE d.date = ?
     """, (date_str,)).fetchall()
 
-    cols = ["code", "name", "price", "pctChg", "last_close", "high", "low", "open",
-            "is_limit_up", "is_limit_down", "sector", "star", "in_pool", "limit_pct"]
+    cols = ["code", "name", "price", "pctChg", "high", "low", "open",
+            "last_close", "limit_pct"]
     result = {}
     for row in rows:
         d = dict(zip(cols, row))
+        # 计算涨停/跌停标记
+        lp = d.get("limit_pct", 10)
+        pct = d.get("pctChg", 0) or 0
+        d["is_limit_up"] = 1 if pct >= lp - 0.1 else 0
+        d["is_limit_down"] = 1 if pct <= -(lp - 0.1) else 0
         result[d["code"]] = d
     return result
 
@@ -137,14 +171,17 @@ def analyze_gap_up_over_top(conn, today, trading_days):
     # 过去7天每只股票的数据
     placeholders = ",".join(["?"] * len(past_days))
     rows = conn.execute(f"""
-        SELECT code, date, price, high, is_limit_up
-        FROM snapshots
-        WHERE date IN ({placeholders}) AND ts = '15:00:00'
+        SELECT d.code, d.date, d.close AS price, d.high, d.pct_chg,
+               COALESCE(m.limit_pct, 10) AS limit_pct
+        FROM daily_bars d
+        LEFT JOIN stock_meta m ON d.date = m.date AND d.code = m.code
+        WHERE d.date IN ({placeholders})
     """, past_days).fetchall()
 
     # 按 code 聚合
     stock_history = {}  # code -> {dates, had_limit_up, yesterday_limit_up, max_high}
-    for code, date, price, high, is_limit_up in rows:
+    for code, date, price, high, pct_chg, limit_pct in rows:
+        is_limit_up = 1 if (pct_chg or 0) >= (limit_pct or 10) - 0.1 else 0
         if code not in stock_history:
             stock_history[code] = {
                 "had_limit_up": False,
@@ -181,78 +218,74 @@ def analyze_gap_up_over_top(conn, today, trading_days):
                 "open_price": today_open,
                 "open_pctChg": info["pctChg"],
                 "past_7d_high": hist["max_high"],
-                "sector": info["sector"],
-                "star": bool(info["star"]),
-                "in_pool": bool(info["in_pool"]),
             })
 
-    results.sort(key=lambda x: (-int(x["in_pool"]), -int(x["star"]), -x["open_pctChg"]))
+    results.sort(key=lambda x: -x["open_pctChg"])
     return {"ts": ts, "count": len(results), "stocks": results}
 
 
 def analyze_sector_summary(conn, today, trading_days):
     """
     板块总结：
-    - 哪些板块批量高开/低开
-    - ⭐辨识度股票权重更高
+    - 按概念板块聚合开盘涨跌幅
+    - 从 stock_concept.db 获取全市场概念映射
     """
     opening, ts = get_today_opening(conn, today)
     if not opening:
         return {"error": "今日无开盘数据", "sectors": []}
 
-    # 按板块聚合（仅股票池内）
-    sector_data = {}
+    # 加载概念映射
+    concept_db = os.path.join(os.path.dirname(DB_PATH), "..", "stock_concept.db")
+    code_concepts = {}  # code -> [concept1, concept2, ...]
+    if os.path.exists(concept_db):
+        try:
+            cconn = sqlite3.connect(concept_db)
+            for row in cconn.execute("SELECT code, concepts FROM stock_concepts WHERE concepts != ''"):
+                try:
+                    code_concepts[row[0]] = json.loads(row[1]) if isinstance(row[1], str) else row[1]
+                except Exception:
+                    pass
+            cconn.close()
+        except Exception:
+            pass
+
+    # 按概念聚合（取每只股票前3个概念）
+    concept_data = {}
     for code, info in opening.items():
-        if not info["in_pool"] or not info["sector"]:
-            continue
-        sector = info["sector"]
-        if sector not in sector_data:
-            sector_data[sector] = {"stocks": [], "star_stocks": []}
-        sector_data[sector]["stocks"].append(info)
-        if info["star"]:
-            sector_data[sector]["star_stocks"].append(info)
+        concepts = code_concepts.get(code, [])[:3]
+        for concept in concepts:
+            if concept not in concept_data:
+                concept_data[concept] = {"stocks": []}
+            concept_data[concept]["stocks"].append(info)
 
     sectors = []
-    for sector, data in sector_data.items():
+    for concept, data in concept_data.items():
         stocks = data["stocks"]
-        star_stocks = data["star_stocks"]
+        if len(stocks) < 2:
+            continue  # 至少 2 只股才算板块
 
-        avg_pct = sum(s["pctChg"] for s in stocks) / len(stocks) if stocks else 0
-
-        # 加权平均（⭐股权重2倍）
-        total_weight = 0
-        weighted_sum = 0
-        for s in stocks:
-            w = 2 if s["star"] else 1
-            weighted_sum += s["pctChg"] * w
-            total_weight += w
-        weighted_avg = weighted_sum / total_weight if total_weight > 0 else 0
-
+        avg_pct = sum(s["pctChg"] for s in stocks) / len(stocks)
         high_open = [s for s in stocks if s["pctChg"] > 1]
         low_open = [s for s in stocks if s["pctChg"] < -1]
-
         leader = max(stocks, key=lambda x: x["pctChg"])
 
         sectors.append({
-            "sector": sector,
+            "sector": concept,
             "avg_pctChg": round(avg_pct, 2),
-            "weighted_avg_pctChg": round(weighted_avg, 2),
+            "weighted_avg_pctChg": round(avg_pct, 2),
             "total": len(stocks),
             "high_open_count": len(high_open),
             "low_open_count": len(low_open),
-            "star_count": len(star_stocks),
-            "star_avg_pct": round(sum(s["pctChg"] for s in star_stocks) / len(star_stocks), 2) if star_stocks else 0,
             "leader": {"name": leader["name"], "code": leader["code"], "pctChg": leader["pctChg"]},
-            "stocks": [{"name": s["name"], "code": s["code"], "pctChg": s["pctChg"], "star": s["star"]}
-                       for s in sorted(stocks, key=lambda x: -x["pctChg"])],
+            "stocks": [{"name": s["name"], "code": s["code"], "pctChg": s["pctChg"]}
+                       for s in sorted(stocks, key=lambda x: -x["pctChg"])[:5]],
         })
 
-    sectors.sort(key=lambda x: -x["weighted_avg_pctChg"])
+    sectors.sort(key=lambda x: -x["avg_pctChg"])
 
-    # 分类
-    high_sectors = [s for s in sectors if s["weighted_avg_pctChg"] > 0.5]
-    low_sectors = [s for s in sectors if s["weighted_avg_pctChg"] < -0.5]
-    neutral_sectors = [s for s in sectors if -0.5 <= s["weighted_avg_pctChg"] <= 0.5]
+    high_sectors = [s for s in sectors if s["avg_pctChg"] > 0.5][:10]
+    low_sectors = [s for s in sectors if s["avg_pctChg"] < -0.5][-10:]
+    neutral_sectors = [s for s in sectors if -0.5 <= s["avg_pctChg"] <= 0.5][:5]
 
     return {
         "ts": ts,
@@ -306,12 +339,9 @@ def analyze_broken_board_reversal(conn, today, trading_days):
             "yesterday_pctChg": yd["pctChg"],
             "today_open": op["open_price"],
             "today_open_pctChg": op["pctChg"],
-            "sector": op["sector"],
-            "star": bool(op["star"]),
-            "in_pool": bool(op["in_pool"]),
         })
 
-    results.sort(key=lambda x: (-int(x["in_pool"]), -x["today_open_pctChg"]))
+    results.sort(key=lambda x: -x["today_open_pctChg"])
     return {"ts": ts, "day_before": day_before, "yesterday": yesterday, "count": len(results), "stocks": results}
 
 
@@ -382,10 +412,9 @@ def ai_analyze(gap_up_data, sector_data, broken_board_data, news_text):
 请根据以下数据，给出简洁有力的开盘分析报告。
 
 分析要求：
-1. 重点关注⭐辨识度股票和池内(in_pool)股票
-2. 板块分析要结合新闻找到高开的原因
-3. 语言简洁，直奔要害
-4. 用 Markdown 格式输出"""
+1. 板块分析要结合新闻找到高开的原因
+2. 语言简洁，直奔要害
+3. 用 Markdown 格式输出"""
 
     user_content = f"""# 今日开盘数据（9:25 集合竞价）
 
@@ -541,17 +570,13 @@ def main():
     if gap_up.get("stocks"):
         data_summary += "## 高开过顶原始数据\n"
         for s in gap_up["stocks"][:10]:
-            star = "⭐" if s["star"] else ""
-            pool = "🏊" if s["in_pool"] else ""
-            data_summary += f"- {star}{pool}**{s['name']}**({s['code']}) 开盘{s['open_pctChg']:+.2f}% 7日高{s['past_7d_high']}\n"
+            data_summary += f"- **{s['name']}**({s['code']}) 开盘{s['open_pctChg']:+.2f}% 7日高{s['past_7d_high']}\n"
         data_summary += "\n"
 
     if broken.get("stocks"):
         data_summary += "## 断板反包原始数据\n"
         for s in broken["stocks"][:10]:
-            star = "⭐" if s["star"] else ""
-            pool = "🏊" if s["in_pool"] else ""
-            data_summary += f"- {star}{pool}**{s['name']}**({s['code']}) 昨{s['yesterday_pctChg']:+.2f}% → 今开{s['today_open_pctChg']:+.2f}%\n"
+            data_summary += f"- **{s['name']}**({s['code']}) 昨{s['yesterday_pctChg']:+.2f}% → 今开{s['today_open_pctChg']:+.2f}%\n"
         data_summary += "\n"
 
     full_report = header + report + "\n\n---\n" + data_summary

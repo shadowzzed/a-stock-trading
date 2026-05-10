@@ -2,14 +2,18 @@
 """
 A 股新闻监控推送脚本
 
-数据源：
+数据源（30 秒轮询，共 8 个）：
 1. TrendRadar SQLite DB（AI 筛选后的热榜 + RSS）
 2. 财联社电报 API（重要快讯，level A/B 或 jpush）
 3. 华尔街见闻 A 股快讯 API
+4. 金十数据（重要标记）
+5. BlockBeats、TechFlow、PANews（行业资讯）
+6. 东方财富研报（首次覆盖、目标价、评级变更）
 
-流程：批量 AI 解读 → 逐条飞书私聊推送 → 保存到 trading/daily/YYYY-MM-DD/新闻.md
+流程：批量 AI 解读 → 逐条飞书私聊推送 → 保存到 {data_root}/daily/YYYY-MM-DD/新闻.md
 """
 
+import fcntl
 import hashlib
 import json
 import os
@@ -49,9 +53,9 @@ if _volc_domain not in _no_proxy:
     os.environ["NO_PROXY"] = ("%s,%s" % (_no_proxy, _volc_domain)).strip(",")
     os.environ["no_proxy"] = os.environ["NO_PROXY"]
 
-# AI 提供商列表（Grok 优先，DeepSeek fallback）
+# AI 提供商列表（newsmonitor 专用：DeepSeek 优先）
 from config import get_ai_providers as _get_ai_providers
-AI_PROVIDERS = _get_ai_providers()
+AI_PROVIDERS = sorted(_get_ai_providers(), key=lambda p: {"DeepSeek": 0, "Grok": 1, "GLM": 2}.get(p["name"], 9))
 
 # 飞书 App Bot
 FEISHU_APP_ID = _cfg["feishu_app_id"]
@@ -93,6 +97,27 @@ def init_news_db():
     conn.execute("CREATE INDEX IF NOT EXISTS idx_news_key ON news(key)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_news_date ON news(created_date)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_news_source ON news(source)")
+    # Phase 3: 事件分类字段（兼容旧数据）
+    try:
+        conn.execute("ALTER TABLE news ADD COLUMN event_type TEXT DEFAULT ''")
+    except sqlite3.OperationalError:
+        pass  # 字段已存在
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_news_event_type ON news(event_type)")
+    # Phase 4: 新闻情绪指数表
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS news_sentiment_index (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            timestamp TEXT NOT NULL,
+            sentiment_score REAL NOT NULL,
+            bullish_count INTEGER NOT NULL DEFAULT 0,
+            bearish_count INTEGER NOT NULL DEFAULT 0,
+            neutral_count INTEGER NOT NULL DEFAULT 0,
+            total_count INTEGER NOT NULL DEFAULT 0,
+            created_date TEXT NOT NULL
+        )
+    """)
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_sentiment_ts ON news_sentiment_index(timestamp)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_sentiment_date ON news_sentiment_index(created_date)")
     conn.commit()
     return conn
 
@@ -149,10 +174,11 @@ def save_news_item(item, interpretation):
     """将新闻条目存入 SQLite"""
     db = get_news_db()
     now = datetime.now()
+    event_type = item.get("event_type", "")
     try:
         db.execute("""
-            INSERT OR IGNORE INTO news (key, title, source, url, news_time, brief, stocks, plates, interpretation, sent_at, created_date)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT OR IGNORE INTO news (key, title, source, url, news_time, brief, stocks, plates, interpretation, sent_at, created_date, event_type)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (
             item["key"],
             item["title"],
@@ -165,6 +191,7 @@ def save_news_item(item, interpretation):
             interpretation,
             now.strftime("%Y-%m-%d %H:%M:%S"),
             now.strftime("%Y-%m-%d"),
+            event_type,
         ))
         db.commit()
     except Exception as e:
@@ -172,7 +199,7 @@ def save_news_item(item, interpretation):
 
 
 def summarize_day_news(date_str):
-    """为指定日期生成新闻摘要，保存到 trading/daily/ 目录"""
+    """为指定日期生成新闻摘要，保存到 {data_root}/daily/ 目录"""
     db = get_news_db()
     rows = db.execute(
         "SELECT title, source, news_time, stocks, plates, interpretation FROM news WHERE created_date = ? ORDER BY sent_at",
@@ -266,31 +293,37 @@ def summarize_day_news(date_str):
 
 
 def cleanup_old_news():
-    """清理超过 7 天的新闻记录（先生成摘要再删除）"""
+    """清理超过 30 天的新闻正文（保留元数据用于历史分析）
+
+    保留字段：id, key, title, source, news_time, stocks, plates, interpretation, sent_at, created_date
+    清空字段：brief, url（节省空间，这些对历史分析无用）
+    永久保留：news_embeddings, news_impacts 表（向量和影响数据不清理）
+    """
     db = get_news_db()
     try:
-        cutoff = (datetime.now() - timedelta(days=7)).strftime("%Y-%m-%d")
+        cutoff = (datetime.now() - timedelta(days=30)).strftime("%Y-%m-%d")
 
-        # 找出将被清理的日期
+        # 找出将被清理的日期，先生成摘要
         dates = db.execute(
-            "SELECT DISTINCT created_date FROM news WHERE created_date < ? ORDER BY created_date",
+            "SELECT DISTINCT created_date FROM news WHERE created_date < ? AND brief != '' ORDER BY created_date",
             (cutoff,)
         ).fetchall()
 
-        # 先为每天生成摘要
         for (date_str,) in dates:
             try:
                 summarize_day_news(date_str)
             except Exception as e:
                 print("[摘要] %s 生成失败: %s" % (date_str, e), flush=True)
 
-        # 再删除
-        cursor = db.execute("DELETE FROM news WHERE created_date < ?", (cutoff,))
-        deleted = cursor.rowcount
+        # 只清空 brief 和 url，保留其他元数据
+        cursor = db.execute(
+            "UPDATE news SET brief = '', url = '' WHERE created_date < ? AND brief != ''",
+            (cutoff,)
+        )
+        cleaned = cursor.rowcount
         db.commit()
-        if deleted > 0:
-            db.execute("VACUUM")
-            print("[清理] 删除 %d 条 7 天前的新闻" % deleted, flush=True)
+        if cleaned > 0:
+            print("[清理] 精简 %d 条 30 天前新闻的正文（元数据已保留）" % cleaned, flush=True)
     except Exception as e:
         print("[清理] 失败: %s" % e, flush=True)
 
@@ -1016,42 +1049,58 @@ def save_to_trading(today, item, interpretation):
 
 
 def format_feishu(item, interpretation, ai_provider="", priority=None):
+    """格式化单条新闻的飞书卡片内容"""
     t = item.get("time", "")
-    t_part = " · %s" % t if t else ""
+    source = item.get("source", "")
 
-    # 标签：优先级 + 关联板块 + 关联个股
+    # ── 标题行 ──
+    lines = ["**%s**" % item["title"]]
+
+    # ── 元信息行：来源 · 时间 ──
+    meta_parts = []
+    if source:
+        meta_parts.append(source)
+    if t:
+        meta_parts.append(t)
+    if meta_parts:
+        lines.append("`%s`" % " · ".join(meta_parts))
+
+    # ── 标签行：优先级 + 板块 + 个股 ──
     tags = []
-    if priority:
-        tag_map = {"supply_demand": "供需", "earnings": "财报", "research": "研报", "geopolitics": "地缘"}
-        tags.append(tag_map.get(priority, priority))
     if item.get("plates"):
-        for p in item["plates"][:2]:
-            tags.append(p)
+        tags.extend(item["plates"][:3])
     if item.get("stocks"):
-        for s in item["stocks"][:3]:
-            # 去掉可能的代码后缀，只留名称
-            tags.append(s.split("(")[0].strip() if "(" in s else s)
-    tag_line = " ".join("[%s]" % tg for tg in tags) + "\n" if tags else ""
+        for s in item["stocks"][:4]:
+            name = s.split("(")[0].strip() if "(" in s else s
+            tags.append(name)
+    if tags:
+        lines.append(" ".join("[%s]" % tg for tg in tags))
 
-    # 已有的关联信息
-    extra_parts = []
-    if item.get("plates"):
-        extra_parts.append("板块：%s" % "、".join(item["plates"][:3]))
-    if item.get("stocks"):
-        extra_parts.append("个股：%s" % "、".join(item["stocks"][:3]))
-    extra_line = "\n" + " | ".join(extra_parts) if extra_parts else ""
-
-    # 原文内容
+    # ── 摘要（引用块）──
     brief = item.get("brief", "").strip()
-    brief_line = "\n\n> %s" % brief if brief else ""
+    if brief and len(brief) > 15:
+        lines.append("> %s" % brief[:200])
 
-    url_line = "\n[原文链接](%s)" % item["url"] if item.get("url") else ""
+    # ── AI 解读 ──
+    if interpretation:
+        # 提取解读中的核心内容（去掉重复的板块/个股行）
+        interp_lines = []
+        for il in interpretation.strip().split("\n"):
+            il = il.strip()
+            if not il:
+                continue
+            # 跳过纯标签行（已在上方展示）
+            if il.startswith("板块：") or il.startswith("个股："):
+                continue
+            interp_lines.append(il)
+        if interp_lines:
+            lines.append("**解读**：%s" % " ".join(interp_lines))
 
-    model_tag = "\n`AI: %s`" % ai_provider if ai_provider else ""
+    # ── 链接 ──
+    if item.get("url"):
+        lines.append("[查看原文](%s)" % item["url"])
 
-    return "%s**%s**\n`%s`%s%s%s\n\n%s%s%s" % (
-        tag_line, item["title"], item["source"], t_part, extra_line, brief_line, interpretation, url_line, model_tag
-    )
+    return "\n".join(lines)
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -1106,12 +1155,13 @@ def classify_priority(title, interpretation=""):
 
 
 def _parse_ai_tags(interpretation):
-    """从 AI 解读文本中提取板块和个股，用于打标"""
+    """从 AI 解读文本中提取板块、个股和事件类型，用于打标"""
     import re as _re
     plates = []
     stocks = []
+    event_type = ""
     if not interpretation:
-        return plates, stocks
+        return plates, stocks, event_type
 
     # 匹配 "板块：xxx" 模式（支持多种分隔符）
     plate_match = _re.search(r'板块[：:]\s*(.+?)(?:\s*[|｜]|\n|$)', interpretation)
@@ -1129,7 +1179,12 @@ def _parse_ai_tags(interpretation):
             stocks = [s.strip() for s in _re.split(r'[、,，]+', stock_str)
                       if s.strip() and s.strip() not in ("无", "—", "-")]
 
-    return plates, stocks
+    # 匹配 "事件：xxx" 模式
+    event_match = _re.search(r'事件[：:]\s*(.+?)(?:\n|$)', interpretation)
+    if event_match:
+        event_type = event_match.group(1).strip()
+
+    return plates, stocks, event_type
 
 
 def load_aggregate_prompt():
@@ -1172,14 +1227,14 @@ def _rank_importance(interpretation):
 
 
 def ai_rank_summaries(summaries_text):
-    """用 AI 对已有摘要做排序去重，输入很短不会超时"""
-    prompt = """你是A股短线新闻编辑。以下是已经解读过的新闻摘要列表，请：
-1. 去重（同一事件合并）
+    """用 AI 对已有摘要做排序去重，只返回排序后的编号列表"""
+    prompt = """你是A股短线新闻编辑。以下是编号的新闻摘要列表，请：
+1. 去重（同一事件只保留一个编号）
 2. 按对A股短线交易的影响程度从高到低排序
-3. 输出前30条（不足则全部）
-4. 保持原有的格式（板块/个股/利好利空/解读）
+3. 最多保留前30条
 
-直接输出排序后的列表，不要加额外说明。"""
+**只输出排序后的编号**，用逗号分隔，不要输出其他任何内容。
+示例输出：3,1,7,2,5"""
 
     for provider in AI_PROVIDERS:
         for attempt in range(3):
@@ -1194,15 +1249,16 @@ def ai_rank_summaries(summaries_text):
                             {"role": "user", "content": summaries_text},
                         ],
                         "temperature": 0.3,
-                        "max_tokens": 6000,
+                        "max_tokens": 1000,
                     },
                     timeout=90,
                 )
                 data = resp.json()
                 track_tokens(data.get("usage"), 0)
                 _write_heartbeat()
+                result = data["choices"][0]["message"]["content"].strip()
                 print("  [排序AI:%s] 完成" % provider["name"], flush=True)
-                return data["choices"][0]["message"]["content"].strip()
+                return result
             except Exception as e:
                 _write_heartbeat()
                 if attempt < 2:
@@ -1262,25 +1318,73 @@ def flush_aggregate_buffer(today, sent_keys):
     scored = list(zip(buf_for_aggregate, summaries))
     scored.sort(key=lambda x: _rank_importance(x[1]), reverse=True)
 
-    # 取前60条摘要送 AI 做精排+去重（摘要很短，60条约3000字，不会超时）
-    top_summaries = [s for _, s in scored[:60]]
-    summaries_text = "共 %d 条新闻摘要（已按重要度粗排）：\n\n" % len(top_summaries)
-    summaries_text += "\n\n".join("%d. %s" % (i + 1, s) for i, s in enumerate(top_summaries))
+    # 取前60条送 AI 做精排+去重（AI 只返回排序后的编号）
+    top_items = scored[:60]  # [(buf_entry, summary_text), ...]
+    summaries_text = "共 %d 条新闻摘要（已按重要度粗排）：\n\n" % len(top_items)
+    summaries_text += "\n\n".join("%d. %s" % (i + 1, s) for i, (_, s) in enumerate(top_items))
 
-    # AI 精排去重
-    aggregate_text = ai_rank_summaries(summaries_text)
+    # AI 精排去重（返回编号列表如 "3,1,7,2"）
+    rank_result = ai_rank_summaries(summaries_text)
 
-    if aggregate_text:
-        header = "### 新闻聚合（%s - %s，%d 条）\n\n" % (window_start, window_end, len(buf_for_aggregate))
-        send_feishu(header + aggregate_text)
-        print("  ✅ 聚合报告已发送（%d 条摘要排序）" % len(top_summaries), flush=True)
-    else:
-        # AI 排序也失败，用规则排序的结果直接发送前30条
-        print("  ⚠️ AI排序失败，使用规则排序直接发送", flush=True)
-        fallback = "### 新闻聚合（%s - %s，%d 条）\n\n" % (window_start, window_end, len(buf_for_aggregate))
-        for i, (_, s) in enumerate(scored[:30]):
-            fallback += "**%d.** %s\n\n" % (i + 1, s)
-        send_feishu(fallback)
+    # 解析编号列表，回退到规则排序
+    import re as _re_agg
+    ordered_items = []
+    if rank_result:
+        nums = _re_agg.findall(r'\d+', rank_result)
+        seen = set()
+        for n in nums:
+            idx = int(n) - 1  # 编号从1开始
+            if 0 <= idx < len(top_items) and idx not in seen:
+                seen.add(idx)
+                ordered_items.append(top_items[idx][0])
+        if ordered_items:
+            print("  ✅ AI排序完成，%d 条" % len(ordered_items), flush=True)
+
+    if not ordered_items:
+        # AI 排序失败或解析失败，用规则排序
+        print("  ⚠️ AI排序失败，使用规则排序", flush=True)
+        ordered_items = [it for it, _ in top_items[:30]]
+
+    # 用代码渲染每条新闻（确保标签不丢失）
+    header = "📋 **新闻聚合**  `%s - %s`  共 %d 条\n---\n" % (window_start, window_end, len(buf_for_aggregate))
+    parts = []
+    impact_limit = 3  # 前 N 条高重要度新闻附加影响分析
+    for i, it in enumerate(ordered_items[:30]):
+        item = it["item"]
+        interp = it.get("interpretation", "")
+        # 标签行
+        tags = []
+        if it.get("priority"):
+            tag_map = {"supply_demand": "供需", "earnings": "财报", "research": "研报", "geopolitics": "地缘"}
+            tags.append(tag_map.get(it["priority"], it["priority"]))
+        if item.get("plates"):
+            tags.extend(item["plates"][:2])
+        if item.get("stocks"):
+            for s in item["stocks"][:3]:
+                name = s.split("(")[0].strip() if "(" in s else s
+                tags.append(name)
+        tag_str = " ".join("[%s]" % tg for tg in tags) + " " if tags else ""
+        # 提取解读核心
+        interp_core = ""
+        for il in interp.strip().split("\n"):
+            il = il.strip()
+            if il and not il.startswith("板块：") and not il.startswith("个股："):
+                interp_core = il
+                break
+        entry = "**%d.** %s**%s**" % (i + 1, tag_str, item["title"])
+        if interp_core:
+            entry += "\n%s" % interp_core
+        # 前几条附加历史影响分析
+        if i < impact_limit and _impact_available:
+            try:
+                impact_report = on_high_priority_news(
+                    item["title"], item.get("brief", ""), timeout_sec=3.0)
+                if impact_report:
+                    entry += "\n%s" % impact_report
+            except Exception:
+                pass
+        parts.append(entry)
+    send_feishu(header + "\n\n".join(parts))
 
     # 清空缓冲区并保存
     _news_buffer = []
@@ -1374,12 +1478,14 @@ def run_once():
         interpretation = interps.get(i, "（AI 解读暂不可用）")
         priority = classify_priority(item["title"], interpretation)
 
-        # 从 AI 解读中提取板块和个股（数据源未提供时回填，用于打标）
-        ai_plates, ai_stocks = _parse_ai_tags(interpretation)
+        # 从 AI 解读中提取板块、个股和事件类型（数据源未提供时回填，用于打标）
+        ai_plates, ai_stocks, ai_event_type = _parse_ai_tags(interpretation)
         if not item.get("plates") and ai_plates:
             item["plates"] = ai_plates
         if not item.get("stocks") and ai_stocks:
             item["stocks"] = ai_stocks
+        if ai_event_type:
+            item["event_type"] = ai_event_type
 
         if trading and priority:
             # 交易时间 + 高优先级 → 立即推送
@@ -1392,7 +1498,10 @@ def run_once():
                         item["title"], item.get("brief", ""), timeout_sec=3.0)
                 except Exception:
                     pass
-            msg = "🔔 **[%s]** %s%s" % (tag, format_feishu(item, interpretation, ai_provider, priority=priority), impact_report)
+            tag_emoji = {"供需": "📦", "财报": "📊", "研报": "📝", "地缘": "🌐"}.get(tag, "🔔")
+            msg = "%s `%s`\n%s" % (tag_emoji, tag, format_feishu(item, interpretation, ai_provider, priority=priority))
+            if impact_report:
+                msg += "\n---\n%s" % impact_report
             if send_feishu(msg):
                 save_to_trading(today, item, interpretation)
                 save_news_item(item, interpretation)
@@ -1412,7 +1521,56 @@ def run_once():
     if _news_buffer and time.time() - _last_aggregate_time[0] >= (AGGREGATE_INTERVAL_TRADING if is_trading_hours() else AGGREGATE_INTERVAL_OFF_HOURS):
         flush_aggregate_buffer(today, sent_keys)
 
+    # 更新情绪指数（每轮有新闻时计算）
+    if unique:
+        _update_sentiment_index(unique, interps)
+
     return sent_count
+
+
+# ═══════════════════════════════════════════════════════════════
+# Phase 4: 新闻情绪指数
+# ═══════════════════════════════════════════════════════════════
+
+def _update_sentiment_index(items, interps):
+    """基于本轮新闻的利好/利空比例，更新情绪指数"""
+    bullish = 0
+    bearish = 0
+    neutral = 0
+    for i, item in enumerate(items):
+        interp = interps.get(i, "")
+        if "利好" in interp:
+            bullish += 1
+        elif "利空" in interp:
+            bearish += 1
+        else:
+            neutral += 1
+
+    total = bullish + bearish + neutral
+    if total == 0:
+        return
+
+    # 情绪值: -1(全利空) 到 +1(全利好)
+    score = (bullish - bearish) / total
+
+    db = get_news_db()
+    now = datetime.now()
+    try:
+        db.execute("""
+            INSERT INTO news_sentiment_index (timestamp, sentiment_score, bullish_count, bearish_count, neutral_count, total_count, created_date)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+        """, (
+            now.strftime("%Y-%m-%d %H:%M:%S"),
+            round(score, 3),
+            bullish,
+            bearish,
+            neutral,
+            total,
+            now.strftime("%Y-%m-%d"),
+        ))
+        db.commit()
+    except Exception as e:
+        print("[情绪] 写入失败: %s" % e, flush=True)
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -1462,7 +1620,24 @@ def _sigusr1_handler(signum, frame):
     raise WatchdogInterrupt("看门狗触发：run_once 超时")
 
 
+_lock_file = None
+
+def _acquire_lock():
+    """文件锁确保单实例运行，获取失败则退出"""
+    global _lock_file
+    lock_path = os.path.join(os.environ.get("TRADING_DIR", os.path.expanduser("~/shared/trading")), ".news_monitor.lock")
+    _lock_file = open(lock_path, "w")
+    try:
+        fcntl.flock(_lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        _lock_file.write(str(os.getpid()))
+        _lock_file.flush()
+    except OSError:
+        print("❌ 另一个 news_monitor 实例已在运行，退出", flush=True)
+        sys.exit(1)
+
+
 def main():
+    _acquire_lock()
     print("📰 A 股新闻监控启动", flush=True)
     print("   数据源: TrendRadar + 财联社 + 华尔街见闻 + 金十数据 + BlockBeats + 东方财富研报", flush=True)
     print("   轮询间隔: %ds" % POLL_INTERVAL, flush=True)
