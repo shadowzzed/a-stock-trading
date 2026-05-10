@@ -113,30 +113,6 @@ def get_all_a_codes():
     return codes
 
 
-def get_last_close_map(client, date_str, all_codes):
-    """通过日K线获取指定日期的昨收价"""
-    last_close = {}
-    for i in range(0, len(all_codes), 80):
-        batch = all_codes[i:i+80]
-        for code in batch:
-            try:
-                df = client.bars(symbol=code, frequency=9, offset=5)
-                if df is None or df.empty:
-                    continue
-                df["date_str"] = pd.to_datetime(df["datetime"]).dt.strftime("%Y%m%d")
-                row = df[df["date_str"] == date_str]
-                if not row.empty:
-                    # 用前一天的 close 作为昨收
-                    idx = row.index[0]
-                    if idx > 0:
-                        last_close[code] = df.loc[idx - 1, "close"]
-                    else:
-                        last_close[code] = row.iloc[0]["open"]
-            except Exception:
-                pass
-    return last_close
-
-
 def backfill_date(date_str, db, code_to_name, pool, all_codes):
     """回填指定日期的分时数据"""
     date_fmt = "%Y-%m-%d"
@@ -144,7 +120,7 @@ def backfill_date(date_str, db, code_to_name, pool, all_codes):
 
     # 检查该日期已有的快照数
     existing = db.execute(
-        "SELECT COUNT(DISTINCT ts) FROM snapshots WHERE date=?", (date_db,)
+        "SELECT COUNT(DISTINCT time) FROM minute_bars WHERE date=?", (date_db,)
     ).fetchone()[0]
     if existing >= len(SNAPSHOT_POINTS):
         print(f"  {date_db}: 已有 {existing} 个快照，跳过")
@@ -220,50 +196,19 @@ def backfill_date(date_str, db, code_to_name, pool, all_codes):
         print(f"  {date_db}: 无有效数据")
         return 0
 
-    # 获取昨收价（通过日K线 - 只对股票池内股票获取）
-    print(f"    获取昨收价...", flush=True)
-    last_close_map = {}
-    pool_codes = [c for c in all_codes if c in pool]
-    for code in pool_codes:
-        try:
-            kdf = client.bars(symbol=code, frequency=9, offset=30)
-            if kdf is not None and not kdf.empty:
-                kdf["d"] = pd.to_datetime(kdf["datetime"]).dt.strftime("%Y-%m-%d")
-                match = kdf[kdf["d"] == date_db]
-                if not match.empty:
-                    idx_pos = kdf.index.get_loc(match.index[0])
-                    if idx_pos > 0:
-                        last_close_map[code] = kdf.iloc[idx_pos - 1]["close"]
-        except Exception:
-            pass
-        time.sleep(0.05)
-
     # 删除已有数据（避免重复）
     for ts_label in SNAPSHOT_POINTS.values():
-        db.execute("DELETE FROM snapshots WHERE date=? AND ts=?", (date_db, ts_label))
+        db.execute("DELETE FROM minute_bars WHERE date=? AND time=?", (date_db, ts_label))
 
     # 插入数据
     inserted = 0
     for row in rows_to_insert:
         date_db_r, ts_label, code, name, price, open_price, high, low, vol, sector, star, in_pool = row
-        lc = last_close_map.get(code, open_price)
-        pct = round((price - lc) / lc * 100, 2) if lc and lc > 0 else 0
-        amount_yi = 0  # 分时数据没有金额，设0
-
-        # 判断涨跌停
-        limit_pct = 20 if code.startswith(("300", "301", "688")) else 10
-        limit_up_price = round(lc * (1 + limit_pct / 100), 2) if lc else 0
-        limit_down_price = round(lc * (1 - limit_pct / 100), 2) if lc else 0
-        is_limit_up = 1 if (limit_up_price > 0 and abs(price - limit_up_price) < 0.02) else 0
-        is_limit_down = 1 if (limit_down_price > 0 and abs(price - limit_down_price) < 0.02) else 0
 
         db.execute("""
-            INSERT INTO snapshots (date, ts, code, name, price, pctChg, open, high, low,
-                                   last_close, volume, amount, amount_yi, limit_pct,
-                                   is_limit_up, is_limit_down, sector, star, in_pool)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, ?, ?, ?, ?, ?, ?)
-        """, (date_db_r, ts_label, code, name, price, pct, open_price, high, low,
-              lc, vol, limit_pct, is_limit_up, is_limit_down, sector, star, in_pool))
+            INSERT INTO minute_bars (date, time, code, open, high, low, close, volume, amount)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (date_db_r, ts_label, code, open_price, high, low, price, vol, 0))
         inserted += 1
 
     db.commit()

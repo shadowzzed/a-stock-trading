@@ -405,8 +405,10 @@ def _screen_trending_stocks(
                 (date_10d, date),
             ).fetchall()
             vol_10d = {c: v or 0 for c, v in v10_rows}
-        # 近 3 日连续阳线标记（用于加分）
+        # 连续阳线分级：3日、5日、7日
         consecutive_up_map = {}
+        consecutive_5d_map = {}
+        consecutive_7d_map = {}
         if len(trading_dates) >= 3:
             d_today, d_1, d_2 = trading_dates[0], trading_dates[1], trading_dates[2]
             up_rows = conn.execute(
@@ -416,6 +418,33 @@ def _screen_trending_stocks(
                 (d_today, d_1, d_2),
             ).fetchall()
             consecutive_up_map = {r[0]: True for r in up_rows}
+        if len(trading_dates) >= 5:
+            dates5 = trading_dates[:5]
+            up5 = conn.execute(
+                "SELECT code FROM daily_bars WHERE date IN (?,?,?,?,?) "
+                "AND pct_chg > 0 GROUP BY code HAVING COUNT(*) = 5",
+                tuple(dates5),
+            ).fetchall()
+            consecutive_5d_map = {r[0]: True for r in up5}
+        if len(trading_dates) >= 7:
+            dates7 = trading_dates[:7]
+            up7 = conn.execute(
+                "SELECT code FROM daily_bars WHERE date IN (?,?,?,?,?,?,?) "
+                "AND pct_chg > 0 GROUP BY code HAVING COUNT(*) = 7",
+                tuple(dates7),
+            ).fetchall()
+            consecutive_7d_map = {r[0]: True for r in up7}
+        # 7日累计涨幅（补充 3日太短的缺陷）
+        cum_7d_map = {}
+        if len(trading_dates) >= 7:
+            base7 = trading_dates[6]
+            rows_7d = conn.execute(
+                "SELECT t.code, (t.close - b.close) / b.close * 100 AS pct "
+                "FROM daily_bars t JOIN daily_bars b ON t.code=b.code "
+                "WHERE t.date=? AND b.date=? AND b.close > 0",
+                (date, base7),
+            ).fetchall()
+            cum_7d_map = {r[0]: r[1] for r in rows_7d}
     finally:
         conn.close()
 
@@ -470,10 +499,24 @@ def _screen_trending_stocks(
             breakdown["trend_sector"] = f"板块{industry}匹配={TREND_SECTOR_MATCH_SCORE}"
         else:
             breakdown["trend_sector"] = f"板块{industry}不匹配=0"
-        # 连续阳线
-        if consecutive_up_map.get(code):
+        # 连续阳线（分级）
+        if consecutive_7d_map.get(code):
+            total += 4
+            breakdown["trend_consecutive"] = "7日连阳+4"
+        elif consecutive_5d_map.get(code):
+            total += 3
+            breakdown["trend_consecutive"] = "5日连阳+3"
+        elif consecutive_up_map.get(code):
             total += TREND_CONSECUTIVE_UP_SCORE
             breakdown["trend_consecutive"] = f"3日连阳+{TREND_CONSECUTIVE_UP_SCORE}"
+        # 7日累计涨幅（长期趋势奖励）
+        cum_7d = cum_7d_map.get(code, 0)
+        if cum_7d >= 30:
+            total += 3
+            breakdown["trend_7d"] = f"7日+{cum_7d:.0f}%(强)=3"
+        elif cum_7d >= 20:
+            total += 2
+            breakdown["trend_7d"] = f"7日+{cum_7d:.0f}%(中)=2"
         breakdown["kind"] = "趋势"
 
         results.append(ScoredStock(
@@ -602,19 +645,26 @@ def screen_stocks(
             s.score += reversal_bonus[s.code]
             s.score_breakdown["reversal"] = f"反包+{reversal_bonus[s.code]}"
 
-    # 5.6. 合并趋势股候选池（非涨停但强趋势）
+    # 5.6. 趋势股独立配额（保证"独立趋势"如德明利不被板块热度挤下）
     trending = _screen_trending_stocks(date, top_sectors, intraday_db)
-    # 去重（如果某股既在 scored 又在 trending，保留高分）
     existing = {s.code for s in scored}
-    for t in trending:
-        if t.code not in existing:
-            scored.append(t)
+    trending_unique = [t for t in trending if t.code not in existing]
 
     # 6. 排序（分数降序，同分按连板高度降序）
     scored.sort(key=lambda x: (x.score, x.board_count), reverse=True)
+    trending_unique.sort(key=lambda x: x.score, reverse=True)
 
-    # 7. 取 Top N
-    return scored[:max_picks]
+    # 7. 分配配额：涨停优先 70%，趋势强制保留 30%（至少 1 只）
+    if max_picks >= 4:
+        trend_quota = max(max_picks // 3, 1)   # 至少 1 只趋势
+    else:
+        trend_quota = 0
+    limit_quota = max_picks - trend_quota
+
+    final = scored[:limit_quota] + trending_unique[:trend_quota]
+    # 按分数统一排序，美化输出
+    final.sort(key=lambda x: (x.score, x.board_count), reverse=True)
+    return final
 
 
 def format_screening_result(stocks: List[ScoredStock]) -> str:

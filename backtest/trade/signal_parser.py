@@ -533,8 +533,11 @@ def _normalize_focus_stocks(focus_stocks: list) -> list[dict]:
     return result
 
 
-def _enrich_from_json(signals: list[TradeSignal], json_data: dict):
+def _enrich_from_json(signals: list[TradeSignal], json_data):
     """用 JSON 数据补充 Markdown 解析结果"""
+    # MiniMax 有时直接返回 list 而非 dict
+    if not isinstance(json_data, dict):
+        return
     focus_stocks = _normalize_focus_stocks(json_data.get("focus_stocks", []))
     do_actions = json_data.get("do_actions", [])
     pos_advice = json_data.get("position_advice", "")

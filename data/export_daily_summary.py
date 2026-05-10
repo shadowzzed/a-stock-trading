@@ -3,10 +3,10 @@
 每日行情摘要导出 — 从盘中 SQLite 生成结构化 Markdown
 
 用法:
-  python3 trading/export_daily_summary.py [日期]     # 默认今天
-  python3 trading/export_daily_summary.py 2026-03-30
+  python3 -m data.export_daily_summary [日期]     # 默认今天
+  python3 -m data.export_daily_summary 2026-03-30
 
-输出: trading/daily/YYYY-MM-DD/行情数据.md
+输出: {data_root}/daily/YYYY-MM-DD/行情数据.md
 """
 
 import json
@@ -46,19 +46,23 @@ def parse_stocks_md():
 
 
 def get_snapshots(db, date):
-    """获取指定日期的所有快照时间"""
+    """获取指定日期的所有分钟K线时间点"""
     rows = db.execute(
-        "SELECT DISTINCT ts FROM snapshots WHERE date=? ORDER BY ts", (date,)
+        "SELECT DISTINCT time FROM minute_bars WHERE date=? ORDER BY time", (date,)
     ).fetchall()
     return [r[0] for r in rows]
 
 
 def get_snapshot_data(db, date, ts):
-    """获取指定快照的数据"""
+    """获取指定时间点的分钟K数据"""
     return db.execute(
-        "SELECT code, name, price, pctChg, open, high, low, last_close, "
-        "volume, amount, amount_yi, sector, star, in_pool "
-        "FROM snapshots WHERE date=? AND ts=?",
+        "SELECT m.code, COALESCE(meta.name, '') AS name, m.close AS price, "
+        "0 AS pctChg, m.open, m.high, m.low, "
+        "COALESCE(meta.last_close, 0) AS last_close, "
+        "m.volume, m.amount, 0 AS amount_yi "
+        "FROM minute_bars m "
+        "LEFT JOIN stock_meta meta ON m.date = meta.date AND m.code = meta.code "
+        "WHERE m.date=? AND m.time=?",
         (date, ts),
     ).fetchall()
 

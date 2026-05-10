@@ -70,6 +70,17 @@ def get_target_codes(conn: sqlite3.Connection, date: str) -> list[str]:
             "SELECT DISTINCT code FROM daily_bars WHERE date = ? ORDER BY code",
             (date,),
         ).fetchall()
+    # Fallback：当日没有清单（比如今天 EOD 还没拉）→ 用最近有数据的日期
+    if not rows:
+        latest = conn.execute(
+            "SELECT MAX(date) FROM stock_meta WHERE date < ?", (date,),
+        ).fetchone()
+        if latest and latest[0]:
+            rows = conn.execute(
+                "SELECT DISTINCT code FROM stock_meta WHERE date = ? ORDER BY code",
+                (latest[0],),
+            ).fetchall()
+            logger.info(f"[{date}] stock_meta 无数据，fallback 到 {latest[0]}，共 {len(rows)} 只")
     return [r[0] for r in rows]
 
 

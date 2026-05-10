@@ -54,7 +54,6 @@ def _load_daily_actions(output_dir: str) -> dict[str, list[dict]]:
             daily[date] = actions
 
     return daily
-    from ..experience.store import ExperienceStore
 
 
 def generate_summary(
@@ -74,9 +73,13 @@ def generate_summary(
             "results": [_result_to_dict(r) for r in results],
         }
     else:
-        # 收益率统计
-        pnl_list = [r.avg_pnl_pct for r in completed if r.avg_pnl_pct != 0]
-        hit_rates = [r.hit_rate for r in completed if r.hit_rate > 0]
+        # 收益率统计 — 仅统计真正有推荐标的的日子（避免空仓日稀释均值）
+        days_with_buys = [
+            r for r in completed
+            if any(rec.action == "买入" for rec in r.recommendations)
+        ]
+        pnl_list = [r.avg_pnl_pct for r in days_with_buys]
+        hit_rates = [r.hit_rate for r in days_with_buys]
         total_recs = sum(len(r.recommendations) for r in completed)
 
         avg_pnl = round(sum(pnl_list) / len(pnl_list), 2) if pnl_list else 0
@@ -266,7 +269,7 @@ def generate_settlement_report(
     closed = tracker.closed_trades
     open_positions = tracker.positions
 
-    # 加载逐日持仓决策
+    # 加载逐日持仓决策（从每日报告中提取 position_actions）
     daily_actions = _load_daily_actions(output_dir)
 
     # ── 用展示资金计算复利交割单 ──
@@ -282,6 +285,7 @@ def generate_settlement_report(
             "buy_date": t["buy_date"],
             "sell_date": t["sell_date"],
             "name": t["name"],
+            "code": t.get("code", ""),
             "position": round(position),
             "pnl_pct": pnl_pct,
             "pnl_amount": round(pnl_amount),
@@ -289,6 +293,8 @@ def generate_settlement_report(
             "buy_reason": t.get("buy_reason", ""),
             "sell_reason": t.get("reason", "") or t.get("sell_reason", ""),
             "hold_days": t.get("hold_days", 0),
+            "forced_exit": t.get("forced_exit", False),
+            "confidence": t.get("confidence", "high"),
         })
 
     # ── 生成 Markdown ──
@@ -305,21 +311,59 @@ def generate_settlement_report(
     closed_pnl = closed_equity - display_capital
     closed_pnl_pct = closed_pnl / display_capital * 100
 
-    # 统计已平仓
-    wins = [t for t in trade_records if t["pnl_pct"] > 0]
-    losses = [t for t in trade_records if t["pnl_pct"] < 0]
-    win_rate = len(wins) / len(trade_records) * 100 if trade_records else 0
+    # 统计已平仓 — 主表排除 forced_exit（持仓超期强平，非 Agent 决策，污染胜负）
+    agent_trades = [t for t in trade_records if not t.get("forced_exit")]
+    forced_trades = [t for t in trade_records if t.get("forced_exit")]
+    wins = [t for t in agent_trades if t["pnl_pct"] > 0]
+    losses = [t for t in agent_trades if t["pnl_pct"] < 0]
+    win_rate = len(wins) / len(agent_trades) * 100 if agent_trades else 0
     avg_win = sum(t["pnl_pct"] for t in wins) / len(wins) if wins else 0
     avg_loss = sum(t["pnl_pct"] for t in losses) / len(losses) if losses else 0
+    pnl_loss_ratio = abs(avg_win / avg_loss) if avg_loss != 0 else 0
 
     lines.extend([
         "- 已平仓资金：{:,.0f}".format(closed_equity),
         "- 已平仓收益：{:>+,.0f}（{:+.2f}%）".format(closed_pnl, closed_pnl_pct),
-        "- 已平仓笔数：{}笔（{}胜{}负）".format(len(trade_records), len(wins), len(losses)),
-        "- 胜率：{:.1f}%".format(win_rate),
+        "- Agent 决策平仓：{}笔（{}胜{}负）".format(len(agent_trades), len(wins), len(losses)),
+        "- 胜率：{:.1f}%（仅 Agent 决策）".format(win_rate),
         "- 平均盈利：{:+.2f}%".format(avg_win),
         "- 平均亏损：{:+.2f}%".format(avg_loss),
+        "- 盈亏比：{:.2f}".format(pnl_loss_ratio),
     ])
+    if forced_trades:
+        forced_pnl = sum(t["pnl_pct"] for t in forced_trades) / len(forced_trades)
+        lines.append(
+            "- 强制平仓：{}笔（均{:+.2f}%，超 MAX_HOLD_DAYS 被动卖出，不计入胜率）".format(
+                len(forced_trades), forced_pnl
+            )
+        )
+
+    # ── Confidence 分组统计（Sprint 2 新增） ──
+    conf_groups = {"high": [], "medium": [], "low": []}
+    for t in agent_trades:
+        c = t.get("confidence", "high")
+        if c not in conf_groups:
+            c = "high"
+        conf_groups[c].append(t)
+    # 只要有至少一笔非默认 high 就显示分组表（说明 Agent 实际用了 confidence）
+    non_default = any(conf_groups["medium"]) or any(conf_groups["low"])
+    if non_default:
+        lines.extend(["", "## 一.2 Confidence 分组表现", "",
+                      "| 自信度 | 笔数 | 胜率 | 均盈利 | 均亏损 | 盈亏比 |",
+                      "|--------|------|------|--------|--------|--------|"])
+        for level in ("high", "medium", "low"):
+            grp = conf_groups[level]
+            if not grp:
+                lines.append("| {} | 0 | — | — | — | — |".format(level))
+                continue
+            w = [t for t in grp if t["pnl_pct"] > 0]
+            l = [t for t in grp if t["pnl_pct"] < 0]
+            wr = len(w) / len(grp) * 100
+            aw = sum(t["pnl_pct"] for t in w) / len(w) if w else 0
+            al = sum(t["pnl_pct"] for t in l) / len(l) if l else 0
+            pr = abs(aw / al) if al != 0 else 0
+            lines.append("| {} | {} | {:.1f}% | {:+.2f}% | {:+.2f}% | {:.2f} |".format(
+                level, len(grp), wr, aw, al, pr))
 
     if open_positions:
         open_value = sum(p.get("cost", 0) * scale for p in open_positions)
@@ -327,9 +371,6 @@ def generate_settlement_report(
             "- 剩余持仓：{}只，市值约{:,.0f}".format(len(open_positions), open_value),
             "- 持仓标的：{}".format("、".join(p["name"] for p in open_positions)),
         ])
-
-    # ── 加载逐日持仓决策（从每日报告中提取 position_actions）──
-    daily_actions = _load_daily_actions(output_dir)
 
     # ── 逐笔交割单 ──
     lines.extend([
