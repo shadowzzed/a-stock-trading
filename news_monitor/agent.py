@@ -8,17 +8,23 @@
 - 盘前简报：汇总隔夜新闻，生成盘前交易参考
 
 用法:
+    # 早报（每日 8:55 触发）— A 股精选 + 美股板块/明星股
+    python -m news_monitor morning_brief
+    python -m news_monitor morning_brief --dry         # 不发，仅打印
+    python -m news_monitor morning_brief --no-us       # 跳过美股部分
+    python -m news_monitor morning_brief --no-a        # 跳过 A 股部分
+
     # 生成事件催化（盘后运行，分析当日新闻）
-    python -m monitor.agent catalyst
+    python -m news_monitor catalyst
 
     # 生成盘前简报（09:00 前运行）
-    python -m monitor.agent briefing
+    python -m news_monitor briefing
 
     # 指定日期
-    python -m monitor.agent catalyst --date 2026-03-31
+    python -m news_monitor catalyst --date 2026-03-31
 
     # 调试模式
-    python -m monitor.agent catalyst --dry-run
+    python -m news_monitor catalyst --dry-run
 """
 
 import argparse
@@ -157,10 +163,13 @@ def run_briefing(date: str, dry_run: bool = False):
 
 def main():
     parser = argparse.ArgumentParser(description="新闻监控 Agent")
+    parser.add_argument("--no-us", action="store_true", help="(morning_brief) 跳过美股部分")
+    parser.add_argument("--no-a", action="store_true", help="(morning_brief) 跳过 A 股部分")
+    parser.add_argument("--dry", action="store_true", help="(morning_brief) 不发送，仅打印")
     parser.add_argument(
         "action",
-        choices=["catalyst", "briefing"],
-        help="catalyst=事件催化提取, briefing=盘前简报",
+        choices=["catalyst", "briefing", "morning_brief"],
+        help="catalyst=事件催化提取, briefing=盘前简报, morning_brief=每日早报（A 股+美股）",
     )
     parser.add_argument("--date", default=datetime.now().strftime("%Y-%m-%d"), help="日期")
     parser.add_argument("--dry-run", action="store_true", help="只看 prompt 不调 AI")
@@ -171,6 +180,59 @@ def main():
         run_catalyst(args.date, args.dry_run)
     elif args.action == "briefing":
         run_briefing(args.date, args.dry_run)
+    elif args.action == "morning_brief":
+        run_morning_brief(dry=args.dry, no_us=args.no_us, no_a=args.no_a)
+
+
+def run_morning_brief(dry: bool = False, no_us: bool = False, no_a: bool = False):
+    """生成并发送早报：A 股精选（来自候选池） + 美股板块/明星股。
+
+    8:55 LaunchAgent 触发，9:00 完成发送。失败 fallback 到无 LLM 简化版。
+    """
+    from news_monitor.morning_brief import generate_a_share_brief, mark_used
+    from news_monitor.morning_brief_us import generate_us_brief
+    from news_monitor.news_monitor import send_feishu
+
+    today = datetime.now().strftime("%Y-%m-%d %H:%M")
+    parts = [f"# 📰 早报 · {today}", ""]
+
+    a_used_ids = []
+    if not no_a:
+        try:
+            a_text, a_used_ids = generate_a_share_brief()
+            parts.append(a_text)
+        except Exception as e:
+            print(f"[早报] A 股部分失败: {e}", flush=True)
+            parts.append(f"## 🌅 A 股早报\n\n_生成失败：{e}_")
+    parts.append("")
+
+    if not no_us:
+        try:
+            us_text = generate_us_brief()
+            parts.append(us_text)
+        except Exception as e:
+            print(f"[早报] 美股部分失败: {e}", flush=True)
+            parts.append(f"## 🇺🇸 美股早报\n\n_生成失败：{e}_")
+    parts.append("")
+    parts.append("---")
+    parts.append(f"_由 News Monitor 早报生成于 {today}_")
+
+    final_text = "\n".join(parts)
+
+    print("\n========== 完整早报 ==========")
+    print(final_text)
+    print("==============================\n")
+
+    if dry:
+        print("[早报] dry-run 模式，未发送", flush=True)
+        return
+
+    if send_feishu(final_text):
+        if a_used_ids:
+            mark_used(a_used_ids)
+        print(f"[早报] ✅ 已发送，标记 {len(a_used_ids)} 条 A 股新闻已用", flush=True)
+    else:
+        print("[早报] ❌ 发送失败", flush=True)
 
 
 if __name__ == "__main__":

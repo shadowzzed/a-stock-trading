@@ -118,6 +118,27 @@ def init_news_db():
     """)
     conn.execute("CREATE INDEX IF NOT EXISTS idx_sentiment_ts ON news_sentiment_index(timestamp)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_sentiment_date ON news_sentiment_index(created_date)")
+    # Phase 5 (2026-05-11): 早报候选池 — 盘后/夜间新闻不再聚合推送，全部入池等次日 9:00 早报精选
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS morning_brief_pool (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            news_key TEXT UNIQUE NOT NULL,
+            source TEXT,
+            title TEXT,
+            brief TEXT,
+            interpretation TEXT,
+            priority TEXT,
+            event_type TEXT,
+            plates TEXT,
+            stocks TEXT,
+            url TEXT,
+            news_time TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            used_in_brief INTEGER DEFAULT 0
+        )
+    """)
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_brief_pool_used ON morning_brief_pool(used_in_brief)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_brief_pool_created ON morning_brief_pool(created_at)")
     conn.commit()
     return conn
 
@@ -1137,6 +1158,68 @@ _news_buffer = []  # 聚合窗口内暂存的新闻
 _last_aggregate_time = [0.0]  # 上次聚合时间
 
 
+# ═══════════════════════════════════════════════════════════════
+# Phase 5 (2026-05-11): 早报候选池 + critical 实时兜底
+# ═══════════════════════════════════════════════════════════════
+
+# 非交易时间的"超紧急"白名单：即使盘后/夜间也立即推送
+# 选词原则：能让 A 股次日开盘直接跳空 / 全市场停摆级别的事件
+CRITICAL_KEYWORDS = [
+    # 战争/地缘
+    "宣战", "核打击", "核试验", "战争爆发", "全面入侵", "动用核武",
+    "台海冲突", "封锁台湾",
+    # 货币政策极端事件
+    "美联储紧急加息", "美联储紧急降息", "央行紧急", "降准降息", "意外加息",
+    # 市场极端事件
+    "熔断", "全球股市熔断", "美股熔断", "雷曼时刻",
+    # 重大监管 / 突发
+    "暂停IPO", "暂停交易", "停牌全市场",
+]
+
+
+def is_critical_news(title: str, brief: str = "") -> bool:
+    """判断是否为非交易时间也必须实时推送的超紧急新闻。"""
+    text = (title + " " + brief).strip()
+    if not text:
+        return False
+    return any(kw in text for kw in CRITICAL_KEYWORDS)
+
+
+def save_to_morning_pool(item: dict, interpretation: str, priority: str = None) -> bool:
+    """把新闻写入早报候选池（盘后/夜间不立即推送，等次日 9:00 早报精选）。
+
+    返回 True 表示新增成功，False 表示已存在（去重）。
+    """
+    db = get_news_db()
+    try:
+        plates_json = json.dumps(item.get("plates", []), ensure_ascii=False)
+        stocks_json = json.dumps(item.get("stocks", []), ensure_ascii=False)
+        db.execute(
+            "INSERT OR IGNORE INTO morning_brief_pool "
+            "(news_key, source, title, brief, interpretation, priority, event_type, "
+            "plates, stocks, url, news_time) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                item.get("key", ""),
+                item.get("source", ""),
+                item.get("title", ""),
+                item.get("brief", ""),
+                interpretation,
+                priority or "",
+                item.get("event_type", ""),
+                plates_json,
+                stocks_json,
+                item.get("url", ""),
+                item.get("time", ""),
+            ),
+        )
+        db.commit()
+        return db.total_changes > 0
+    except Exception as e:
+        log_error("morning_pool", "save 失败: %s" % e)
+        return False
+
+
 def is_trading_hours():
     """判断当前是否 A 股交易时间（09:25-15:00）"""
     now = datetime.now()
@@ -1487,9 +1570,17 @@ def run_once():
         if ai_event_type:
             item["event_type"] = ai_event_type
 
-        if trading and priority:
-            # 交易时间 + 高优先级 → 立即推送
+        # 是否走"立即推送"路径：交易时间高优 OR 非交易时间 critical 兜底
+        critical = is_critical_news(item["title"], item.get("brief", ""))
+        push_now = (trading and priority) or critical
+
+        if push_now:
+            # 立即推送
             tag = {"supply_demand": "供需", "earnings": "财报", "research": "研报", "geopolitics": "地缘"}.get(priority, "")
+            tag_emoji = {"供需": "📦", "财报": "📊", "研报": "📝", "地缘": "🌐"}.get(tag, "🔔")
+            if critical and not trading:
+                tag = "紧急"
+                tag_emoji = "🚨"
             # 影响分析（可选，超时跳过）
             impact_report = ""
             if _impact_available:
@@ -1498,7 +1589,6 @@ def run_once():
                         item["title"], item.get("brief", ""), timeout_sec=3.0)
                 except Exception:
                     pass
-            tag_emoji = {"供需": "📦", "财报": "📊", "研报": "📝", "地缘": "🌐"}.get(tag, "🔔")
             msg = "%s `%s`\n%s" % (tag_emoji, tag, format_feishu(item, interpretation, ai_provider, priority=priority))
             if impact_report:
                 msg += "\n---\n%s" % impact_report
@@ -1510,12 +1600,21 @@ def run_once():
                 sent_count += 1
                 print("  🔔 [%s] %s" % (tag, item["title"][:30]), flush=True)
             time.sleep(0.3)
-            # 标记为已单独推送，聚合时跳过
-            _news_buffer.append({"item": item, "interpretation": interpretation, "priority": priority, "sent_immediately": True})
-        else:
-            # 暂存到聚合缓冲区
+            if trading:
+                # 交易时间标记到聚合缓冲（聚合时跳过）
+                _news_buffer.append({"item": item, "interpretation": interpretation, "priority": priority, "sent_immediately": True})
+            # 非交易时间 critical 已实时推送，无需再入聚合或候选池
+        elif trading:
+            # 交易时间低优 → 暂存聚合缓冲（保持原有 20 分钟聚合行为）
             _news_buffer.append({"item": item, "interpretation": interpretation, "priority": priority, "sent_immediately": False})
-            print("  📦 缓存: %s" % item["title"][:35], flush=True)
+            print("  📦 缓存(聚合): %s" % item["title"][:35], flush=True)
+        else:
+            # 非交易时间普通新闻 → 入早报候选池，不再 60 分钟聚合推送
+            save_to_morning_pool(item, interpretation, priority)
+            save_news_item(item, interpretation)  # 同时入主表（用于历史归档/搜索）
+            _title_window.add(item["title"])
+            sent_keys.add(item["key"])
+            print("  🌅 入早报池: %s" % item["title"][:35], flush=True)
 
     # 检查是否到了聚合时间
     if _news_buffer and time.time() - _last_aggregate_time[0] >= (AGGREGATE_INTERVAL_TRADING if is_trading_hours() else AGGREGATE_INTERVAL_OFF_HOURS):
@@ -1639,10 +1738,11 @@ def _acquire_lock():
 def main():
     _acquire_lock()
     print("📰 A 股新闻监控启动", flush=True)
-    print("   数据源: TrendRadar + 财联社 + 华尔街见闻 + 金十数据 + BlockBeats + 东方财富研报", flush=True)
+    print("   数据源: TrendRadar + 财联社 + 华尔街见闻 + 金十数据 + BlockBeats + TechFlow + PANews + 研报", flush=True)
     print("   轮询间隔: %ds" % POLL_INTERVAL, flush=True)
     print("   交易时间(09:25-15:00): 高优实时推送 | 低优%d分钟聚合" % (AGGREGATE_INTERVAL_TRADING // 60), flush=True)
-    print("   非交易时间: %d分钟聚合推送" % (AGGREGATE_INTERVAL_OFF_HOURS // 60), flush=True)
+    print("   非交易时间: 全部入早报候选池（次日 9:00 由 morning_brief 精选 Top 12 推送）", flush=True)
+    print("   非交易时间例外: 战争/熔断/紧急加息等 critical 关键词仍立即推送（白名单兜底）", flush=True)
     print("   看门狗超时: %ds" % WATCHDOG_TIMEOUT, flush=True)
     print(flush=True)
     _last_aggregate_time[0] = time.time()  # 初始化聚合计时器
