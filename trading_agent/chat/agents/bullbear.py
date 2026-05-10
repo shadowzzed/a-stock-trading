@@ -25,4 +25,8 @@ class BullBearAgent(BaseAgent):
         "get_review_docs",
         "get_quant_rules",
         "get_prev_report",
+        "get_news",
+        "search_similar_news",
+        "get_news_impact",
+        "get_sentiment_index",
     ]

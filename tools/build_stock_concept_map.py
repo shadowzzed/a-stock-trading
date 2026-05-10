@@ -24,10 +24,9 @@ def get_all_stock_codes(intraday_db):
     conn = sqlite3.connect(intraday_db)
     c = conn.cursor()
     try:
-        c.execute("SELECT code, name FROM snapshots WHERE code NOT LIKE '688%' GROUP BY code")
+        c.execute("SELECT code, name FROM daily_bars GROUP BY code")
     except:
-        # fallback: 只获取主板的
-        c.execute("SELECT DISTINCT code, name FROM snapshots WHERE length(code)=6")
+        c.execute("SELECT DISTINCT code, name FROM daily_bars WHERE length(code)=6")
     rows = c.fetchall()
     conn.close()
 

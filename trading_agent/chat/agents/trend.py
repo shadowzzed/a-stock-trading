@@ -26,4 +26,5 @@ class TrendAgent(BaseAgent):
         "get_index_data",
         "get_capital_flow",
         "scan_trend_stocks",
+        "get_news",
     ]

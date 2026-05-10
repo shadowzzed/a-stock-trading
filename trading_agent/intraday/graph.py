@@ -132,27 +132,30 @@ def _fetch_early_session(cfg: dict, today: str) -> dict:
         context_parts.append("## 今日开盘分析报告\n\n" + opening_report)
     else:
         print("[WARN] 开盘分析报告不存在，尝试从 DB 直接拉取数据", flush=True)
-        # fallback: 直接查 09:25 和 09:40 数据
+        # fallback: 从 minute_bars + stock_meta 查 09:25 和 09:40 数据
         db_path = cfg["intraday_db"]
         if os.path.exists(db_path):
             conn = sqlite3.connect(db_path, timeout=10)
             rows = conn.execute("""
-                SELECT code, name, price, pctChg, open, high, low, last_close,
-                       sector, star, in_pool, is_limit_up
-                FROM snapshots WHERE date = ? AND in_pool = 1
-                    AND (
-                        (ts >= '09:25:00' AND ts <= '09:30:00')
-                        OR (ts >= '09:38:00' AND ts <= '09:45:00')
-                    )
-                ORDER BY ts, pctChg DESC
+                SELECT m.code,
+                       COALESCE(meta.name, '') AS name,
+                       m.close AS price,
+                       m.open, m.high, m.low,
+                       COALESCE(meta.last_close, 0) AS last_close
+                FROM minute_bars m
+                LEFT JOIN stock_meta meta ON m.date = meta.date AND m.code = meta.code
+                WHERE m.date = ?
+                    AND (m.time IN ('09:25', '09:30', '09:40', '09:45'))
+                ORDER BY m.time, m.close DESC
             """, (today,)).fetchall()
             conn.close()
             if rows:
-                context_parts.append("## 池内股票行情（09:25 + 09:40）\n")
+                context_parts.append("## 全市场行情（09:25 + 09:40）\n")
                 for r in rows[:50]:
+                    code, name, price, open_p, high, low, last_close = r
+                    pct = ((price / last_close - 1) * 100) if last_close and last_close > 0 else 0
                     context_parts.append(
-                        "%s | %s | %.2f%% | sector=%s star=%d" %
-                        (r[0], r[1], r[3], r[8], r[9])
+                        "%s | %s | %.2f%%" % (code, name, pct)
                     )
 
     # 股票池

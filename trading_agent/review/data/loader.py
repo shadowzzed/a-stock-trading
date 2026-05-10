@@ -58,18 +58,20 @@ class DailyData:
 
 def load_daily_data(data_dir: str, date: str, history_days: int = 7,
                     backtest_mode: bool = False) -> DailyData:
-    """从 trading/daily/YYYY-MM-DD/ 目录加载当日数据
+    """从 {data_root}/daily/YYYY-MM-DD/ 目录加载当日数据
 
     Args:
-        data_dir: trading 根目录（如 /path/to/trading）
+        data_dir: data_root 路径（即 config.yaml 中的 data_root，默认 ~/shared/trading）
         date: 日期字符串，如 "2026-03-24"
         history_days: 历史回溯天数
         backtest_mode: 回测模式下，review_docs 只加载 D-1 及之前（避免前瞻偏差）
     """
     daily_dir = os.path.join(data_dir, "daily", date)
 
-    # 涨停板（CSV 优先，东方财富 API fallback）
-    limit_up = _load_csv(daily_dir, f"涨停板_{date.replace('-', '')}.csv")
+    # 涨停板（DB 优先 > CSV > 东方财富 API fallback）
+    limit_up = _load_limit_up_from_db(data_dir, date)
+    if limit_up.empty:
+        limit_up = _load_csv(daily_dir, f"涨停板_{date.replace('-', '')}.csv")
     if limit_up.empty:
         limit_up = fetch_limit_up_from_eastmoney(date)
         if not limit_up.empty:
@@ -78,8 +80,10 @@ def load_daily_data(data_dir: str, date: str, history_days: int = 7,
             limit_up.to_csv(csv_path, index=False, encoding="utf-8-sig")
             logger.info("已通过东方财富 API 获取涨停板数据并缓存到 %s", csv_path)
 
-    # 跌停板（CSV 优先，东方财富 API fallback）
-    limit_down = _load_csv(daily_dir, f"跌停板_{date.replace('-', '')}.csv")
+    # 跌停板（DB 优先 > CSV > 东方财富 API fallback）
+    limit_down = _load_limit_down_from_db(data_dir, date)
+    if limit_down.empty:
+        limit_down = _load_csv(daily_dir, f"跌停板_{date.replace('-', '')}.csv")
     if limit_down.empty:
         limit_down = fetch_limit_down_from_eastmoney(date)
         if not limit_down.empty:
@@ -129,33 +133,45 @@ def _load_history(data_dir: str, current_date: str, days: int = 5,
     """
     history = []
     daily_root = os.path.join(data_dir, "daily")
-    if not os.path.isdir(daily_root):
-        return history
 
-    # 列出所有日期目录，排序取当前日期之前的
-    all_dates = sorted([
-        d for d in os.listdir(daily_root)
-        if os.path.isdir(os.path.join(daily_root, d)) and d < current_date
-    ])
+    # 优先从 DB 获取交易日列表
+    db_path = os.path.join(data_dir, "intraday", "intraday.db")
+    if os.path.exists(db_path):
+        try:
+            conn = sqlite3.connect(db_path, timeout=10)
+            all_dates = [r[0] for r in conn.execute(
+                "SELECT DISTINCT date FROM limit_up WHERE date < ? ORDER BY date",
+                (current_date,)
+            ).fetchall()]
+            conn.close()
+        except Exception:
+            all_dates = []
+    else:
+        all_dates = []
+
+    # DB fallback：扫描 CSV 目录
+    if not all_dates and os.path.isdir(daily_root):
+        all_dates = sorted([
+            d for d in os.listdir(daily_root)
+            if os.path.isdir(os.path.join(daily_root, d)) and d < current_date
+        ])
 
     for hist_date in all_dates[-days:]:
-        hist_dir = os.path.join(daily_root, hist_date)
-        date_compact = hist_date.replace("-", "")
+        # 优先从 DB 读取
+        lu = _load_limit_up_from_db(data_dir, hist_date)
+        ld = _load_limit_down_from_db(data_dir, hist_date)
 
-        lu = _load_csv(hist_dir, "涨停板_{}.csv".format(date_compact))
-        if lu.empty:
-            lu = fetch_limit_up_from_eastmoney(hist_date)
-            if not lu.empty:
-                os.makedirs(hist_dir, exist_ok=True)
-                lu.to_csv(os.path.join(hist_dir, "涨停板_{}.csv".format(date_compact)),
-                          index=False, encoding="utf-8-sig")
-        ld = _load_csv(hist_dir, "跌停板_{}.csv".format(date_compact))
-        if ld.empty:
-            ld = fetch_limit_down_from_eastmoney(hist_date)
-            if not ld.empty:
-                os.makedirs(hist_dir, exist_ok=True)
-                ld.to_csv(os.path.join(hist_dir, "跌停板_{}.csv".format(date_compact)),
-                          index=False, encoding="utf-8-sig")
+        # CSV fallback（非回测模式才尝试 API）
+        if lu.empty and not backtest_mode:
+            hist_dir = os.path.join(daily_root, hist_date)
+            date_compact = hist_date.replace("-", "")
+            if os.path.isdir(hist_dir):
+                lu = _load_csv(hist_dir, "涨停板_{}.csv".format(date_compact))
+        if ld.empty and not backtest_mode:
+            hist_dir = os.path.join(daily_root, hist_date)
+            date_compact = hist_date.replace("-", "")
+            if os.path.isdir(hist_dir):
+                ld = _load_csv(hist_dir, "跌停板_{}.csv".format(date_compact))
 
         lu_count = len(lu)
         ld_count = len(ld)
@@ -413,6 +429,43 @@ def fetch_limit_down_from_eastmoney(date: str) -> pd.DataFrame:
 
     except Exception as e:
         logger.warning("东方财富跌停板 API 请求失败 %s: %s", date_compact, e)
+        return pd.DataFrame()
+
+
+def _load_limit_up_from_db(data_dir: str, date: str) -> pd.DataFrame:
+    """从 limit_up 表加载涨停板数据"""
+    db_path = os.path.join(data_dir, "intraday", "intraday.db")
+    if not os.path.exists(db_path):
+        return pd.DataFrame()
+    try:
+        conn = sqlite3.connect(db_path, timeout=10)
+        df = pd.read_sql_query(
+            "SELECT date, code as 代码, name as 名称, pct_chg as 涨跌幅, price as 最新价, amount as 成交额, "
+            "first_limit_time as 首次封板时间, last_limit_time as 最后封板时间, "
+            "blown_count as 炸板次数, board_count as 连板数, industry as 所属行业 "
+            "FROM limit_up WHERE date = ?",
+            conn, params=(date,))
+        conn.close()
+        return df
+    except Exception:
+        return pd.DataFrame()
+
+
+def _load_limit_down_from_db(data_dir: str, date: str) -> pd.DataFrame:
+    """从 limit_down 表加载跌停板数据"""
+    db_path = os.path.join(data_dir, "intraday", "intraday.db")
+    if not os.path.exists(db_path):
+        return pd.DataFrame()
+    try:
+        conn = sqlite3.connect(db_path, timeout=10)
+        df = pd.read_sql_query(
+            "SELECT date, code as 代码, name as 名称, pct_chg as 涨跌幅, price as 最新价, amount as 成交额, "
+            "board_count as 连续跌停, open_count as 开板次数, industry as 所属行业 "
+            "FROM limit_down WHERE date = ?",
+            conn, params=(date,))
+        conn.close()
+        return df
+    except Exception:
         return pd.DataFrame()
 
 
@@ -727,97 +780,72 @@ def save_lessons(data_dir: str, date: str, new_lessons: list,
 
 
 def load_index_data(data_dir: str, date: str) -> str:
-    """加载当日指数数据，返回文本摘要"""
-    daily_dir = os.path.join(data_dir, "daily", date)
-    date_compact = date.replace("-", "")
-    csv_path = os.path.join(daily_dir, f"指数_{date_compact}.csv")
-    if not os.path.exists(csv_path):
+    """加载当日指数数据，返回文本摘要（从 index_data 表读取）"""
+    import sqlite3
+
+    db_path = os.path.join(data_dir, "intraday", "intraday.db")
+    if not os.path.exists(db_path):
         return ""
 
+    conn = sqlite3.connect(db_path, timeout=10)
     try:
-        df = pd.read_csv(csv_path, encoding="utf-8-sig")
-    except (pd.errors.EmptyDataError, Exception):
+        rows = conn.execute(
+            "SELECT name, close, pct_chg, amount FROM index_data WHERE date = ? ORDER BY code",
+            (date,),
+        ).fetchall()
+    except Exception:
         return ""
+    finally:
+        conn.close()
 
-    if df.empty:
+    if not rows:
         return ""
 
     lines = ["## 指数行情"]
     lines.append("| 指数 | 收盘 | 涨跌幅 | 成交额(亿) |")
     lines.append("|------|------|--------|-----------|")
-    for _, row in df.iterrows():
-        name = row.get("名称", row.get("代码", "?"))
-        close_val = row.get("收盘价", 0)
-        pct = row.get("涨跌幅", 0)
-        amount = row.get("成交额", 0)
-        try:
-            amount_yi = float(amount) / 1e8
-        except (ValueError, TypeError):
-            amount_yi = 0
-        lines.append(f"| {name} | {close_val} | {float(pct):+.2f}% | {amount_yi:.0f} |")
+    for row in rows:
+        name, close_val, pct, amount = row
+        amount_yi = (amount or 0) / 1e8 if amount else 0
+        lines.append(f"| {name or '?'} | {close_val or 0} | {float(pct or 0):+.2f}% | {amount_yi:.0f} |")
 
     return "\n".join(lines)
 
 
 def load_capital_flow(data_dir: str, date: str) -> str:
-    """加载当日资金流数据（板块资金流+北向资金），返回文本摘要"""
-    daily_dir = os.path.join(data_dir, "daily", date)
-    date_compact = date.replace("-", "")
-    lines = []
+    """加载当日资金流数据，返回文本摘要（从 capital_flow 表读取）"""
+    import sqlite3
 
-    # 板块资金流
-    sector_path = os.path.join(daily_dir, f"板块资金流_{date_compact}.csv")
-    if os.path.exists(sector_path):
-        try:
-            df = pd.read_csv(sector_path, encoding="utf-8-sig")
-            if not df.empty:
-                lines.append("## 板块资金流向（今日）")
-                # 取净流入前5和后5
-                if "净额" in df.columns or "主力净流入" in df.columns:
-                    flow_col = "净额" if "净额" in df.columns else "主力净流入"
-                    name_col = "名称" if "名称" in df.columns else df.columns[0]
-                    df[flow_col] = pd.to_numeric(df[flow_col], errors="coerce")
-                    top5 = df.nlargest(5, flow_col)
-                    bot5 = df.nsmallest(5, flow_col)
-                    lines.append("**净流入前5**：" + "、".join(
-                        f"{r[name_col]}({r[flow_col]/1e8:+.1f}亿)" for _, r in top5.iterrows()
-                    ))
-                    lines.append("**净流出前5**：" + "、".join(
-                        f"{r[name_col]}({r[flow_col]/1e8:+.1f}亿)" for _, r in bot5.iterrows()
-                    ))
-        except Exception:
-            pass
+    db_path = os.path.join(data_dir, "intraday", "intraday.db")
+    if not os.path.exists(db_path):
+        return ""
 
-    # 北向资金
-    north_path = os.path.join(daily_dir, f"北向资金_{date_compact}.csv")
-    if os.path.exists(north_path):
-        try:
-            df = pd.read_csv(north_path, encoding="utf-8-sig")
-            if not df.empty:
-                lines.append("\n## 北向资金")
-                for _, row in df.iterrows():
-                    channel = row.get("通道", row.get("名称", "?"))
-                    # 尝试多个可能的列名
-                    net = None
-                    for col in ["当日成交净买额", "当日净买额", "净买入"]:
-                        val = row.get(col)
-                        if pd.notna(val) and val != "":
-                            try:
-                                net = float(val)
-                                break
-                            except (ValueError, TypeError):
-                                pass
-                    # 领涨股信息
-                    leader = row.get("领涨股", "")
-                    leader_pct = row.get("领涨股-涨跌幅", "")
-                    if net is not None:
-                        lines.append(f"- {channel}：净买入 {net/1e8:+.1f}亿")
-                    elif leader:
-                        lines.append(f"- {channel}：领涨股 {leader}({leader_pct}%)")
-        except Exception:
-            pass
+    conn = sqlite3.connect(db_path, timeout=10)
+    try:
+        rows = conn.execute(
+            "SELECT name, net_flow FROM capital_flow WHERE date = ? ORDER BY net_flow DESC",
+            (date,),
+        ).fetchall()
+    except Exception:
+        return ""
+    finally:
+        conn.close()
 
-    return "\n".join(lines) if lines else ""
+    if not rows:
+        return ""
+
+    lines = ["## 板块资金流向（今日）"]
+    top5 = rows[:5]
+    bot5 = rows[-5:] if len(rows) > 5 else []
+    lines.append("**净流入前5**：" + "、".join(
+        f"{r[0]}({r[1]/1e8:+.1f}亿)" for r in top5 if r[1]
+    ))
+    if bot5:
+        lines.append("**净流出前5**：" + "、".join(
+            f"{r[0]}({r[1]/1e8:+.1f}亿)" for r in bot5 if r[1]
+        ))
+
+    return "\n".join(lines)
 
 
 def load_memory(memory_dir: str, date: str, max_days: int = 5) -> str:
@@ -947,6 +975,114 @@ def _get_db_path(data_dir: str) -> str:
     return os.path.join(data_dir, "intraday", "intraday.db")
 
 
+def _ensure_stock_meta(conn: sqlite3.Connection):
+    """确保 stock_meta 表存在，并从已有数据一次性迁移。
+
+    stock_meta 只存 minute_bars 缺少的字段：name、limit_pct、last_close。
+    """
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS stock_meta (
+            date       TEXT NOT NULL,
+            code       TEXT NOT NULL,
+            name       TEXT,
+            limit_pct  INTEGER DEFAULT 10,
+            last_close REAL,
+            PRIMARY KEY (date, code)
+        )
+    """)
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_meta_code ON stock_meta(code)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_meta_name ON stock_meta(name)")
+    # 对于 daily_bars 中有数据但 stock_meta 中缺失的日期，从 daily_bars 补充
+    try:
+        conn.execute("""
+            INSERT OR IGNORE INTO stock_meta (date, code, name, last_close)
+            SELECT d.date, d.code, d.name,
+                   (SELECT d2.close FROM daily_bars d2
+                    WHERE d2.code = d.code AND d2.date < d.date
+                    ORDER BY d2.date DESC LIMIT 1) AS last_close
+            FROM daily_bars d
+            WHERE NOT EXISTS (
+                SELECT 1 FROM stock_meta m WHERE m.date = d.date AND m.code = d.code
+            )
+        """)
+    except Exception as e:
+        logger.debug("[stock_meta] daily_bars 补充失败: %s", e)
+    conn.commit()
+
+
+def _enrich_rows_from_meta(conn: sqlite3.Connection, rows: list[dict], date: str) -> list[dict]:
+    """用 stock_meta 补充 minute_bars/daily_bars 缺少的元数据字段（name、limit_pct、last_close）。"""
+    if not rows:
+        return rows
+    codes = list({r["code"] for r in rows})
+    placeholders = ",".join(["?"] * len(codes))
+    meta_rows = conn.execute(
+        f"SELECT code, name, limit_pct, last_close "
+        f"FROM stock_meta WHERE date = ? AND code IN ({placeholders})",
+        [date] + codes,
+    ).fetchall()
+    meta_map = {}
+    for m in meta_rows:
+        meta_map[m[0]] = {"name": m[1], "limit_pct": m[2], "last_close": m[3]}
+
+    # 如果当日 meta 的 name 为空，从最近有 name 的记录补充
+    missing_name_codes = [c for c in codes if not meta_map.get(c, {}).get("name")]
+    if missing_name_codes:
+        ph2 = ",".join(["?"] * len(missing_name_codes))
+        name_rows = conn.execute(
+            f"SELECT code, name FROM stock_meta "
+            f"WHERE code IN ({ph2}) AND name IS NOT NULL AND name != '' "
+            f"ORDER BY date DESC",
+            missing_name_codes,
+        ).fetchall()
+        name_map = {}
+        for r in name_rows:
+            if r[0] not in name_map:
+                name_map[r[0]] = r[1]
+        # 也试从 daily_bars 补
+        if len(name_map) < len(missing_name_codes):
+            still_missing = [c for c in missing_name_codes if c not in name_map]
+            if still_missing:
+                ph3 = ",".join(["?"] * len(still_missing))
+                db_rows = conn.execute(
+                    f"SELECT code, name FROM daily_bars "
+                    f"WHERE code IN ({ph3}) AND name IS NOT NULL AND name != '' "
+                    f"ORDER BY date DESC",
+                    still_missing,
+                ).fetchall()
+                for r in db_rows:
+                    if r[0] not in name_map:
+                        name_map[r[0]] = r[1]
+        for code, name in name_map.items():
+            if code in meta_map:
+                if not meta_map[code].get("name"):
+                    meta_map[code]["name"] = name
+            else:
+                meta_map[code] = {"name": name, "limit_pct": 10, "last_close": None}
+    for r in rows:
+        meta = meta_map.get(r["code"], {})
+        if "name" not in r or not r.get("name"):
+            r["name"] = meta.get("name", "")
+        r.setdefault("limit_pct", meta.get("limit_pct", 10))
+        last_close = meta.get("last_close")
+        r.setdefault("last_close", last_close)
+        # 从 close/last_close 计算派生字段
+        close = r.get("price") or r.get("close")
+        if close and last_close and last_close > 0:
+            pct = (close / last_close - 1) * 100
+            r.setdefault("pctChg", round(pct, 2))
+            lp = r.get("limit_pct", 10)
+            r.setdefault("is_limit_up", 1 if pct >= lp - 0.1 else 0)
+            r.setdefault("is_limit_down", 1 if pct <= -(lp - 0.1) else 0)
+            r.setdefault("amount_yi", round(r.get("amount", 0) / 1e8, 2) if r.get("amount") else 0)
+        else:
+            r.setdefault("pctChg", r.get("pct_chg", 0))
+            r.setdefault("is_limit_up", 0)
+            r.setdefault("is_limit_down", 0)
+            r.setdefault("amount_yi", round(r.get("amount", 0) / 1e8, 2) if r.get("amount") else 0)
+    return rows
+
+
 def load_stock_detail(
     data_dir: str,
     name: Optional[str] = None,
@@ -986,70 +1122,71 @@ def load_stock_detail(
         )
 
     try:
-        # 先检查指定日期是否有数据，无数据且用户未显式指定日期时 fallback
+        _ensure_stock_meta(conn)
+        # 先检查指定日期是否有数据
         has_date_data = conn.execute(
-            "SELECT 1 FROM snapshots WHERE date = ? LIMIT 1", (target_date,)
+            "SELECT 1 FROM minute_bars WHERE date = ? LIMIT 1", (target_date,)
         ).fetchone()
 
         if not has_date_data and not date:
-            # 回测模式下，fallback 不超过 max_date
             if max_date:
                 fallback_row = conn.execute(
-                    "SELECT date FROM snapshots WHERE date <= ? ORDER BY date DESC LIMIT 1",
+                    "SELECT date FROM minute_bars WHERE date <= ? ORDER BY date DESC LIMIT 1",
                     (max_date,),
                 ).fetchone()
             else:
                 fallback_row = conn.execute(
-                    "SELECT date FROM snapshots ORDER BY date DESC LIMIT 1"
+                    "SELECT date FROM minute_bars ORDER BY date DESC LIMIT 1"
                 ).fetchone()
             if fallback_row:
                 target_date = fallback_row[0]
                 date_fallback = True
 
-        conditions = ["date = ?"]
-        params: list = [target_date]
-        # 回测模式下，额外校验日期不超过 max_date
         if max_date and target_date > max_date:
             return DataResult(
                 content="无数据（回测模式下日期超出范围）",
                 warnings=[f"请求日期 {target_date} 超出回测截止日期 {max_date}"],
-                data_sources_missing=["intraday_snapshot"],
+                data_sources_missing=["minute_bars"],
             )
+
+        conditions = ["m.date = ?"]
+        params: list = [target_date]
         if code:
-            conditions.append("code LIKE ?")
+            conditions.append("m.code LIKE ?")
             params.append(f"%{code}%")
         if name:
-            conditions.append("name LIKE ?")
+            conditions.append("meta.name LIKE ?")
             params.append(f"%{name}%")
 
         where = " AND ".join(conditions)
         query = f"""
-            SELECT date, ts, code, name, price, pctChg,
-                   open, high, low, last_close,
-                   volume, amount, amount_yi,
-                   is_limit_up, is_limit_down, sector
-            FROM snapshots WHERE {where} ORDER BY ts
+            SELECT m.date, m.time AS ts, m.code,
+                   m.close AS price, m.open, m.high, m.low,
+                   m.volume, m.amount
+            FROM minute_bars m
+            LEFT JOIN stock_meta meta ON m.date = meta.date AND m.code = meta.code
+            WHERE {where} ORDER BY m.time
         """
-        rows = conn.execute(query, params).fetchall()
+        raw_rows = [dict(r) for r in conn.execute(query, params).fetchall()]
+        rows = _enrich_rows_from_meta(conn, raw_rows, target_date)
     finally:
         conn.close()
 
     if not rows:
         return DataResult(
-            content="无数据（未找到匹配的股票快照）",
+            content="无数据（未找到匹配的分时数据）",
             warnings=[f"未找到 {name or code} 在 {target_date} 的分时数据"],
-            data_sources_missing=["intraday_snapshot"],
+            data_sources_missing=["minute_bars"],
         )
 
     lines = []
     first = rows[0]
-    stock_name = first["name"]
+    stock_name = first.get("name", "")
     stock_code = first["code"]
-    sector = first["sector"] or ""
     if date_fallback:
         lines.append(f"> 注：今日为非交易日，已自动切换到最近交易日 {target_date}\n")
-    header = f"## {stock_name}（{stock_code}）{f' - {sector}' if sector else ''}"
-    header += f"\n日期: {target_date}，共 {len(rows)} 条快照\n"
+    header = f"## {stock_name}（{stock_code}）"
+    header += f"\n日期: {target_date}，共 {len(rows)} 条分时数据\n"
     lines.append(header)
 
     lines.append("| 时间 | 价格 | 涨跌幅 | 成交额(亿) | 涨停 |")
@@ -1102,21 +1239,34 @@ def load_market_snapshot(
         try:
             conn = sqlite3.connect(db_path)
             conn.row_factory = sqlite3.Row
+            _ensure_stock_meta(conn)
+
+            # 判断使用 minute_bars 还是 daily_bars
+            # 明确传 "close" 时用 daily_bars；其他情况优先 minute_bars（盘中最新）
+            force_daily = (time == "close")
+            if force_daily:
+                use_minute = False
+            else:
+                # 检查 minute_bars 是否有当日数据（盘中有数据就优先用）
+                has_minute = conn.execute(
+                    "SELECT 1 FROM minute_bars WHERE date = ? LIMIT 1", (ds,)
+                ).fetchone()
+                use_minute = bool(has_minute)
+
+            check_table = "minute_bars" if use_minute else "daily_bars"
             has_data = conn.execute(
-                "SELECT 1 FROM snapshots WHERE date = ? LIMIT 1", (ds,)
+                f"SELECT 1 FROM {check_table} WHERE date = ? LIMIT 1", (ds,)
             ).fetchone()
 
-            # 用户未显式指定日期时，自动 fallback 到最近一个交易日
             if not has_data and not date:
-                # 回测模式下 fallback 不超过 max_date
                 if max_date:
                     fallback_row = conn.execute(
-                        "SELECT date FROM snapshots WHERE date <= ? ORDER BY date DESC LIMIT 1",
+                        f"SELECT date FROM {check_table} WHERE date <= ? ORDER BY date DESC LIMIT 1",
                         (max_date,),
                     ).fetchone()
                 else:
                     fallback_row = conn.execute(
-                        "SELECT date FROM snapshots ORDER BY date DESC LIMIT 1"
+                        f"SELECT date FROM {check_table} ORDER BY date DESC LIMIT 1"
                     ).fetchone()
                 if fallback_row:
                     ds = fallback_row[0]
@@ -1124,38 +1274,76 @@ def load_market_snapshot(
                     date_fallback = True
 
             if has_data:
-                if time and time not in ("close", "latest"):
-                    ts_row = conn.execute(
-                        "SELECT ts FROM snapshots WHERE date = ? AND ts <= ? ORDER BY ts DESC LIMIT 1",
-                        (ds, time + ":59"),
-                    ).fetchone()
+                if use_minute:
+                    # 分钟级数据：找到最近的可用时间点
+                    if time and time not in ("latest", "close"):
+                        ts_row = conn.execute(
+                            "SELECT time FROM minute_bars WHERE date = ? AND time <= ? ORDER BY time DESC LIMIT 1",
+                            (ds, time + ":59" if len(time) <= 5 else time),
+                        ).fetchone()
+                    else:
+                        # 不指定时间或 latest → 取当日最新分钟
+                        ts_row = conn.execute(
+                            "SELECT time FROM minute_bars WHERE date = ? ORDER BY time DESC LIMIT 1",
+                            (ds,),
+                        ).fetchone()
+                    if ts_row:
+                        actual_ts = ts_row[0]
+                        conditions = ["m.date = ?", "m.time = ?"]
+                        params: list = [ds, actual_ts]
+                        if code:
+                            conditions.append("m.code LIKE ?")
+                            params.append(f"%{code}%")
+                        if name:
+                            conditions.append("meta.name LIKE ?")
+                            params.append(f"%{name}%")
+                        # pool 模式已废弃，忽略
+                        where = " AND ".join(conditions)
+                        sort_col = (
+                            "m.amount" if sort_by == "amount"
+                            else "m.volume" if sort_by == "volume"
+                            else "m.close"
+                        )
+                        query = f"""
+                            SELECT m.date, m.time AS ts, m.code,
+                                   m.close AS price, m.open, m.high, m.low,
+                                   m.volume, m.amount
+                            FROM minute_bars m
+                            LEFT JOIN stock_meta meta ON m.date = meta.date AND m.code = meta.code
+                            WHERE {where}
+                            ORDER BY {sort_col} DESC
+                        """
+                        raw_rows = [dict(r) for r in conn.execute(query, params).fetchall()]
+                        rows = _enrich_rows_from_meta(conn, raw_rows, ds)
                 else:
-                    ts_row = conn.execute(
-                        "SELECT ts FROM snapshots WHERE date = ? ORDER BY ts DESC LIMIT 1",
-                        (ds,),
-                    ).fetchone()
-
-                if ts_row:
-                    actual_ts = ts_row[0]
-                    conditions = ["date = ?", "ts = ?"]
-                    params: list = [ds, actual_ts]
+                    # 日线数据（close/latest）
+                    actual_ts = "15:00"
+                    conditions = ["d.date = ?"]
+                    params: list = [ds]
                     if code:
-                        conditions.append("code LIKE ?")
+                        conditions.append("d.code LIKE ?")
                         params.append(f"%{code}%")
                     if name:
-                        conditions.append("name LIKE ?")
+                        conditions.append("d.name LIKE ?")
                         params.append(f"%{name}%")
-                    if mode == "pool":
-                        conditions.append("in_pool = 1")
-
+                    # pool 模式已废弃，忽略
                     where = " AND ".join(conditions)
                     sort_col = (
-                        "amount_yi" if sort_by == "amount"
-                        else "volume" if sort_by == "volume"
-                        else "pctChg"
+                        "d.amount" if sort_by == "amount"
+                        else "d.volume" if sort_by == "volume"
+                        else "d.pct_chg"
                     )
-                    query = f"SELECT * FROM snapshots WHERE {where} ORDER BY {sort_col} DESC"
-                    rows = [dict(r) for r in conn.execute(query, params).fetchall()]
+                    query = f"""
+                        SELECT d.date, '15:00' AS ts, d.code, d.name,
+                               d.close AS price, d.open, d.high, d.low,
+                               d.pct_chg AS pctChg, d.volume, d.amount
+                        FROM daily_bars d
+                        LEFT JOIN stock_meta meta ON d.date = meta.date AND d.code = meta.code
+                        WHERE {where}
+                        ORDER BY {sort_col} DESC
+                    """
+                    raw_rows = [dict(r) for r in conn.execute(query, params).fetchall()]
+                    rows = _enrich_rows_from_meta(conn, raw_rows, ds)
         except Exception as e:
             logger.error("[load_market_snapshot] DB error: %s", e)
         finally:
@@ -1164,9 +1352,9 @@ def load_market_snapshot(
 
     if not rows:
         return DataResult(
-            content=f"无行情数据（{ds} {time or ''}），本地数据库和通达信接口均无数据",
-            warnings=[f"{ds} 无行情快照数据"],
-            data_sources_missing=["intraday_snapshot"],
+            content=f"无行情数据（{ds} {time or ''}），本地数据库无数据",
+            warnings=[f"{ds} 无行情数据"],
+            data_sources_missing=["minute_bars" if time else "daily_bars"],
         )
 
     def _fmt_pct(v):
@@ -1281,12 +1469,13 @@ def scan_trend_stocks(
         )
 
     try:
+        _ensure_stock_meta(conn)
         # 回测模式下，只使用 <= max_date 的交易日
         date_filter = max_date or date or datetime.now().strftime("%Y-%m-%d")
         trading_days = [
             r[0] for r in conn.execute(
-                "SELECT DISTINCT date FROM snapshots "
-                "WHERE ts = '15:00:00' AND date <= ? ORDER BY date DESC LIMIT 12",
+                "SELECT DISTINCT date FROM daily_bars "
+                "WHERE date <= ? ORDER BY date DESC LIMIT 12",
                 (date_filter,),
             ).fetchall()
         ]
@@ -1294,36 +1483,49 @@ def scan_trend_stocks(
             return DataResult(
                 content=f"数据不足：仅 {len(trading_days)} 个交易日，至少需要6个",
                 warnings=["日线数据不足，无法计算均线"],
-                data_sources_missing=["daily_snapshots"],
+                data_sources_missing=["daily_bars"],
             )
 
         today = trading_days[0]
         calc_days = trading_days[:11]
 
         placeholders = ",".join(["?"] * len(calc_days))
-        rows = conn.execute(f"""
-            SELECT date, code, name, price, pctChg, open, high, low,
-                   amount_yi, volume, sector, star, in_pool
-            FROM snapshots
-            WHERE date IN ({placeholders}) AND ts = '15:00:00'
-            ORDER BY code, date DESC
+        raw_rows = conn.execute(f"""
+            SELECT d.date, d.code, d.name, d.close AS price, d.pct_chg AS pctChg,
+                   d.open, d.high, d.low, d.amount, d.volume
+            FROM daily_bars d
+            WHERE d.date IN ({placeholders})
+            ORDER BY d.code, d.date DESC
         """, calc_days).fetchall()
 
-        if not rows:
+        if not raw_rows:
             return DataResult(
                 content="无收盘数据",
-                warnings=["SQLite 中无收盘快照数据"],
-                data_sources_missing=["daily_snapshots"],
+                warnings=["SQLite 中无日线数据"],
+                data_sources_missing=["daily_bars"],
             )
+        rows = [dict(r) for r in raw_rows]
+        # 补充 amount_yi
+        for r in rows:
+            r["amount_yi"] = round(r.get("amount", 0) / 1e8, 2) if r.get("amount") else 0
+
+        # 加载概念板块映射（从 stock_concept.db）
+        concept_map = {}  # code -> concepts(str)
+        concept_db_path = os.path.join(data_dir, "stock_concept.db")
+        if os.path.exists(concept_db_path):
+            try:
+                cconn = sqlite3.connect(concept_db_path)
+                for row in cconn.execute("SELECT code, concepts FROM stock_concepts WHERE concepts != ''").fetchall():
+                    concept_map[row[0]] = row[1]  # JSON string
+                cconn.close()
+            except Exception:
+                pass
 
         stock_data = {}
         for r in rows:
             code = r["code"]
             if code not in stock_data:
-                stock_data[code] = {
-                    "prices": {}, "name": r["name"],
-                    "sector": r["sector"] or "", "star": r["star"], "in_pool": r["in_pool"],
-                }
+                stock_data[code] = {"prices": {}, "name": r["name"]}
             stock_data[code]["prices"][r["date"]] = r["price"]
 
         results = []
@@ -1383,10 +1585,20 @@ def scan_trend_stocks(
             if not above_ma5 and not above_ma10:
                 continue
 
+            # 解析概念板块
+            concepts_json = concept_map.get(code, "")
+            concepts_list = []
+            if concepts_json:
+                try:
+                    concepts_list = json.loads(concepts_json) if isinstance(concepts_json, str) else concepts_json
+                except Exception:
+                    pass
+            concepts_str = "、".join(concepts_list[:3]) if concepts_list else ""
+
             results.append({
                 "code": code, "name": sd["name"], "price": today_price,
                 "pctChg": today_pct, "amount_yi": today_amount,
-                "sector": sd["sector"], "star": sd["star"], "in_pool": sd["in_pool"],
+                "concepts": concepts_list, "concepts_display": concepts_str,
                 "ma5": round(ma5, 2) if ma5 else None,
                 "ma10": round(ma10, 2) if ma10 else None,
                 "above_ma5": above_ma5, "above_ma10": above_ma10,
@@ -1395,23 +1607,21 @@ def scan_trend_stocks(
             })
 
         if hot_only:
-            sector_avg = {}
-            sector_counts = {}
+            # 按概念聚合，找热门概念
+            concept_avg = {}
             for r in results:
-                s = r["sector"]
-                if not s: continue
-                sector_avg.setdefault(s, []).append(r["pctChg"])
-                sector_counts[s] = sector_counts.get(s, 0) + 1
-            hot_sectors = {
-                s for s, pcts in sector_avg.items()
-                if sum(pcts) / len(pcts) > 1.0 and sector_counts.get(s, 0) >= 2
+                for c in r["concepts"]:
+                    concept_avg.setdefault(c, []).append(r["pctChg"])
+            hot_concepts = {
+                c for c, pcts in concept_avg.items()
+                if sum(pcts) / len(pcts) > 1.0 and len(pcts) >= 2
             }
-            results = [r for r in results if r["sector"] in hot_sectors]
+            results = [r for r in results if any(c in hot_concepts for c in r["concepts"])]
 
         if sector:
-            results = [r for r in results if sector in r["sector"]]
+            results = [r for r in results if any(sector in c for c in r["concepts"])]
 
-        results.sort(key=lambda x: (-int(x["in_pool"] or 0), -int(x["star"] or 0), -(x["pctChg"] or 0)))
+        results.sort(key=lambda x: -(x["pctChg"] or 0))
         results = results[:top_n]
 
         if not results:
@@ -1421,38 +1631,38 @@ def scan_trend_stocks(
             f"## 趋势股扫描结果（{ds}）",
             f"筛选条件：涨幅≥{min_pct}%" + (f"≤{max_pct}%" if max_pct else "")
             + f" | 均线类型={ma_type}"
-            + (f" | 板块含「{sector}」" if sector else "")
-            + (f" | 仅热门板块" if hot_only else ""),
+            + (f" | 概念含「{sector}」" if sector else "")
+            + (f" | 仅热门概念" if hot_only else ""),
             f"共找到 {len(results)} 只趋势股\n",
-            "| 代码 | 名称 | 现价 | 涨幅 | 5日线 | 10日线 | 距5日线 | 距10日线 | 成交额(亿) | 板块 |",
+            "| 代码 | 名称 | 现价 | 涨幅 | 5日线 | 10日线 | 距5日线 | 距10日线 | 成交额(亿) | 概念 |",
             "|------|------|------|------|-------|--------|---------|----------|-----------|------|",
         ]
 
         for r in results:
-            star_mark = "⭐" if r["star"] else ""
-            pool_mark = "🏊" if r["in_pool"] else ""
-            name_display = f"{star_mark}{pool_mark}{r['name']}"
             ma5_str = f"{r['ma5']:.2f}" if r["ma5"] else "-"
             ma10_str = f"{r['ma10']:.2f}" if r["ma10"] else "-"
             dist5 = f"{r['dist_ma5']:+.1f}%" if r["dist_ma5"] is not None else "-"
             dist10 = f"{r['dist_ma10']:+.1f}%" if r["dist_ma10"] is not None else "-"
             lines.append(
-                f"| {r['code']} | {name_display} | {r['price']:.2f} "
+                f"| {r['code']} | {r['name']} | {r['price']:.2f} "
                 f"| {r['pctChg']:+.2f}% | {ma5_str} | {ma10_str} "
-                f"| {dist5} | {dist10} | {r['amount_yi']:.1f} | {r['sector']} |"
+                f"| {dist5} | {dist10} | {r['amount_yi']:.1f} | {r['concepts_display']} |"
             )
 
-        sector_summary = {}
+        # 概念分布统计
+        concept_summary = {}
         for r in results:
-            s = r["sector"] or "未知"
-            sector_summary.setdefault(s, {"count": 0, "pcts": []})
-            sector_summary[s]["count"] += 1
-            sector_summary[s]["pcts"].append(r["pctChg"])
+            for c in r["concepts"][:3]:
+                concept_summary.setdefault(c, {"count": 0, "pcts": []})
+                concept_summary[c]["count"] += 1
+                concept_summary[c]["pcts"].append(r["pctChg"])
 
-        lines.append("\n### 板块分布")
-        for s, info in sorted(sector_summary.items(), key=lambda x: -x[1]["count"]):
-            avg_pct = sum(info["pcts"]) / len(info["pcts"])
-            lines.append(f"- **{s}**：{info['count']}只，平均涨幅 {avg_pct:+.2f}%")
+        if concept_summary:
+            top_concepts = sorted(concept_summary.items(), key=lambda x: -x[1]["count"])[:10]
+            lines.append("\n### 概念分布（TOP10）")
+            for c, info in top_concepts:
+                avg_pct = sum(info["pcts"]) / len(info["pcts"])
+                lines.append(f"- **{c}**：{info['count']}只，平均涨幅 {avg_pct:+.2f}%")
 
         return "\n".join(lines)
 
@@ -1684,7 +1894,7 @@ def _load_stock_from_mootdx(
 def _load_stock_from_intraday_db(
     data_dir: str, date: str, stock_name: str,
 ) -> Optional[dict]:
-    """从 intraday.db snapshots 表加载个股日线数据（全市场覆盖）"""
+    """从 intraday.db daily_bars 表加载个股日线数据（全市场覆盖）"""
     code = _resolve_stock_code(data_dir, stock_name)
     if not code:
         return None
@@ -1695,10 +1905,14 @@ def _load_stock_from_intraday_db(
 
     try:
         conn = sqlite3.connect(db_path)
-        # 取当日最后一条快照作为日线数据
         row = conn.execute(
-            "SELECT open, high, low, price, last_close, pctChg, volume, amount "
-            "FROM snapshots WHERE code = ? AND date = ? ORDER BY ts DESC LIMIT 1",
+            "SELECT open, high, low, close, pct_chg, volume, amount "
+            "FROM daily_bars WHERE code = ? AND date = ?",
+            (code, date),
+        ).fetchone()
+        # 获取前收盘价（前一个交易日的 close）
+        prev_row = conn.execute(
+            "SELECT close FROM daily_bars WHERE code = ? AND date < ? ORDER BY date DESC LIMIT 1",
             (code, date),
         ).fetchone()
         conn.close()
@@ -1706,9 +1920,9 @@ def _load_stock_from_intraday_db(
         if not row:
             return None
 
-        open_price, high, low, close, last_close, pct_chg, volume, amount = row
+        open_price, high, low, close, pct_chg, volume, amount = row
+        last_close = prev_row[0] if prev_row else None
 
-        # volume 字段可能包含二进制数据，安全转换
         def _safe_float(v, default=0.0):
             try:
                 return float(v) if v is not None else default
@@ -1730,11 +1944,11 @@ def _load_stock_from_intraday_db(
             "pct_chg": _safe_float(pct_chg),
             "volume": _safe_float(volume),
             "amount": _safe_float(amount),
-            "last_close": _safe_float(last_close),
-            "_source": "intraday_db",
+            "last_close": _safe_float(last_close) if last_close else None,
+            "_source": "daily_bars",
         }
     except Exception as e:
-        logger.debug("[intraday_db] fallback 失败 %s %s: %s", date, stock_name, e)
+        logger.debug("[daily_bars] fallback 失败 %s %s: %s", date, stock_name, e)
 
     return None
 
@@ -1742,7 +1956,7 @@ def _load_stock_from_intraday_db(
 def _load_stock_from_intraday_db_by_code(
     data_dir: str, date: str, stock_code: str,
 ) -> Optional[dict]:
-    """从 intraday.db snapshots 表按代码加载日线数据（全市场覆盖）"""
+    """从 intraday.db daily_bars 表按代码加载日线数据（全市场覆盖）"""
     normalized = stock_code.strip()
     if "." in normalized:
         normalized = normalized.split(".", 1)[1]
@@ -1754,8 +1968,13 @@ def _load_stock_from_intraday_db_by_code(
     try:
         conn = sqlite3.connect(db_path)
         row = conn.execute(
-            "SELECT name, open, high, low, price, last_close, pctChg, volume, amount "
-            "FROM snapshots WHERE code = ? AND date = ? ORDER BY ts DESC LIMIT 1",
+            "SELECT name, open, high, low, close, pct_chg, volume, amount "
+            "FROM daily_bars WHERE code = ? AND date = ?",
+            (normalized, date),
+        ).fetchone()
+        # 获取前收盘价
+        prev_row = conn.execute(
+            "SELECT close FROM daily_bars WHERE code = ? AND date < ? ORDER BY date DESC LIMIT 1",
             (normalized, date),
         ).fetchone()
         conn.close()
@@ -1763,7 +1982,8 @@ def _load_stock_from_intraday_db_by_code(
         if not row:
             return None
 
-        name, open_price, high, low, close, last_close, pct_chg, volume, amount = row
+        name, open_price, high, low, close, pct_chg, volume, amount = row
+        last_close = prev_row[0] if prev_row else None
 
         def _safe_float(v, default=0.0):
             try:
@@ -1786,11 +2006,11 @@ def _load_stock_from_intraday_db_by_code(
             "pct_chg": _safe_float(pct_chg),
             "volume": _safe_float(volume),
             "amount": _safe_float(amount),
-            "last_close": _safe_float(last_close),
-            "_source": "intraday_db",
+            "last_close": _safe_float(last_close) if last_close else None,
+            "_source": "daily_bars",
         }
     except Exception as e:
-        logger.debug("[intraday_db] by_code fallback 失败 %s %s: %s", date, stock_code, e)
+        logger.debug("[daily_bars] by_code fallback 失败 %s %s: %s", date, stock_code, e)
 
     return None
 
@@ -1838,7 +2058,7 @@ def _resolve_stock_code(data_dir: str, stock_name: str) -> Optional[str]:
         try:
             conn = sqlite3.connect(db_path)
             row = conn.execute(
-                "SELECT DISTINCT code FROM snapshots WHERE name = ? LIMIT 1",
+                "SELECT DISTINCT code FROM daily_bars WHERE name = ? LIMIT 1",
                 (stock_name,),
             ).fetchone()
             conn.close()

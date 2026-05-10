@@ -83,10 +83,10 @@ class BaseAgent:
             fallbacks = [self._create_llm(p) for p in providers[1:]]
             self.llm = self.llm.with_fallbacks(fallbacks)
 
-        # 工具
-        today = datetime.now().strftime("%Y-%m-%d")
+        # 工具（回测模式下用回测日期作为默认日期，避免越界）
+        effective_date = self.backtest_max_date or datetime.now().strftime("%Y-%m-%d")
         self.tool_factory = RetrievalToolFactory(
-            data_dir, today, memory_dir,
+            data_dir, effective_date, memory_dir,
             backtest_max_date=self.backtest_max_date,
         )
         all_tools = self.tool_factory.create_tools()
@@ -102,11 +102,14 @@ class BaseAgent:
         self.system_prompt = self._load_prompt()
         if self.backtest_max_date:
             self.system_prompt += (
-                f"\n\n## 回测模式约束\n"
-                f"当前处于回测模式，模拟日期为 {self.backtest_max_date}。\n"
-                f"你只能使用 {self.backtest_max_date} 及之前的数据进行分析。\n"
-                f"所有工具调用中的日期参数不得超过 {self.backtest_max_date}。\n"
-                f"不要尝试获取该日期之后的任何信息。"
+                f"\n\n## ⚠️ 回测模式约束（必须严格遵守）\n"
+                f"当前处于回测模式。你的分析日期是 {self.backtest_max_date}，不是今天。\n"
+                f"调用任何工具时：\n"
+                f"- 不要传 date 参数（工具会自动使用正确日期 {self.backtest_max_date}）\n"
+                f"- 绝对不要传入 {datetime.now().strftime('%Y-%m-%d')} 或任何大于 {self.backtest_max_date} 的日期\n"
+                f"- 如果你不确定日期，使用 {self.backtest_max_date}\n"
+                f"- 所有分析和结论必须基于 {self.backtest_max_date} 及之前的数据\n"
+                f"违反此约束属于严重错误，会导致回测结果无效。"
             )
 
     @staticmethod
@@ -195,15 +198,22 @@ class BaseAgent:
                         )
 
         # 提取文本内容（Anthropic 协议下 response.content 可能是列表）
-        if response and response.content:
+        # 也处理 OpenAI 兼容协议的 reasoning_content 字段（MiniMax 等）
+        if response:
             content = response.content
-            if isinstance(content, list):
-                # Anthropic 格式: [TextBlock(...), ToolUseBlock(...)]
-                text_parts = [
-                    block.text if hasattr(block, "text") else str(block)
-                    for block in content
-                    if hasattr(block, "text") or isinstance(block, str)
-                ]
-                return "\n".join(text_parts) if text_parts else "（分析未生成有效文本）"
-            return content
+            # MiniMax/M2.7 等模型 content 为空，实际内容在 reasoning_content
+            if not content and hasattr(response, "additional_kwargs"):
+                reasoning = response.additional_kwargs.get("reasoning_content", "")
+                if reasoning:
+                    content = reasoning
+            if content:
+                if isinstance(content, list):
+                    # Anthropic 格式: [TextBlock(...), ToolUseBlock(...)]
+                    text_parts = [
+                        block.text if hasattr(block, "text") else str(block)
+                        for block in content
+                        if hasattr(block, "text") or isinstance(block, str)
+                    ]
+                    return "\n".join(text_parts) if text_parts else "（分析未生成有效文本）"
+                return content
         return "（分析未生成有效结果）"

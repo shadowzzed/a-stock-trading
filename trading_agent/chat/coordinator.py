@@ -144,14 +144,39 @@ class CoordinatorAgent(BaseAgent):
         try:
             resp = self.llm.invoke(messages)
             text = resp.content.strip()
-            # 尝试解析 JSON 数组
-            if "[" in text:
-                start = text.index("[")
-                end = text.rindex("]") + 1
-                agents = json.loads(text[start:end])
-                if isinstance(agents, list):
-                    # 过滤无效值
-                    return [a for a in agents if a in self._agent_map]
+            # 清理控制字符（\x00-\x1f 除 \t\n\r 外），兼容 MiniMax reasoning_content 输出
+            import re
+            text = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f]", "", text)
+
+            # 策略 1: 逐行找"整行即数组"的格式
+            for line in text.split("\n"):
+                line = line.strip()
+                if line.startswith("[") and line.endswith("]"):
+                    try:
+                        agents = json.loads(line)
+                        if isinstance(agents, list):
+                            valid = [a for a in agents if a in self._agent_map]
+                            if valid:
+                                return valid
+                    except (json.JSONDecodeError, ValueError):
+                        pass
+
+            # 策略 2: 用 regex 提取所有完整 [...] 片段并逐个 parse
+            # 只匹配不含嵌套 [] 的简单数组（意图列表本就简单）
+            for m in re.finditer(r'\[[^\[\]]*\]', text):
+                try:
+                    agents = json.loads(m.group(0))
+                    if isinstance(agents, list):
+                        valid = [a for a in agents if a in self._agent_map]
+                        if valid:
+                            return valid
+                except (json.JSONDecodeError, ValueError):
+                    continue
+
+            # 策略 3: 自然语言中提取 agent 名（LLM 有时输出 "sentiment, sector"）
+            found = [name for name in self._agent_map.keys() if name in text]
+            if found:
+                return found
         except Exception as e:
             logger.warning("意图识别失败，fallback 到全部分析师: %s", e)
 

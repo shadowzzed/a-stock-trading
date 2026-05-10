@@ -24,4 +24,5 @@ class AuctionAgent(BaseAgent):
         "get_history_data",
         "get_quant_rules",
         "get_prev_report",
+        "get_news",
     ]

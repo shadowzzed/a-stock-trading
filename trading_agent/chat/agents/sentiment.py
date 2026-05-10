@@ -25,4 +25,8 @@ class SentimentAgent(BaseAgent):
         "get_memory",
         "get_lessons",
         "get_quant_rules",
+        "get_news",
+        "search_similar_news",
+        "get_news_impact",
+        "get_sentiment_index",
     ]

@@ -10,11 +10,26 @@
 """
 from __future__ import annotations
 
+import contextlib
+import io
 import os
 import subprocess
 import sys
 import time
 from datetime import datetime
+
+
+LOG_FILE = "/Users/luoxin/shared/trading/logs/intraday_tick.log"
+os.makedirs(os.path.dirname(LOG_FILE), exist_ok=True)
+
+
+def _log(msg: str):
+    """所有调试信息写日志文件，不输出到 stdout（避免被 HappyClaw 推送为飞书消息）。"""
+    try:
+        with open(LOG_FILE, "a") as f:
+            f.write(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} {msg}\n")
+    except Exception:
+        pass
 
 
 def _real_home() -> str:
@@ -54,58 +69,72 @@ def _is_trading_minute() -> bool:
 
 
 def run_pull_minute_bars():
-    """调用 happyclaw 下的 pull_minute_bars.py（主采集脚本）。"""
-    # 硬编码绝对路径：HappyClaw script runner 下 REAL_HOME 被设成 workspace，
-    # 导致 os.path.join 产生 .../main/src/happyclaw/... 嵌套路径
+    """调用 happyclaw 下的 pull_minute_bars.py（stdout 吞到日志，不推用户）。"""
     pull_script = "/Users/luoxin/src/happyclaw/data/groups/main/trading/pull_minute_bars.py"
     if not os.path.exists(pull_script):
-        print(f"[tick] pull script not found: {pull_script}")
-        return False
+        _log(f"pull script not found: {pull_script}")
+        return False, "script not found"
     try:
-        subprocess.run(
-            ["python3", pull_script],
-            timeout=55,  # 单次最多 55 秒，避免和下一分钟 tick 冲突
+        # 关键修复：用 sys.executable 而非 "python3"
+        # HappyClaw script-runner 的 PATH 下 python3 可能解析到系统 Python 3.9，
+        # 而 mootdx/pandas 装在 Python 3.14，会触发 ImportError
+        r = subprocess.run(
+            [sys.executable, pull_script],
+            timeout=55,
+            capture_output=True,
+            text=True,
             check=False,
         )
-        return True
+        _log(f"pull stdout: {r.stdout.strip()[-200:]}")
+        if r.returncode != 0:
+            _log(f"pull stderr: {r.stderr.strip()[-500:]}")
+            return False, r.stderr.strip()[:200]
+        return True, ""
     except subprocess.TimeoutExpired:
-        print(f"[tick] pull_minute_bars 超时")
-        return False
+        _log("pull_minute_bars 超时")
+        return False, "timeout"
     except Exception as e:
-        print(f"[tick] pull_minute_bars 失败: {e}")
-        return False
+        _log(f"pull_minute_bars 异常: {e}")
+        return False, str(e)
 
 
 def run_monitor_scan():
-    """运行方向二监控扫一次。"""
-    # 恢复真实 HOME，monitor.py 内部用 os.path.expanduser('~/shared/trading/...')
-    # 硬编码：HappyClaw script runner 下 REAL_HOME 可能指向 workspace
+    """运行方向二监控扫一次，吞掉 stdout；新信号 monitor 自己通过飞书 API 推送。"""
     os.environ["HOME"] = "/Users/luoxin"
+    buf = io.StringIO()
     try:
-        from trading_agent.intraday.monitor import main as monitor_main
-        monitor_main()
-        return True
+        with contextlib.redirect_stdout(buf):
+            from trading_agent.intraday.monitor import main as monitor_main
+            monitor_main()
+        _log(f"monitor stdout: {buf.getvalue().strip()[-500:]}")
+        return True, ""
     except Exception as e:
         import traceback
-        traceback.print_exc()
-        print(f"[tick] monitor 失败: {e}")
-        return False
+        _log(f"monitor 异常: {traceback.format_exc()[-1000:]}")
+        return False, str(e)
 
 
 def main():
     if not _is_trading_minute():
         return
     start = time.time()
-    print(f"[tick {datetime.now().strftime('%H:%M:%S')}] start")
+    _log(f"tick start")
 
-    # 1. 先拉数据
-    pulled = run_pull_minute_bars()
-    elapsed_pull = time.time() - start
-    print(f"[tick] pull done in {elapsed_pull:.1f}s (ok={pulled})")
+    errors = []
+    pulled, pull_err = run_pull_minute_bars()
+    if not pulled:
+        errors.append(f"pull 失败: {pull_err}")
 
-    # 2. 再扫信号（pull 失败也扫，可能用到前一分钟数据）
-    run_monitor_scan()
-    print(f"[tick] total {time.time()-start:.1f}s")
+    scanned, mon_err = run_monitor_scan()
+    if not scanned:
+        errors.append(f"monitor 失败: {mon_err}")
+
+    elapsed = time.time() - start
+    _log(f"tick done in {elapsed:.1f}s errors={len(errors)}")
+
+    # 只在失败时才输出到 stdout（HappyClaw 会推送给用户）
+    if errors:
+        print(f"⚠️ intraday_tick {datetime.now().strftime('%H:%M')} 异常: " + " | ".join(errors))
 
 
 if __name__ == "__main__":

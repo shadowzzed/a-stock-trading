@@ -25,4 +25,5 @@ class DragonAgent(BaseAgent):
         "get_quant_rules",
         "get_prev_report",
         "get_past_report",
+        "get_news",
     ]

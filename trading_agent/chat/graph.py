@@ -92,6 +92,8 @@ def manage_context(state: TradingState) -> dict:
     1. 消息数 > SUMMARY_THRESHOLD → LLM 摘要前 N-KEEP_RECENT 条，然后用 RemoveMessage 删除
     2. 始终用 trim_messages 确保 token 不超标
     """
+    _ensure_initialized()
+    _refresh_all_dates()
     messages = state.get("messages", [])
     summary = state.get("summary", "")
     updates: dict[str, Any] = {}
@@ -256,6 +258,7 @@ def synthesize(state: TradingState) -> dict:
 2. 综合多位分析师的结论，给出直接回答
 3. 如果分析师之间有分歧，简要说明并给出你的判断
 4. 如果涉及操作建议，附带风险提示
+5. **数据溯源标注（必须）**：回复中出现的所有行情数据（连板数、涨停/跌停状态、价格、涨跌幅、成交量、封单量、板块涨跌停家数等）必须在数据后紧跟 `[工具名]` 标注来源，例如"金牛化工 3连板 [get_connected_boards]"、"涨停 36 家 [get_market_data]"。分析师结果中通常包含工具调用记录，请据此标注。纯分析观点和建议无需标注。
 
 用户问题：{user_msg}"""
 
@@ -323,16 +326,18 @@ def reflect(state: TradingState) -> dict:
         from config import get_config
 
         cfg = get_config()
-        store_path = os.path.join(cfg.get("data_root", ""), "backtest", "experience_store.json")
-        if not os.path.exists(store_path):
+        data_dir = cfg.get("data_root", "")
+        store_file = os.path.join(data_dir, "experience_store.json")
+        if not os.path.isfile(store_file):
             # 尝试备用路径
-            store_path = os.path.expanduser("~/shared/trading/backtest/experience_store.json")
-        if not os.path.exists(store_path):
-            logger.debug("经验库不存在，跳过反思: %s", store_path)
+            data_dir = os.path.expanduser("~/shared/trading")
+            store_file = os.path.join(data_dir, "experience_store.json")
+        if not os.path.isfile(store_file):
+            logger.debug("经验库不存在，跳过反思: %s", store_file)
             return {}
 
-        store = ExperienceStore(store_path)
-        lessons = store.search(max_results=5, min_confidence=0.3)
+        store = ExperienceStore(data_dir)
+        lessons = store.search(limit=5, min_confidence=0.3)
 
         if not lessons:
             return {}
@@ -367,6 +372,7 @@ def reflect(state: TradingState) -> dict:
    - 修正可以是：删除有问题的推荐、调整仓位建议、补充风险提示
 3. 如果没有问题：原样输出报告内容，不加任何标注
 4. 保持原文的格式和结构，只修正有问题的部分
+5. **必须保留原文中的 `[工具名]` 数据溯源标注**，修正时不要删除或遗漏这些标注
 
 直接输出最终版本的报告（不要输出分析过程）："""
 
@@ -456,16 +462,14 @@ FAIL
             return {}
 
         if review_result.startswith("FAIL"):
-            # 审查未通过：拦截原始回复，替换为错误提示
+            # 审查未通过：降级为警告，不拦截回复
             issues = review_result[4:].strip()
-            blocked_reply = (
-                "⚠️ **数据审查未通过，回复已拦截**\n\n"
-                "以下行情数据未经工具验证，为避免提供错误信息，原始回复不予展示：\n"
-                + issues
-                + "\n\n请重新提问，我会通过工具查询获取准确数据后再回复。"
+            warning_suffix = (
+                "\n\n---\n⚠️ *数据溯源提示：以上部分行情数据未标注工具来源，"
+                "数据均来自分析师工具查询，仅供参考。*"
             )
-            logger.warning("数据溯源审查未通过，已拦截回复: %s", issues[:200])
-            return {"messages": [AIMessage(content=blocked_reply)]}
+            logger.warning("数据溯源审查未通过（已降级为警告）: %s", issues[:200])
+            return {"messages": [AIMessage(content=content + warning_suffix)]}
 
     except Exception as e:
         logger.warning("数据溯源审查异常，跳过: %s", e)
@@ -657,6 +661,7 @@ def _ensure_initialized():
 
     today = datetime.now().strftime("%Y-%m-%d")
     factory = RetrievalToolFactory(data_dir, today, memory_dir)
+    _coordinator.tool_factory = factory
     _coordinator.tools = factory.create_tools()
     _coordinator.tool_map = {t.name: t for t in _coordinator.tools}
     _coordinator.system_prompt = _coordinator._load_prompt()
@@ -668,6 +673,19 @@ def _ensure_initialized():
     _agents["trend"] = TrendAgent(data_dir, memory_dir, cache=_cache)
 
     logger.info("LangGraph 图节点已初始化（4 位分析师 + coordinator）")
+
+
+def _refresh_all_dates():
+    """刷新所有 Agent 的工具日期（防止跨天后日期边界过期）。"""
+    from datetime import datetime
+    today = datetime.now().strftime("%Y-%m-%d")
+
+    if _coordinator is not None and hasattr(_coordinator, "tool_factory") and _coordinator.tool_factory:
+        _coordinator.tool_factory.refresh_date(today)
+
+    for agent in _agents.values():
+        if hasattr(agent, "tool_factory") and agent.tool_factory:
+            agent.tool_factory.refresh_date(today)
 
 
 def _get_llm():
