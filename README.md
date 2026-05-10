@@ -61,6 +61,25 @@ python -m trading_agent.intraday opening_analysis --dry-run
 
 配置优先级：环境变量 `TRADING_DATA_ROOT` > `config.yaml` > 默认值 `./runtime_data/`
 
+### 运行时数据位置
+
+所有运行时数据都在 `data_root` 下（默认 `~/shared/trading/`），仓库内**不应**有任何业务数据：
+
+| 路径 | 内容 |
+|------|------|
+| `{data_root}/intraday/intraday.db` | 盘中快照 SQLite（全市场 ~5000 只） |
+| `{data_root}/daily/YYYY-MM-DD/` | 每日数据（CSV、分析报告、新闻） |
+| `{data_root}/chat_checkpoints/chat.db` | LangGraph chat agent 对话状态持久化（2026-05-11 从仓库内 `trading/checkpoints/` 迁出） |
+| `{data_root}/news_monitor.db` | 新闻去重数据库 |
+| `{data_root}/logs/` | 运行日志 |
+
+### 已废弃/移除的入口
+
+| 路径 | 状态 |
+|------|------|
+| `trading_agent/chat/*.mjs` + `node_modules/` + `package.json` | **已移除**（2026-05-11）。此前是 2026-04-03 的 Node.js 版重写尝试（OpenAI SDK + lark-oapi/node-sdk），4-15 之后未再迭代；当前生产路径是 Python 版（`python -m trading_agent.chat` → LangGraph + langchain-openai）。如需查看历史代码：`git show 653201c` |
+| `trading_agent/review/` 的 CLI 入口 | **已移除**。v6 重构后 review 模块仅保留 `data/loader.py`、`tools/retrieval.py` 作为基础设施 |
+
 ## 产品线说明
 
 ### trading_agent/ — Trading Agent（盘中交易代理）
@@ -104,46 +123,58 @@ python -m trading_agent.intraday closing_review
 python -m trading_agent.intraday opening_analysis --dry-run   # 调试模式
 ```
 
-#### review/ — 盘后多 Agent 复盘
+#### review/ — 复用基础设施（已不再独立运行）
 
-基于 LangGraph 的多 Agent 复盘框架：
-
-```
-情绪分析师 ─┐
-板块分析师 ─┼──▶ 多空辩论 ──▶ 裁决报告
-龙头分析师 ─┘
-```
-
-```bash
-python -m trading_agent.review 2026-03-31                 # 直接出报告
-python -m trading_agent.review 2026-03-31 -i              # 交互模式
-python -m trading_agent.review 2026-03-31 --model gpt-4   # 指定模型
-```
+> **注意**：盘后多 Agent 复盘流程已在 v6 重构中拆解，独立 CLI 入口（`python -m trading_agent.review`）不再保留。本目录现仅保留 `data/loader.py`、`tools/retrieval.py` 作为基础设施，被 `trading_agent/chat/` 和 `backtest/` 复用。
+>
+> 盘后复盘的能力现整合在 `trading_agent/chat/`（飞书对话）+ `trading_agent/intraday/closing_review` 中。
 
 ### backtest/ — 回测系统
 
-策略回测引擎 + 结构化经验库，支持 Trading Agent 自我迭代：
+策略回测引擎 + 结构化经验库 + 策略池影子运行，支持 Trading Agent 自我迭代：
 
 | 模块 | 功能 |
 |------|------|
 | `engine/` | 回测引擎核心（数据加载、策略执行、报告生成） |
 | `experience/` | 结构化经验库（教训分类、场景匹配、prompt 注入） |
+| `screener.py` | Layer 2 量化选股（涨停股评分 + 反包加分 + 趋势股路径） |
 | `adapter.py` | 数据适配层，桥接 trading_agent/review/ 的数据 |
-| `run.py` | 回测运行入口 |
+| `monitor_backtest_v2.py` | 方向二盘中监控回测（买卖信号配对+T+1+超时强平+入场过滤） |
+| `strategies/__init__.py` | 策略池（8 个预配置变体：base/tight/wide/sealed_only/heat_gate/conservative…） |
+| `shadow_runner.py` | 多策略并行影子运行 + 健康度评估 + 报告生成 |
+| `param_sweep_v4.py` | 止损/止盈参数敏感性扫描 |
+| `run.py` | 经验系统回测入口 |
 
 ```bash
+# 经验系统回测
 python -m backtest
+
+# 方向二盘中回测（单策略）
+python -m backtest.monitor_backtest_v2 --start 2026-03-03 --end 2026-04-17 \
+    --output ~/shared/backtest/monitor.json \
+    --report ~/shared/backtest/交割单.md
+
+# 策略池影子运行 + 健康度体检
+python -m backtest.shadow_runner --start 2026-03-03 --end 2026-04-17 --send-feishu
+python -m backtest.shadow_runner --weekly                 # 周度体检（最近 30 天）
+
+# 参数敏感性
+python -m backtest.param_sweep_v4
 ```
 
 ### news_monitor/ — News Monitor（新闻监控）
 
 实时财经新闻聚合 + AI 解读 + 事件催化提取。
 
-**数据源**（30 秒轮询）：
-- TrendRadar DB（11 个热榜平台）
+**数据源**（30 秒轮询，共 8 个）：
+- TrendRadar DB（11 个热榜平台聚合）
 - 财联社电报（重要级别）
 - 华尔街见闻（A 股频道）
 - 金十数据（重要标记）
+- BlockBeats（区块链/加密相关 A 股联动）
+- TechFlow（深科技/AI 行业资讯）
+- PANews（PA 财经/科技）
+- 东方财富研报（首次覆盖、目标价、评级变更）
 
 ```bash
 # 新闻监控（全天运行）
@@ -154,6 +185,28 @@ python -m news_monitor catalyst
 
 # 盘前简报
 python -m news_monitor briefing
+```
+
+### data_tools/ — 数据质量工具
+
+用于检测和修复 `intraday.db` 中的数据缺陷（mootdx 缓存错位、stock_meta 字段错误等）。
+
+| 文件 | 功能 |
+|------|------|
+| `data_quality_check.py` | 检测 minute_bars 污染（唯一价比例 < 30%）并自动用 daily OHLC 合成修复 |
+| `synthesize_minute_bars.py` | 用 daily OHLC 合成 minute_bars（full 整天 / morning 早盘两种模式） |
+| `fix_stock_meta.py` | 修复 stock_meta.last_close（从 daily_bars 前日 close 补正） |
+
+```bash
+# 扫描修复（建议每日盘后跑）
+python data_tools/data_quality_check.py --scan 2026-04-01 2026-04-30
+
+# 手动合成某天
+python data_tools/synthesize_minute_bars.py 2026-04-16 full
+python data_tools/synthesize_minute_bars.py 2026-04-13 morning
+
+# 修复 stock_meta
+python data_tools/fix_stock_meta.py 2026-03-01 2026-04-30
 ```
 
 ### data/ — 共享数据层

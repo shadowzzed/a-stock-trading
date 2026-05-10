@@ -63,10 +63,6 @@ def _acquire_lock() -> bool:
 _graph = None
 _graph_lock = threading.Lock()
 
-# Checkpoint DB 路径
-_CHECKPOINT_DIR = Path(_project_root) / "trading" / "checkpoints"
-_CHECKPOINT_DB = _CHECKPOINT_DIR / "chat.db"
-
 
 def _get_graph():
     """获取或创建 LangGraph 图实例（延迟初始化，线程安全）。"""
@@ -78,9 +74,10 @@ def _get_graph():
         if _graph is not None:
             return _graph
 
-        # 确保 checkpoint 目录存在
-        _CHECKPOINT_DIR.mkdir(parents=True, exist_ok=True)
-        db_path = str(_CHECKPOINT_DB)
+        cfg = get_config()
+        checkpoint_dir = Path(cfg["chat_checkpoint_dir"])
+        checkpoint_dir.mkdir(parents=True, exist_ok=True)
+        db_path = str(checkpoint_dir / "chat.db")
 
         logger.info("正在初始化 LangGraph（checkpoint: %s）...", db_path)
         _graph = create_graph_with_sqlite(db_path)

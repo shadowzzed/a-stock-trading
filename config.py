@@ -93,6 +93,7 @@ def get_config():
         "memory_dir": os.path.join(data_root, "memory", "main"),
         "knowledge_dir": os.path.join(_PROJECT_ROOT, "knowledge"),
         "lessons_file": os.path.join(data_root, "agent_lessons.json"),
+        "chat_checkpoint_dir": os.path.join(data_root, "chat_checkpoints"),
         "trendradar_output": trendradar_output,
         "news_state_dir": news_state_dir,
 
@@ -110,6 +111,11 @@ def get_config():
         "glm_api_key": os.environ.get("GLM_API_KEY", yaml_cfg.get("glm_api_key", "")),
         "glm_api_base": yaml_cfg.get("glm_api_base", "https://open.bigmodel.cn/api/anthropic"),
         "glm_model": yaml_cfg.get("glm_model", "glm-5"),
+
+        # AI 配置 — MiniMax（OpenAI 兼容协议）
+        "minimax_api_key": os.environ.get("MINIMAX_API_KEY", yaml_cfg.get("minimax_api_key", "")),
+        "minimax_api_base": yaml_cfg.get("minimax_api_base", "https://api.minimax.chat/v1"),
+        "minimax_model": yaml_cfg.get("minimax_model", "MiniMax-M2.7"),
 
         # 飞书配置（环境变量 > config.yaml > 默认值）
         "feishu_app_id": os.environ.get("FEISHU_APP_ID", yaml_cfg.get("feishu_app_id", "")),
@@ -155,10 +161,17 @@ def init_data_dirs():
 
 
 def get_ai_providers():
-    """返回 AI 提供商列表（按优先级：GLM > DeepSeek > Grok）"""
+    """返回 AI 提供商列表（全局默认优先级：MiniMax > GLM > Grok > DeepSeek，供 tradeAgent 等使用）"""
     cfg = get_config()
     providers = []
-    # GLM 为回测主力（响应快 4-5s，稳定）
+    if cfg["minimax_api_key"]:
+        providers.append({
+            "name": "MiniMax",
+            "protocol": "openai",
+            "base": cfg["minimax_api_base"],
+            "key": cfg["minimax_api_key"],
+            "model": cfg["minimax_model"],
+        })
     if cfg["glm_api_key"]:
         providers.append({
             "name": "GLM",
@@ -167,14 +180,6 @@ def get_ai_providers():
             "key": cfg["glm_api_key"],
             "model": cfg["glm_model"],
         })
-    if cfg["ai_api_key"]:
-        providers.append({
-            "name": "DeepSeek",
-            "protocol": "openai",
-            "base": cfg["ai_api_base"],
-            "key": cfg["ai_api_key"],
-            "model": cfg["ai_model"],
-        })
     if cfg["grok_api_key"]:
         providers.append({
             "name": "Grok",
@@ -182,6 +187,14 @@ def get_ai_providers():
             "base": cfg["grok_api_base"],
             "key": cfg["grok_api_key"],
             "model": cfg["grok_model"],
+        })
+    if cfg["ai_api_key"]:
+        providers.append({
+            "name": "DeepSeek",
+            "protocol": "openai",
+            "base": cfg["ai_api_base"],
+            "key": cfg["ai_api_key"],
+            "model": cfg["ai_model"],
         })
     return providers
 

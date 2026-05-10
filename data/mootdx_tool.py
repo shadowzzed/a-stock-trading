@@ -2,12 +2,12 @@
 """
 MootDX 工具 - 通达信数据接口
 用法:
-  python3 trading/mootdx_tool.py quotes          # 股票池实时行情
-  python3 trading/mootdx_tool.py quotes 600396 000966  # 指定股票实时行情
-  python3 trading/mootdx_tool.py kline 600396 [days]   # 日K线（默认20天）
-  python3 trading/mootdx_tool.py pool-kline [days]     # 股票池全量日K线
-  python3 trading/mootdx_tool.py minute 600396         # 当日分时
-  python3 trading/mootdx_tool.py bid 600396 000966     # 五档盘口
+  python3 -m data.mootdx_tool quotes          # 股票池实时行情
+  python3 -m data.mootdx_tool quotes 600396 000966  # 指定股票实时行情
+  python3 -m data.mootdx_tool kline 600396 [days]   # 日K线（默认20天）
+  python3 -m data.mootdx_tool pool-kline [days]     # 股票池全量日K线
+  python3 -m data.mootdx_tool minute 600396         # 当日分时
+  python3 -m data.mootdx_tool bid 600396 000966     # 五档盘口
 """
 
 import sys
@@ -16,7 +16,12 @@ import re
 import pandas as pd
 from mootdx.quotes import Quotes
 
-STOCKS_MD = os.path.join(os.path.dirname(__file__), "stocks.md")
+# 项目根加入 sys.path，便于直接 python3 data/mootdx_tool.py 也能 import config
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from config import get_config
+
+_cfg = get_config()
+STOCKS_MD = _cfg["stocks_file"]
 
 
 def get_client():
@@ -223,7 +228,8 @@ def cmd_pool_kline(days=20):
     result = merged[["date", "code", "名称", "open", "high", "low", "close", "vol", "amount", "pctChg", "板块"]].copy()
     result.columns = ["date", "code", "名称", "open", "high", "low", "close", "volume", "amount", "pctChg", "板块"]
 
-    outfile = f"trading/daily/pool_kline_{days}d.csv"
+    outfile = os.path.join(_cfg["daily_dir"], f"pool_kline_{days}d.csv")
+    os.makedirs(os.path.dirname(outfile), exist_ok=True)
     result.to_csv(outfile, index=False, encoding="utf-8-sig")
     print(f"已输出 {len(result)} 条记录到 {outfile}")
     print(f"覆盖 {result['名称'].nunique()} 只股票，{result['date'].nunique()} 个交易日")
