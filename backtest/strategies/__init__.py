@@ -138,6 +138,15 @@ STRATEGIES: dict[str, Strategy] = {
         layer1_provider="deterministic",
         sealed_min_prev_board=2,
     ),
+    "v8_tight_fast": Strategy(
+        name="v8_tight_fast",
+        description="v8_tight + 短持仓（max_hold_days=3，更快轮换）",
+        stop_loss_pct=-5.0,
+        take_profit_pct=10.0,
+        max_hold_days=3,
+        layer1_gate=True,
+        layer1_provider="deterministic",
+    ),
 }
 
 
