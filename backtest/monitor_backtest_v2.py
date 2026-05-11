@@ -295,15 +295,21 @@ def run_monitor_backtest_v2(start_date: str, end_date: str, strategy_params: dic
         MAX_POSITIONS = params["max_positions"]
     if "max_hold_days" in params:
         MAX_HOLD_DAYS = params["max_hold_days"]
-    # 止损止盈通过 monitor.py 全局变量覆盖
+    # 止损止盈通过模块全局变量覆盖（必须同时覆盖 monitor.py 和 layered_analysis.py
+    # —— 否则盘中 sell 走 monitor.py 阈值、盘后 sell 走 layered_analysis.py 阈值，导致策略不一致）
     if "stop_loss_pct" in params or "take_profit_pct" in params:
         from trading_agent.intraday import monitor as _monitor
+        from trading_agent.intraday import layered_analysis as _la
         _saved_sl = _monitor.STOP_LOSS_PCT
         _saved_tp = _monitor.TAKE_PROFIT_PCT
+        _saved_la_sl = _la.STOP_LOSS_PCT
+        _saved_la_tp = _la.TAKE_PROFIT_PCT
         if "stop_loss_pct" in params:
             _monitor.STOP_LOSS_PCT = params["stop_loss_pct"]
+            _la.STOP_LOSS_PCT = params["stop_loss_pct"]
         if "take_profit_pct" in params:
             _monitor.TAKE_PROFIT_PCT = params["take_profit_pct"]
+            _la.TAKE_PROFIT_PCT = params["take_profit_pct"]
     # 入场信号过滤
     buy_signals_override = None
     if params.get("sealed_only"):
@@ -319,6 +325,8 @@ def run_monitor_backtest_v2(start_date: str, end_date: str, strategy_params: dic
         if "stop_loss_pct" in params or "take_profit_pct" in params:
             _monitor.STOP_LOSS_PCT = _saved_sl
             _monitor.TAKE_PROFIT_PCT = _saved_tp
+            _la.STOP_LOSS_PCT = _saved_la_sl
+            _la.TAKE_PROFIT_PCT = _saved_la_tp
 
 
 def _run_monitor_backtest_v2_impl(start_date: str, end_date: str, params: dict, buy_signals_override) -> dict:
