@@ -24,6 +24,8 @@ class Strategy:
     market_heat_min: int = 0          # 市场冷淡过滤（昨日涨停数 < 此数不买，0=关闭）
     trailing_activate_pct: float = 0  # 移动止盈激活阈值（浮盈 ≥ 此值启用），0=关闭
     trailing_drawdown_pct: float = 0  # 移动止盈触发回撤（峰值后回撤 ≥ 此值卖出），0=关闭
+    layer1_gate: bool = False         # 是否启用 Layer 1 GLM 大盘门控
+    layer1_provider: str = "GLM"      # Layer 1 LLM 提供商
     notes: str = ""                   # 备注
 
     def as_params_dict(self) -> dict:
@@ -41,6 +43,8 @@ class Strategy:
             "market_heat_min": self.market_heat_min,
             "trailing_activate_pct": self.trailing_activate_pct,
             "trailing_drawdown_pct": self.trailing_drawdown_pct,
+            "layer1_gate": self.layer1_gate,
+            "layer1_provider": self.layer1_provider,
         }
 
 
@@ -53,7 +57,15 @@ STRATEGIES: dict[str, Strategy] = {
     ),
     "v8_tight": Strategy(
         name="v8_tight",
-        description="紧止损止盈（-5/+10），适合震荡市",
+        description="紧止损止盈（-5/+10）+ Layer1 deterministic 门控（生产默认）",
+        stop_loss_pct=-5.0,
+        take_profit_pct=10.0,
+        layer1_gate=True,
+        layer1_provider="deterministic",
+    ),
+    "v8_tight_naked": Strategy(
+        name="v8_tight_naked",
+        description="v8_tight 不含 Layer1（仅用于对比 Layer1 的边际价值）",
         stop_loss_pct=-5.0,
         take_profit_pct=10.0,
     ),
@@ -106,6 +118,14 @@ STRATEGIES: dict[str, Strategy] = {
         take_profit_pct=10.0,
         trailing_activate_pct=5.0,
         trailing_drawdown_pct=5.0,
+    ),
+    "v8_tight_layer1": Strategy(
+        name="v8_tight_layer1",
+        description="v8_tight + Layer 1 大盘情绪门控（deterministic，与生产一致，恐慌日跳过买入）",
+        stop_loss_pct=-5.0,
+        take_profit_pct=10.0,
+        layer1_gate=True,
+        layer1_provider="deterministic",
     ),
 }
 

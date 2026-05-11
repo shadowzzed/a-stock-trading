@@ -350,13 +350,23 @@ def _run_monitor_backtest_v2_impl(start_date: str, end_date: str, params: dict, 
 
     # Phase 4 准备：Layer1 门控
     layer1_gate_enabled = bool(params.get("layer1_gate", False))
-    layer1_provider_name = params.get("layer1_provider", "GLM")
+    layer1_provider_name = params.get("layer1_provider", "deterministic")
     layer1_runner = None
     layer1_data_provider = None
+    layer1_provider_idx = 0
+    layer1_use_deterministic = (layer1_provider_name == "deterministic")
     if layer1_gate_enabled:
         from backtest.adapter import ReviewDataProvider, MarketJudgmentRunner
-        layer1_runner = MarketJudgmentRunner()
+        from backtest.layered_engine import _code_sentiment_fallback
         layer1_data_provider = ReviewDataProvider()
+        if not layer1_use_deterministic:
+            from config import get_ai_providers
+            providers = get_ai_providers()
+            for i, p in enumerate(providers):
+                if p["name"] == layer1_provider_name:
+                    layer1_provider_idx = i
+                    break
+            layer1_runner = MarketJudgmentRunner()
 
     for day_idx, date in enumerate(all_dates):
         state = MonitorState()
@@ -412,12 +422,18 @@ def _run_monitor_backtest_v2_impl(start_date: str, end_date: str, params: dict, 
             prev_date = all_dates[day_idx - 1]
             try:
                 snapshot = layer1_data_provider.load_market_snapshot(TRADING_DIR, prev_date)
-                judgment = layer1_runner.run(
-                    snapshot,
-                    provider_name=layer1_provider_name,
-                    fallback_chain=["MiniMax"],
-                    max_retries=3,
-                )
+                if layer1_use_deterministic:
+                    # 与生产 layered_analysis.py 完全一致的 deterministic 判断
+                    phase = _code_sentiment_fallback(snapshot)
+                    if phase in ("退潮", "冰点"):
+                        gate = "空仓"
+                    elif phase in ("修复", "升温", "高潮"):
+                        gate = "可买入"
+                    else:
+                        gate = "谨慎"
+                    judgment = {"sentiment_phase": phase, "action_gate": gate, "top_sectors": []}
+                else:
+                    judgment = layer1_runner.run(snapshot, provider_index=layer1_provider_idx)
                 daily_gate = judgment.get("action_gate", "可买入")
                 layer1_judgments.append({
                     "date": date, "prev_date": prev_date,
