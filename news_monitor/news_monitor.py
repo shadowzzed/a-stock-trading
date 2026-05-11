@@ -837,7 +837,13 @@ def fetch_blockbeats(sent_keys):
             timeout=15,
         )
         data = resp.json()
-        for item in data.get("data", {}).get("data", []):
+        # 2026-05 API 调整：data 字段直接是 list（之前嵌套两层）
+        raw = data.get("data", [])
+        if isinstance(raw, dict):
+            raw = raw.get("data", [])
+        for item in raw:
+            if not isinstance(item, dict):
+                continue
             title = item.get("title", "").strip()
             if not title:
                 continue
@@ -1677,7 +1683,7 @@ def _update_sentiment_index(items, interps):
 # ═══════════════════════════════════════════════════════════════
 
 HEARTBEAT_PATH = Path(os.path.join(_cfg["logs_dir"], ".news_monitor_heartbeat"))
-WATCHDOG_TIMEOUT = 300  # run_once 超过 5 分钟视为卡死
+WATCHDOG_TIMEOUT = 1800  # run_once 超过 30 分钟视为卡死（首次启动 LLM 解读 80+ 条需要时间）
 
 
 def _write_heartbeat():
