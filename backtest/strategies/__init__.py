@@ -26,6 +26,7 @@ class Strategy:
     trailing_drawdown_pct: float = 0  # 移动止盈触发回撤（峰值后回撤 ≥ 此值卖出），0=关闭
     layer1_gate: bool = False         # 是否启用 Layer 1 GLM 大盘门控
     layer1_provider: str = "GLM"      # Layer 1 LLM 提供商
+    sealed_min_prev_board: int = 0    # 封板入场要求：昨日 ≥X 板才接力（0=关闭）
     notes: str = ""                   # 备注
 
     def as_params_dict(self) -> dict:
@@ -45,6 +46,7 @@ class Strategy:
             "trailing_drawdown_pct": self.trailing_drawdown_pct,
             "layer1_gate": self.layer1_gate,
             "layer1_provider": self.layer1_provider,
+            "sealed_min_prev_board": self.sealed_min_prev_board,
         }
 
 
@@ -126,6 +128,15 @@ STRATEGIES: dict[str, Strategy] = {
         take_profit_pct=10.0,
         layer1_gate=True,
         layer1_provider="deterministic",
+    ),
+    "v8_tight_strict": Strategy(
+        name="v8_tight_strict",
+        description="v8_tight + 封板只接 ≥2 板（避免1板分歧）",
+        stop_loss_pct=-5.0,
+        take_profit_pct=10.0,
+        layer1_gate=True,
+        layer1_provider="deterministic",
+        sealed_min_prev_board=2,
     ),
 }
 

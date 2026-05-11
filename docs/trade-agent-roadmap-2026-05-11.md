@@ -104,7 +104,7 @@ Layer 3: 买卖信号（monitor.py）
 | P0 | shadow_runner 跨策略污染 fix | 数据可靠性 | - | 4h | 低，已记 task #26 |
 | P1 | 入场后第 1 分钟试错止损（-3% 立即出） | +2pp | 待测 | 4h | 中，可能误杀真信号 |
 | P2 | 板块龙头加成提高（leader 2→3） | +1-2pp | 待测 | 1h | 低 |
-| P2 | sealed_min_prev_board 收紧（1→2） | +1pp | 待测 | 1h | 减少噪音封板 |
+| ~~P2~~ | ~~sealed_min_prev_board 收紧（1→2）~~ | ~~+1pp~~ | **实测 -3.87pp ❌，胜率升但笔数砍半（见 §3.1.0b）** | 1h | - |
 | P3 | 多空过滤（连续 3 天下跌则空仓） | +2pp | 待测 | 6h | 高，需新数据流 |
 
 ### 3.1.0 Layer 1 大盘门控实测结果（2026-05-11，**已上线**）
@@ -134,6 +134,19 @@ backtest 增加了两种 Layer 1 实现，与生产逻辑统一：
 - 添加 deterministic 路径（与生产 `_code_sentiment_fallback` 完全一致）
 - Strategy dataclass 新增 `layer1_gate`/`layer1_provider` 字段
 - `v8_tight` 默认 `layer1_gate=True, layer1_provider="deterministic"`
+
+### 3.1.0b sealed_min_prev_board=2 实测结果（2026-05-11）
+
+新增 `v8_tight_strict` 变体：要求封板入场标的"昨日 ≥2 板"才接力。
+
+| 策略 | 总收益 | 月化 | 笔数 | 胜率 |
+|------|------|-----|------|------|
+| v8_tight（baseline） | +24.86% | +13.05% | 38 | 47.4% |
+| v8_tight_strict | +17.23% | +9.18% | **18** | **61.1%** |
+
+**结论**：胜率显著提升（+14pp），**但笔数砍半 → 月化倒退 -3.87pp**。高胜率不等于高回报，剔除了太多有效机会。**不上线**。
+
+**经验教训**：粗暴提高入场门槛 ≠ 优化策略。需要更精细的过滤维度，比如"≥2 板 OR 在热点板块"，而不是单一硬门槛。
 
 ### 3.1.1 Trailing Stop Loss 实测结果（2026-05-11）
 
