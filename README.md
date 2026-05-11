@@ -145,6 +145,10 @@ python -m trading_agent.intraday opening_analysis --dry-run   # 调试模式
 | `param_sweep_v4.py` | 止损/止盈参数敏感性扫描 |
 | `run.py` | 经验系统回测入口 |
 
+**当前生产策略**：**v8_tight**（自 2026-05-11 起，shadow_runner 4-13~5-08 +15.32% 完胜 v8_base +6.89%）
+- 参数：`STOP_LOSS_PCT=-5.0`, `TAKE_PROFIT_PCT=10.0`, `MAX_HOLD_DAYS=5`, `MAX_POSITIONS=3`
+- 详见 [`docs/trade-agent-roadmap-2026-05-11.md`](docs/trade-agent-roadmap-2026-05-11.md)
+
 ```bash
 # 经验系统回测
 python -m backtest
@@ -154,7 +158,7 @@ python -m backtest.monitor_backtest_v2 --start 2026-03-03 --end 2026-04-17 \
     --output ~/shared/backtest/monitor.json \
     --report ~/shared/backtest/交割单.md
 
-# 策略池影子运行 + 健康度体检
+# 策略池影子运行 + 健康度体检（推荐每周一跑）
 python -m backtest.shadow_runner --start 2026-03-03 --end 2026-04-17 --send-feishu
 python -m backtest.shadow_runner --weekly                 # 周度体检（最近 30 天）
 
@@ -164,7 +168,7 @@ python -m backtest.param_sweep_v4
 
 ### news_monitor/ — News Monitor（新闻监控）
 
-实时财经新闻聚合 + AI 解读 + 事件催化提取。
+实时财经新闻聚合 + AI 解读 + 早报候选池 + 事件催化提取。
 
 **数据源**（30 秒轮询，共 8 个）：
 - TrendRadar DB（11 个热榜平台聚合）
@@ -176,14 +180,30 @@ python -m backtest.param_sweep_v4
 - PANews（PA 财经/科技）
 - 东方财富研报（首次覆盖、目标价、评级变更）
 
+**推送策略**（2026-05 改造）：
+
+| 时段 | 行为 |
+|------|------|
+| 09:25-15:00 交易时间 | 高优实时推送 / 低优 20 分钟聚合 |
+| 15:00-次日 09:25 非交易时间 | 全部入 `morning_brief_pool` 候选池，次日 9:00 早报精选 |
+| 任何时段 | "战争/熔断/紧急加息"等 critical 关键词立即推送（白名单兜底） |
+
+**早报机制**：每个工作日 8:55 LaunchAgent 触发 `morning_brief`，从池中粗筛 30 条 → LLM 精排 12 条 + 一句话开盘启示，同时调 yfinance 拉美股板块 ETF（11 个 SPDR + 8 个主题）+ 14 只明星股，分析 A/美映射关系，合并发送到飞书。
+
 ```bash
-# 新闻监控（全天运行）
+# 新闻监控（全天运行，建议挂 LaunchAgent: com.luoxin.astocktrading.news-monitor）
 python news_monitor/news_monitor.py
 
-# 事件催化提取
+# 每日早报（A 股精选 + 美股板块/明星股，挂 LaunchAgent: morning-brief 8:55 mon-fri）
+python -m news_monitor morning_brief             # 生成并发送
+python -m news_monitor morning_brief --dry       # dry-run 不发
+python -m news_monitor morning_brief --no-us     # 跳过美股部分
+python -m news_monitor morning_brief --no-a      # 跳过 A 股部分
+
+# 事件催化提取（盘后跑）
 python -m news_monitor catalyst
 
-# 盘前简报
+# 盘前简报（与 morning_brief 区别：仅 A 股、不调美股）
 python -m news_monitor briefing
 ```
 
