@@ -22,6 +22,8 @@ class Strategy:
     auction_strong_only: bool = False # 是否仅允许 auction_strong（剔除 sealed）
     sealed_only: bool = False         # 是否仅允许 sealed
     market_heat_min: int = 0          # 市场冷淡过滤（昨日涨停数 < 此数不买，0=关闭）
+    trailing_activate_pct: float = 0  # 移动止盈激活阈值（浮盈 ≥ 此值启用），0=关闭
+    trailing_drawdown_pct: float = 0  # 移动止盈触发回撤（峰值后回撤 ≥ 此值卖出），0=关闭
     notes: str = ""                   # 备注
 
     def as_params_dict(self) -> dict:
@@ -37,6 +39,8 @@ class Strategy:
             "auction_strong_only": self.auction_strong_only,
             "sealed_only": self.sealed_only,
             "market_heat_min": self.market_heat_min,
+            "trailing_activate_pct": self.trailing_activate_pct,
+            "trailing_drawdown_pct": self.trailing_drawdown_pct,
         }
 
 
@@ -86,6 +90,22 @@ STRATEGIES: dict[str, Strategy] = {
         take_profit_pct=12.0,
         max_positions=2,
         sealed_only=True,
+    ),
+    "v8_tight_trail": Strategy(
+        name="v8_tight_trail",
+        description="v8_tight + 移动止盈（+5% 激活，回撤 3% 卖）",
+        stop_loss_pct=-5.0,
+        take_profit_pct=10.0,
+        trailing_activate_pct=5.0,
+        trailing_drawdown_pct=3.0,
+    ),
+    "v8_tight_trail_wide": Strategy(
+        name="v8_tight_trail_wide",
+        description="v8_tight + 宽 trailing（+5% 激活，回撤 5% 卖，让利润奔跑）",
+        stop_loss_pct=-5.0,
+        take_profit_pct=10.0,
+        trailing_activate_pct=5.0,
+        trailing_drawdown_pct=5.0,
     ),
 }
 
