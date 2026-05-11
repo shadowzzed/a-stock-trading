@@ -35,8 +35,8 @@ MONITOR_STATE_FILE = os.path.join(TRADING_DIR, "monitor_state.json")
 # 信号阈值
 AUCTION_STRONG_PCT = 3.0     # 竞价高开超过此比例 = 超预期
 AUCTION_WEAK_PCT = -2.0      # 竞价低开超过此比例 = 低于预期
-STOP_LOSS_PCT = -7.0          # 盘中浮亏止损
-TAKE_PROFIT_PCT = 15.0        # 盘中浮盈止盈
+STOP_LOSS_PCT = -5.0          # 盘中浮亏止损 (v8_tight: shadow_runner 4-13~5-08 +15.32%)
+TAKE_PROFIT_PCT = 10.0        # 盘中浮盈止盈 (v8_tight: shadow_runner 4-13~5-08 +15.32%)
 MIN_SCORE_FOR_OPPORTUNITY = 6  # 新机会最低评分（从 8 降到 6，让盘中扫描更敏感）
 TREND_BREAKOUT_PCT = 5.0      # 趋势股盘中涨幅突破阈值 → 触发 trend_breakout 买入
 

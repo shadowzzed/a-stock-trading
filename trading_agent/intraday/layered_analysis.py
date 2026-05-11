@@ -30,8 +30,8 @@ CONCEPT_DB = os.path.join(TRADING_DIR, "stock_concept.db")
 PORTFOLIO_FILE = os.path.join(TRADING_DIR, "portfolio_state.json")
 
 # Layer 3 参数（与回测一致）
-STOP_LOSS_PCT = -7.0
-TAKE_PROFIT_PCT = 15.0
+STOP_LOSS_PCT = -5.0  # v8_tight (与 monitor.py 同步)
+TAKE_PROFIT_PCT = 10.0  # v8_tight (与 monitor.py 同步)
 MAX_HOLD_DAYS = 5
 MAX_POSITIONS = 2  # watchlist 只看最核心的 4 只（= MAX_POSITIONS × 2）
 POSITION_PCT = 0.30
