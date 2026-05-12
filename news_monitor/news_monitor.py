@@ -467,42 +467,37 @@ def track_tokens(usage_data, news_count=0):
 
 
 def check_hourly_report():
-    """每小时发送一次 token 消耗统计"""
+    """每小时本地打印 token 统计 + 异常情况推送
+
+    2026-05-12 改：去掉常规 token 播报（飞书刷屏），仅本地日志。
+    仅在有错误时才推送（错误诊断不能丢）。
+    """
     current_hour = datetime.now().hour
     if current_hour == _token_stats["last_report_hour"]:
         return
     if _token_stats["last_report_hour"] == -1:
-        # 首次运行不报告，只记录当前小时
         _token_stats["last_report_hour"] = current_hour
         return
 
     _token_stats["last_report_hour"] = current_hour
 
     total = _token_stats["total_tokens"]
-    prompt = _token_stats["prompt_tokens"]
-    completion = _token_stats["completion_tokens"]
     calls = _token_stats["api_calls"]
     news = _token_stats["news_count"]
 
-    if total == 0 and calls == 0 and not _error_log:
-        return
+    # 本地日志（便于事后排查）
+    print("[统计] tokens=%d, calls=%d, news=%d, errors=%d" % (
+        total, calls, news, len(_error_log)), flush=True)
 
-    msg = "📊 **新闻监控 Token 统计**（截至 %s）\n" % datetime.now().strftime("%H:%M")
-    msg += "累计消耗：**%s** tokens（输入 %s + 输出 %s）\n" % (
-        format_number(total), format_number(prompt), format_number(completion)
-    )
-    msg += "API 调用：%d 次 | 处理新闻：%d 条" % (calls, news)
-
+    # 仅在有错误时才推送飞书
     if _error_log:
-        msg += "\n\n⚠️ **本小时错误（%d 次）**：\n" % len(_error_log)
-        for entry in _error_log[-10:]:  # 最多显示10条
+        msg = "⚠️ **News Monitor 本小时错误（%d 次）**\n" % len(_error_log)
+        for entry in _error_log[-10:]:
             msg += "- %s\n" % entry
         if len(_error_log) > 10:
             msg += "- ...及另外 %d 条\n" % (len(_error_log) - 10)
+        send_feishu(msg)
         _error_log.clear()
-
-    send_feishu(msg)
-    print("[统计] tokens=%d, calls=%d, news=%d, errors=%d" % (total, calls, news, len(_error_log)), flush=True)
 
 
 def format_number(n):
@@ -1163,6 +1158,33 @@ _PRIORITY_KEYWORDS = {
 _news_buffer = []  # 聚合窗口内暂存的新闻
 _last_aggregate_time = [0.0]  # 上次聚合时间
 
+# 同板块/同股 30 分钟限流（避免刷屏）
+# key: 板块名 或 股票名, value: 上次推送时间戳
+_topic_dedup_window = {}
+TOPIC_DEDUP_SECONDS = 1800  # 30 分钟
+
+
+def _topic_recently_pushed(plates: list, stocks: list) -> str:
+    """返回 30 分钟内已推过的板块/股票名，否则空串。"""
+    now = time.time()
+    for topic in (plates or []) + (stocks or []):
+        last = _topic_dedup_window.get(topic, 0)
+        if now - last < TOPIC_DEDUP_SECONDS:
+            return topic
+    return ""
+
+
+def _mark_topic_pushed(plates: list, stocks: list):
+    now = time.time()
+    for topic in (plates or []) + (stocks or []):
+        _topic_dedup_window[topic] = now
+    # 简单清理：超过 2 小时的清掉
+    if len(_topic_dedup_window) > 200:
+        cutoff = now - 2 * TOPIC_DEDUP_SECONDS
+        for k in list(_topic_dedup_window.keys()):
+            if _topic_dedup_window[k] < cutoff:
+                del _topic_dedup_window[k]
+
 
 # ═══════════════════════════════════════════════════════════════
 # Phase 5 (2026-05-11): 早报候选池 + critical 实时兜底
@@ -1578,7 +1600,24 @@ def run_once():
 
         # 是否走"立即推送"路径：交易时间高优 OR 非交易时间 critical 兜底
         critical = is_critical_news(item["title"], item.get("brief", ""))
-        push_now = (trading and priority) or critical
+        push_now = critical  # critical 始终推
+        push_filter_reason = ""
+
+        if trading and priority and not critical:
+            # 2026-05-12 收紧盘中推送条件（用户反馈刷屏）：
+            # 1. 个股研报 → 不实时推（信息密度低，每天几百条）
+            # 2. 无具体板块/股票映射 → 不实时推（无操作性）
+            # 3. 30 分钟内同板块/同股已推过 → 不再推（同主题去重）
+            if item.get("source", "").startswith("个股研报"):
+                push_filter_reason = "个股研报"
+            elif not item.get("plates") and not item.get("stocks"):
+                push_filter_reason = "无板块/无股票"
+            else:
+                dup_topic = _topic_recently_pushed(item.get("plates"), item.get("stocks"))
+                if dup_topic:
+                    push_filter_reason = "30 分钟内同主题已推: %s" % dup_topic
+                else:
+                    push_now = True
 
         if push_now:
             # 立即推送
@@ -1604,6 +1643,8 @@ def run_once():
                 _title_window.add(item["title"])
                 sent_keys.add(item["key"])
                 sent_count += 1
+                # 标记同主题已推，下次 30 分钟内同板块/股新闻不再实时推
+                _mark_topic_pushed(item.get("plates"), item.get("stocks"))
                 print("  🔔 [%s] %s" % (tag, item["title"][:30]), flush=True)
             time.sleep(0.3)
             if trading:
@@ -1611,9 +1652,12 @@ def run_once():
                 _news_buffer.append({"item": item, "interpretation": interpretation, "priority": priority, "sent_immediately": True})
             # 非交易时间 critical 已实时推送，无需再入聚合或候选池
         elif trading:
-            # 交易时间低优 → 暂存聚合缓冲（保持原有 20 分钟聚合行为）
+            # 交易时间低优/被过滤 → 暂存聚合缓冲（保持原有 20 分钟聚合行为）
             _news_buffer.append({"item": item, "interpretation": interpretation, "priority": priority, "sent_immediately": False})
-            print("  📦 缓存(聚合): %s" % item["title"][:35], flush=True)
+            if push_filter_reason:
+                print("  📦 缓存(聚合，%s): %s" % (push_filter_reason, item["title"][:30]), flush=True)
+            else:
+                print("  📦 缓存(聚合): %s" % item["title"][:35], flush=True)
         else:
             # 非交易时间普通新闻 → 入早报候选池，不再 60 分钟聚合推送
             save_to_morning_pool(item, interpretation, priority)
@@ -1746,9 +1790,11 @@ def main():
     print("📰 A 股新闻监控启动", flush=True)
     print("   数据源: TrendRadar + 财联社 + 华尔街见闻 + 金十数据 + BlockBeats + TechFlow + PANews + 研报", flush=True)
     print("   轮询间隔: %ds" % POLL_INTERVAL, flush=True)
-    print("   交易时间(09:25-15:00): 高优实时推送 | 低优%d分钟聚合" % (AGGREGATE_INTERVAL_TRADING // 60), flush=True)
+    print("   交易时间(09:25-15:00): 高门槛实时推送 | 低优%d分钟聚合" % (AGGREGATE_INTERVAL_TRADING // 60), flush=True)
+    print("     实时门槛(2026-05-12 收紧): priority 命中 + 必须有板块/个股 + 30 分钟同主题去重 + 非个股研报", flush=True)
     print("   非交易时间: 全部入早报候选池（次日 9:00 由 morning_brief 精选 Top 12 推送）", flush=True)
     print("   非交易时间例外: 战争/熔断/紧急加息等 critical 关键词仍立即推送（白名单兜底）", flush=True)
+    print("   小时报告: 仅本地日志 + 错误推送（已去掉 token 统计飞书播报）", flush=True)
     print("   看门狗超时: %ds" % WATCHDOG_TIMEOUT, flush=True)
     print(flush=True)
     _last_aggregate_time[0] = time.time()  # 初始化聚合计时器
