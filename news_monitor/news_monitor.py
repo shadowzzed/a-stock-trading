@@ -467,10 +467,11 @@ def track_tokens(usage_data, news_count=0):
 
 
 def check_hourly_report():
-    """每小时本地打印 token 统计 + 异常情况推送
+    """每小时本地打印 token 统计 + 错误记录（全部仅本地，不推飞书）
 
-    2026-05-12 改：去掉常规 token 播报（飞书刷屏），仅本地日志。
-    仅在有错误时才推送（错误诊断不能丢）。
+    2026-05-12 改：去掉 token 飞书播报。
+    2026-05-13 改：错误也不推飞书（用户反馈飞书太吵），仅写本地日志。
+        排查时去 ~/shared/trading/logs/news_monitor.log 找 [ERROR] 行。
     """
     current_hour = datetime.now().hour
     if current_hour == _token_stats["last_report_hour"]:
@@ -485,18 +486,16 @@ def check_hourly_report():
     calls = _token_stats["api_calls"]
     news = _token_stats["news_count"]
 
-    # 本地日志（便于事后排查）
     print("[统计] tokens=%d, calls=%d, news=%d, errors=%d" % (
         total, calls, news, len(_error_log)), flush=True)
 
-    # 仅在有错误时才推送飞书
     if _error_log:
-        msg = "⚠️ **News Monitor 本小时错误（%d 次）**\n" % len(_error_log)
+        # 仅写本地日志，便于事后排查；不推飞书
+        print("[ERROR] 本小时累计错误 %d 次（详情如下，仅本地日志）：" % len(_error_log), flush=True)
         for entry in _error_log[-10:]:
-            msg += "- %s\n" % entry
+            print("  - %s" % entry, flush=True)
         if len(_error_log) > 10:
-            msg += "- ...及另外 %d 条\n" % (len(_error_log) - 10)
-        send_feishu(msg)
+            print("  - ...及另外 %d 条" % (len(_error_log) - 10), flush=True)
         _error_log.clear()
 
 
@@ -1794,7 +1793,7 @@ def main():
     print("     实时门槛(2026-05-12 收紧): priority 命中 + 必须有板块/个股 + 30 分钟同主题去重 + 非个股研报", flush=True)
     print("   非交易时间: 全部入早报候选池（次日 9:00 由 morning_brief 精选 Top 12 推送）", flush=True)
     print("   非交易时间例外: 战争/熔断/紧急加息等 critical 关键词仍立即推送（白名单兜底）", flush=True)
-    print("   小时报告: 仅本地日志 + 错误推送（已去掉 token 统计飞书播报）", flush=True)
+    print("   小时报告: 仅本地日志（token 统计 + 错误都不推飞书，排查看 news_monitor.log）", flush=True)
     print("   看门狗超时: %ds" % WATCHDOG_TIMEOUT, flush=True)
     print(flush=True)
     _last_aggregate_time[0] = time.time()  # 初始化聚合计时器
